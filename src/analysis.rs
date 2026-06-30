@@ -195,16 +195,14 @@ impl GpuYin {
         // Pass 1: difference function. Separate pass from the scan so wgpu
         // inserts the read-after-write barrier on diff_buf between them.
         {
-            let mut pass =
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.diff_pipeline);
             pass.set_bind_group(0, &self.diff_bind_group, &[]);
             pass.dispatch_workgroups((DIFF_LEN as u32).div_ceil(64), 1, 1);
         }
         // Pass 2: inclusive prefix-sum, single workgroup.
         {
-            let mut pass =
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.scan_pipeline);
             pass.set_bind_group(0, &self.scan_bind_group, &[]);
             pass.dispatch_workgroups(1, 1, 1);
@@ -280,9 +278,7 @@ impl AnalysisEngine {
         // with the same code the CPU reference uses, so f0 agrees by construction.
         // Any GPU failure falls back to the pure-CPU YIN.
         let pitch = match self.gpu.analyze(audio_in) {
-            Ok((diff, cumsum)) => {
-                crate::math::yin_f0_from_diff_cumsum(&diff, &cumsum, sample_rate)
-            }
+            Ok((diff, cumsum)) => crate::math::yin_f0_from_diff_cumsum(&diff, &cumsum, sample_rate),
             Err(e) => {
                 eprintln!("GPU YIN dispatch failed ({e:?}); using CPU fallback");
                 crate::math::yin_pitch(audio_in, sample_rate)
@@ -316,11 +312,12 @@ impl AnalysisEngine {
         }
         let formants = self.last_formants;
 
-        let mut profile = VocalProfile::default();
-        profile.f0 = f0;
-        profile.formants = formants;
-        profile.active_partials = 5;
-        profile.valid = voiced;
+        let profile = VocalProfile {
+            f0,
+            formants,
+            valid: voiced,
+            ..VocalProfile::default()
+        };
 
         // Publish to synthesis + UI (VocalProfile is Copy).
         self.profile_tx.write(profile);
@@ -392,8 +389,13 @@ mod tests {
         let gpu_f0 = crate::math::yin_f0_from_diff_cumsum(&gpu_diff, &gpu_cumsum, sr)
             .expect("gpu f0")
             .f0;
-        let cpu_f0 = crate::math::yin_f0_from_diff(&cpu_diff, sr).expect("cpu f0").f0;
-        assert!((gpu_f0 - cpu_f0).abs() < 2.0, "gpu {gpu_f0} vs cpu {cpu_f0}");
+        let cpu_f0 = crate::math::yin_f0_from_diff(&cpu_diff, sr)
+            .expect("cpu f0")
+            .f0;
+        assert!(
+            (gpu_f0 - cpu_f0).abs() < 2.0,
+            "gpu {gpu_f0} vs cpu {cpu_f0}"
+        );
         assert!((gpu_f0 - 220.0).abs() < 5.0, "gpu f0 {gpu_f0} ~ 220 Hz");
     }
 }

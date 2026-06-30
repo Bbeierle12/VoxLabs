@@ -37,9 +37,12 @@ impl AudioEngine {
         let channels = output_config.channels as usize;
         let in_channels = input_config.channels as usize;
 
+        // Input callback needs its own handle; the output closure moves `telemetry`.
+        let telemetry_in = telemetry.clone();
+
         // Output stream (Synthesis)
         let _output_stream = output_device.build_output_stream(
-            output_config.clone(),
+            output_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // Read latest profile (non-blocking)
                 let profile = profile_rx.read();
@@ -82,12 +85,23 @@ impl AudioEngine {
 
         // Input stream (Analysis gathering)
         let _input_stream = input_device.build_input_stream(
-            input_config.clone(),
+            input_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Downmix and push to analysis ring buffer
+                // Downmix and push to the analysis ring buffer. A failed push means
+                // the ring is full — the analysis thread fell behind and this input
+                // is dropped. Count it as an overrun (xrun) so the UI telemetry
+                // reflects lost input instead of silently reading zero.
+                let mut overran = false;
                 for frame in data.chunks(in_channels) {
                     let mono = frame.iter().sum::<f32>() / (in_channels as f32);
-                    let _ = audio_tx.push(mono);
+                    if audio_tx.push(mono).is_err() {
+                        overran = true;
+                    }
+                }
+                if overran {
+                    telemetry_in
+                        .xruns
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             },
             move |err| {

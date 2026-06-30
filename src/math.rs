@@ -174,14 +174,19 @@ fn yin_bounds(len: usize, sample_rate: f32) -> Option<(usize, usize)> {
 /// (descend into the first sub-threshold dip, else fall back to the global
 /// minimum) followed by parabolic interpolation. Shared by every path so they
 /// all pick the same lag from the same CMND.
-fn yin_pick(cmnd: &[f32], tau_min: usize, tau_max: usize, sample_rate: f32) -> Option<PitchEstimate> {
+fn yin_pick(
+    cmnd: &[f32],
+    tau_min: usize,
+    tau_max: usize,
+    sample_rate: f32,
+) -> Option<PitchEstimate> {
     // Step 3: absolute threshold. First lag whose CMND dips below the threshold,
     // then descend to the bottom of that dip (its local minimum).
     let mut tau_est = None;
     let mut tau = tau_min;
     while tau <= tau_max {
         if cmnd[tau] < YIN_THRESHOLD {
-            while tau + 1 <= tau_max && cmnd[tau + 1] < cmnd[tau] {
+            while tau < tau_max && cmnd[tau + 1] < cmnd[tau] {
                 tau += 1;
             }
             tau_est = Some(tau);
@@ -416,12 +421,18 @@ mod tests {
         let buf: Vec<f32> = (0..2048)
             .map(|i| {
                 let x = i as f32;
-                (x * 0.91).sin() * 0.5 + (x * 0.37).sin() * 0.3 + ((x * 12.9898).sin() * 43758.5).fract()
+                (x * 0.91).sin() * 0.5
+                    + (x * 0.37).sin() * 0.3
+                    + ((x * 12.9898).sin() * 43758.5).fract()
             })
             .collect();
         let est = yin_pitch(&buf, sr).expect("estimate");
         // Aperiodic input should not look strongly voiced.
-        assert!(est.confidence < 0.8, "noise looked too periodic: {}", est.confidence);
+        assert!(
+            est.confidence < 0.8,
+            "noise looked too periodic: {}",
+            est.confidence
+        );
     }
 
     #[test]
@@ -444,7 +455,10 @@ mod tests {
         let a = lpc_coefficients(&buf, 12, 0.97);
         assert_eq!(a.len(), 13);
         assert!((a[0] - 1.0).abs() < 1e-6, "a[0] must be 1.0, got {}", a[0]);
-        assert!(a.iter().all(|c| c.is_finite()), "coeffs must be finite: {a:?}");
+        assert!(
+            a.iter().all(|c| c.is_finite()),
+            "coeffs must be finite: {a:?}"
+        );
         // The model should have captured *something* (not the trivial all-pass).
         assert!(a[1..].iter().any(|&c| c.abs() > 1e-3), "LPC fit is trivial");
     }
@@ -456,10 +470,18 @@ mod tests {
         let factor = 4;
         let dec = decimate(&buf, factor);
         // Length drops ~factor x.
-        assert!((dec.len() as i32 - 512).abs() <= 2, "len {} ~ 512", dec.len());
+        assert!(
+            (dec.len() as i32 - 512).abs() <= 2,
+            "len {} ~ 512",
+            dec.len()
+        );
         // The 200 Hz tone survives at the decimated rate.
         let est = yin_pitch(&dec, sr / factor as f32).expect("estimate");
-        assert!((est.f0 - 200.0).abs() < 6.0, "decimated f0 {} ~ 200 Hz", est.f0);
+        assert!(
+            (est.f0 - 200.0).abs() < 6.0,
+            "decimated f0 {} ~ 200 Hz",
+            est.f0
+        );
     }
 
     /// Denominator of a single 2-pole resonator at radius `r`, center `f` Hz:
@@ -494,7 +516,7 @@ mod tests {
             "F1 {} should be ~1500 Hz (orientation check)",
             formants[0].frequency
         );
-        let expected_bw = -fs / std::f64::consts::PI * (r as f64).ln();
+        let expected_bw = -fs / std::f64::consts::PI * r.ln();
         assert!(
             (formants[0].bandwidth as f64 - expected_bw).abs() < 30.0,
             "BW {} should be ~{:.0} Hz and positive",
