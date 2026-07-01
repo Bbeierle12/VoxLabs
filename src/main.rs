@@ -1,113 +1,26 @@
-// Native-only modules: real audio I/O (cpal) and GPU compute (wgpu). The web
-// build (P2) replaces these with a Web Audio + CPU-DSP layer, so they are gated
-// out of the wasm target entirely.
-#[cfg(not(target_arch = "wasm32"))]
-mod analysis;
-#[cfg(not(target_arch = "wasm32"))]
-mod audio;
+//! Binary entry points. The real work lives in the `voice_harmonic_engine`
+//! library crate; this file is only the thin per-platform `main`.
 
-mod concurrency;
-mod math;
-mod synthesis;
-mod types;
-mod ui;
-
-use concurrency::ConcurrencyBridges;
-use ui::DashboardApp;
-
-#[cfg(not(target_arch = "wasm32"))]
+// Desktop: hand off to the shared native runner in the library.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn main() -> anyhow::Result<()> {
-    use analysis::AnalysisEngine;
-    use audio::AudioEngine;
-    use cpal::traits::{DeviceTrait, HostTrait};
-    use std::thread;
-
-    env_logger::init();
-
-    println!("Starting Voice Harmonic Engine...");
-
-    let bridges = ConcurrencyBridges::new();
-    let profile_tx = bridges.profile_tx;
-
-    let mut audio_rx = bridges.audio_rx;
-    let ui_profile_tx = bridges.ui_profile_tx;
-
-    // Determine the real microphone sample rate up front so the analysis DSP
-    // scales its frequencies correctly. Previously process_frame was fed a
-    // hardcoded 44100.0, which mis-scaled f0/formants on any other device rate.
-    let input_sample_rate = {
-        let host = cpal::default_host();
-        let dev = host
-            .default_input_device()
-            .ok_or_else(|| anyhow::anyhow!("No input device found"))?;
-        dev.default_input_config()?.config().sample_rate as f32
-    };
-    println!("Microphone sample rate: {input_sample_rate} Hz");
-
-    // Start background analysis thread
-    thread::spawn(move || {
-        let mut engine = pollster::block_on(AnalysisEngine::new(profile_tx, ui_profile_tx))
-            .expect("Failed to init AnalysisEngine");
-
-        // Persistent accumulator. Each tick we drain *everything* available from
-        // the ring buffer, then process as many whole frames as we have, carrying
-        // the leftover samples into the next tick. The previous loop reset its
-        // index every iteration and silently discarded any partial (<1024) read.
-        let mut accumulator: Vec<f32> = Vec::with_capacity(analysis::ANALYSIS_FRAME * 4);
-        loop {
-            while let Ok(sample) = audio_rx.pop() {
-                accumulator.push(sample);
-            }
-
-            while accumulator.len() >= analysis::ANALYSIS_FRAME {
-                engine
-                    .process_frame(&accumulator[..analysis::ANALYSIS_FRAME], input_sample_rate)
-                    .expect("process_frame failed");
-                accumulator.drain(..analysis::ANALYSIS_FRAME);
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    });
-
-    let _audio_engine = AudioEngine::start(
-        bridges.profile_rx,
-        bridges.event_rx,
-        bridges.audio_tx,
-        bridges.telemetry.clone(),
-    )?;
-
-    println!("Audio engine running. Starting GUI...");
-
-    let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1024.0, 768.0]),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Voice Harmonic Engine",
-        native_options,
-        Box::new(|cc| {
-            Ok(Box::new(DashboardApp::new(
-                cc,
-                bridges.event_tx,
-                bridges.telemetry.clone(),
-                bridges.ui_profile_rx,
-            )))
-        }),
-    )
-    .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e))?;
-
-    Ok(())
+    voice_harmonic_engine::run()
 }
 
-// Web entry point. P1 renders the existing dashboard in the browser with the DSP
+// Android: the real entry point is `android_main` inside the library's `android`
+// module, loaded from the cdylib by NativeActivity — the binary target is unused
+// on Android. A `[[bin]]` still needs a `main`, so provide an empty stub.
+#[cfg(target_os = "android")]
+fn main() {}
+
+// Web entry point. Renders the existing dashboard in the browser with the DSP
 // stubbed: the concurrency bridges are built so the UI has its event/telemetry/
 // profile handles, but nothing writes the profile yet, so the dashboard sits in
-// "SEARCHING" until P2 wires the Web Audio capture/synthesis layer.
+// "SEARCHING" until the Web Audio capture/synthesis layer is wired.
 #[cfg(target_arch = "wasm32")]
 fn main() {
     use eframe::wasm_bindgen::JsCast as _;
+    use voice_harmonic_engine::{ConcurrencyBridges, DashboardApp};
 
     console_error_panic_hook::set_once();
 

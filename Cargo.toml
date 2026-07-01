@@ -3,25 +3,68 @@ name = "voice_harmonic_engine"
 version = "0.1.0"
 edition = "2024"
 
-# Shared across native + web (pure-Rust, wasm-compatible).
+# The crate is both an rlib (linked by the desktop/web `[[bin]]`) and a cdylib
+# (`libvoice_harmonic_engine.so`, which the Android APK loads and whose
+# `android_main` symbol android-activity's NativeActivity glue calls). Desktop
+# and web are unaffected: they keep using the rlib via the binary target.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# Shared across every target (native desktop, Android, web/wasm). Pure-Rust and
+# wasm-compatible. eframe here is a minimal common base with no renderer/backend
+# features; each platform block below turns on exactly what it needs so that the
+# feature sets never collide (notably: `accesskit` is incompatible with
+# `android-native-activity`, so Android must not receive it).
 [dependencies]
 aberth = "0.4.1"
 anyhow = "1.0.102"
 atomic_float = "1.1.0"
 bytemuck = "1.25.0"
 crossbeam-utils = "0.8.21"
-eframe = "0.34.3"
+eframe = { version = "0.34.3", default-features = false, features = ["default_fonts"] }
 egui = "0.34.3"
 log = "0.4.32"
 rtrb = "0.3.4"
 triple_buffer = "9.0.0"
 
-# Native desktop only: real audio I/O, GPU compute, blocking executor, logger.
+# Desktop + web: restore eframe's stock default feature set, so those two targets
+# behave identically to before this Android work (wgpu renderer, accesskit,
+# wayland/x11, web screen reader). eframe's own default also enables `winit/default`
+# — which can't be named from a consumer's feature list — so the desktop winit dep
+# below re-adds it directly.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = [
+    "accesskit",
+    "wayland",
+    "web_screen_reader",
+    "wgpu",
+    "x11",
+] }
+
+# Native desktop + Android: real audio I/O (cpal). cpal's Android backend is
+# pure-NDK AAudio (ndk "audio" + jni), both already in the lockfile.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.18.1"
+
+# Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
+# logger, plus winit's default backends (x11/wayland, matching eframe's stock
+# `winit/default`). Android takes the CPU DSP path instead, so it never compiles
+# wgpu — keeping wgpu-on-Vulkan-Android out of the build entirely (de-risked).
+[target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
 wgpu = "29.0.3"
 pollster = "0.4.0"
 env_logger = "0.11.10"
+winit = "0.30.13"
+
+# Android only: android-activity's NativeActivity glue provides the `android_main`
+# entry (via winit's `android-native-activity` backend), eframe renders through
+# glow/EGL (GLES — de-risked vs wgpu/Vulkan for a first build), and android_logger
+# routes `log` to logcat.
+[target.'cfg(target_os = "android")'.dependencies]
+eframe = { version = "0.34.3", default-features = false, features = ["glow", "android-native-activity"] }
+android-activity = { version = "0.6", features = ["native-activity"] }
+android_logger = "0.15"
+winit = { version = "0.30.13", default-features = false, features = ["android-native-activity", "rwh_06"] }
 
 # Web (wasm) only: browser bindings + panic hook for eframe's web backend.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -29,3 +72,29 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["Document", "Element", "Window", "HtmlCanvasElement"] }
+
+# --- Android APK packaging (cargo-apk / cargo apk) ------------------------------
+# Release signing is NOT configured here on purpose: cargo-apk reads the keystore
+# path + password from the CARGO_APK_RELEASE_KEYSTORE[_PASSWORD] env vars, so no
+# secret is committed. See docs/android-build.md.
+[package.metadata.android]
+package = "com.voiceharmonic.engine"
+apk_name = "voice_harmonic_engine"
+build_targets = ["aarch64-linux-android"]
+
+[package.metadata.android.sdk]
+# 26 (Android 8.0), not 24: cpal's Android backend links libaaudio, and AAudio —
+# the low-latency capture/playback path this instrument targets — was added in
+# API 26. cargo-apk compiles against the min_sdk API level, so 24 fails to link
+# (`-laaudio` unavailable). 26 is the floor for AAudio anyway.
+min_sdk_version = 26
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Voice Harmonic Engine"
+
+# Real-time microphone capture. This is a runtime ("dangerous") permission on
+# Android 6+; declaring it here is necessary but NOT sufficient — the app/user
+# must also grant it at runtime (see docs/android-build.md).
+[[package.metadata.android.uses_permission]]
+name = "android.permission.RECORD_AUDIO"

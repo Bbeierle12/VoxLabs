@@ -1,2 +1,8 @@
 /target
 /dist
+
+# Android build + signing artifacts. NEVER commit APKs or keystores/secrets.
+*.apk
+*.keystore
+*.jks
+dist/
