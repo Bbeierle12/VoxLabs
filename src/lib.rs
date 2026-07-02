@@ -6,6 +6,7 @@
 //!   * web/wasm — `main.rs`'s wasm `main()` drives eframe's `WebRunner`;
 //!   * Android  — the `android` module's `android_main` (compiled into the
 //!     cdylib the APK loads).
+//!
 //! All three launch the same [`DashboardApp`] egui UI.
 
 // Real audio I/O (cpal): desktop + Android; gated out of wasm (Web Audio there).

@@ -8,6 +8,9 @@ use triple_buffer::{Input, Output, TripleBuffer};
 pub struct Telemetry {
     pub xruns: CachePadded<AtomicU32>,
     pub consumed_frames: CachePadded<AtomicU32>,
+    /// Latest microphone input RMS as `f32::to_bits`, written once per input
+    /// callback. Drives the Capture screen's LEVEL readout and waveform.
+    pub input_rms: CachePadded<AtomicU32>,
     /// Reserved: engine liveness flag for a future UI status indicator.
     #[allow(dead_code)]
     pub alive: CachePadded<AtomicBool>,
@@ -18,6 +21,7 @@ impl Telemetry {
         Self {
             xruns: CachePadded::new(AtomicU32::new(0)),
             consumed_frames: CachePadded::new(AtomicU32::new(0)),
+            input_rms: CachePadded::new(AtomicU32::new(0)),
             alive: CachePadded::new(AtomicBool::new(true)),
         }
     }
@@ -53,6 +57,12 @@ pub struct ConcurrencyBridges {
 
     // Telemetry (Synthesis -> UI/Analysis)
     pub telemetry: Arc<Telemetry>,
+}
+
+impl Default for ConcurrencyBridges {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConcurrencyBridges {

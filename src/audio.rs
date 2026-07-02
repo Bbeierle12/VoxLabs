@@ -92,11 +92,21 @@ impl AudioEngine {
                 // is dropped. Count it as an overrun (xrun) so the UI telemetry
                 // reflects lost input instead of silently reading zero.
                 let mut overran = false;
+                let mut sum_sq = 0.0f32;
+                let mut frames = 0u32;
                 for frame in data.chunks(in_channels) {
                     let mono = frame.iter().sum::<f32>() / (in_channels as f32);
+                    sum_sq += mono * mono;
+                    frames += 1;
                     if audio_tx.push(mono).is_err() {
                         overran = true;
                     }
+                }
+                if frames > 0 {
+                    let rms = (sum_sq / frames as f32).sqrt();
+                    telemetry_in
+                        .input_rms
+                        .store(rms.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 }
                 if overran {
                     telemetry_in
