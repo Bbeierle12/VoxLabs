@@ -438,6 +438,96 @@ pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; 
     amps
 }
 
+// ── Musical mapping & timbre metrics ─────────────────────────────────────────
+
+/// A 12-TET note name for a frequency: pitch class, octave, and signed cents
+/// offset from the nearest equal-tempered pitch (A4 = 440 Hz).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Note {
+    pub name: &'static str,
+    pub octave: i32,
+    pub cents: f32,
+}
+
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+/// Nearest 12-TET note to `hz` (A4 = 440). `None` for non-positive/non-finite
+/// input. Cents are in (-50, +50].
+pub fn freq_to_note(hz: f32) -> Option<Note> {
+    if hz <= 0.0 || !hz.is_finite() {
+        return None;
+    }
+    let midi = 69.0 + 12.0 * (hz / 440.0).log2();
+    let nearest = midi.round();
+    let idx = (nearest as i32).rem_euclid(12) as usize;
+    Some(Note {
+        name: NOTE_NAMES[idx],
+        octave: (nearest as i32).div_euclid(12) - 1,
+        cents: (midi - nearest) * 100.0,
+    })
+}
+
+/// Spectral tilt in dB/octave: least-squares slope of harmonic level (dB)
+/// against log2(harmonic number). A sawtooth's 1/k rolloff measures ≈ −6
+/// dB/oct; a brighter, more pressed voice is shallower (closer to 0).
+pub fn spectral_tilt_db_per_octave(amps: &[f32]) -> Option<f32> {
+    let pts: Vec<(f32, f32)> = amps
+        .iter()
+        .enumerate()
+        .filter(|&(_, &a)| a > 1e-6)
+        .map(|(k, &a)| (((k + 1) as f32).log2(), 20.0 * a.log10()))
+        .collect();
+    if pts.len() < 2 {
+        return None;
+    }
+    let n = pts.len() as f32;
+    let (sx, sy) = pts
+        .iter()
+        .fold((0.0f32, 0.0f32), |(sx, sy), (x, y)| (sx + x, sy + y));
+    let (mx, my) = (sx / n, sy / n);
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for (x, y) in &pts {
+        num += (x - mx) * (y - my);
+        den += (x - mx) * (x - mx);
+    }
+    (den > 1e-9).then(|| num / den)
+}
+
+/// Even/odd harmonic energy balance in dB over H2..=H16. H1 is excluded — it
+/// has no parity partner and would swamp the comparison. Positive = even-heavy
+/// (fuller, rounder); negative = odd-heavy (hollower, clarinet-like).
+pub fn even_odd_balance_db(amps: &[f32]) -> Option<f32> {
+    let (mut even, mut odd) = (0.0f32, 0.0f32);
+    for (k, &a) in amps.iter().enumerate().take(16).skip(1) {
+        let e = a * a;
+        if (k + 1).is_multiple_of(2) {
+            even += e;
+        } else {
+            odd += e;
+        }
+    }
+    (even > 0.0 && odd > 0.0).then(|| 10.0 * (even / odd).log10())
+}
+
+/// Percentage of harmonic energy in the singer's-formant band (2.8–3.4 kHz) —
+/// the resonance cluster that lets a trained voice project over an ensemble.
+pub fn singers_formant_pct(amps: &[f32], f0: f32) -> Option<f32> {
+    if f0 <= 0.0 {
+        return None;
+    }
+    let (mut band, mut total) = (0.0f32, 0.0f32);
+    for (k, &a) in amps.iter().enumerate() {
+        let e = a * a;
+        total += e;
+        if (2_800.0..=3_400.0).contains(&((k + 1) as f32 * f0)) {
+            band += e;
+        }
+    }
+    (total > 1e-12).then(|| band / total * 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +727,88 @@ mod tests {
         let buf = sine(220.0, 44_100.0, 2048);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, 0.0), [0.0; 32]);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, -5.0), [0.0; 32]);
+    }
+
+    #[test]
+    fn note_naming_hits_known_pitches() {
+        let a4 = freq_to_note(440.0).unwrap();
+        assert_eq!((a4.name, a4.octave), ("A", 4));
+        assert!(a4.cents.abs() < 0.01, "A440 cents {}", a4.cents);
+
+        let a2 = freq_to_note(110.0).unwrap();
+        assert_eq!((a2.name, a2.octave), ("A", 2));
+
+        let c4 = freq_to_note(261.626).unwrap();
+        assert_eq!((c4.name, c4.octave), ("C", 4));
+        assert!(c4.cents.abs() < 0.5);
+
+        let bb4 = freq_to_note(466.164).unwrap();
+        assert_eq!((bb4.name, bb4.octave), ("A#", 4));
+
+        // 445 Hz is ~19.6 cents sharp of A4.
+        let sharp = freq_to_note(445.0).unwrap();
+        assert_eq!(sharp.name, "A");
+        assert!((sharp.cents - 19.56).abs() < 0.5, "cents {}", sharp.cents);
+
+        assert!(freq_to_note(0.0).is_none());
+        assert!(freq_to_note(-100.0).is_none());
+        assert!(freq_to_note(f32::NAN).is_none());
+    }
+
+    #[test]
+    fn seventh_harmonic_is_31_cents_flat() {
+        // The musician's landmark: H7 of any fundamental sits ~31.2 cents
+        // below the 12-TET minor seventh (2 octaves + m7 above f0).
+        let h7 = freq_to_note(7.0 * 110.0).unwrap();
+        assert_eq!((h7.name, h7.octave), ("G", 5));
+        assert!((h7.cents + 31.2).abs() < 0.5, "H7 cents {}", h7.cents);
+    }
+
+    #[test]
+    fn tilt_of_sawtooth_spectrum_is_minus_six() {
+        let amps: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        let tilt = spectral_tilt_db_per_octave(&amps).unwrap();
+        assert!((tilt + 6.02).abs() < 0.1, "tilt {tilt}");
+
+        let flat = [1.0f32; 8];
+        assert!(spectral_tilt_db_per_octave(&flat).unwrap().abs() < 1e-3);
+
+        assert!(spectral_tilt_db_per_octave(&[1.0]).is_none());
+        assert!(spectral_tilt_db_per_octave(&[0.0; 8]).is_none());
+    }
+
+    #[test]
+    fn even_odd_balance_signs_and_edges() {
+        // H2 twice the amplitude of H3 → 10·log10(4) ≈ +6.02 dB (even-heavy).
+        let mut amps = [0.0f32; 16];
+        amps[1] = 1.0; // H2
+        amps[2] = 0.5; // H3
+        let b = even_odd_balance_db(&amps).unwrap();
+        assert!((b - 6.02).abs() < 0.05, "balance {b}");
+
+        // Odd-only spectrum (square-wave-like) has no even energy → None.
+        let mut odd_only = [0.0f32; 16];
+        odd_only[2] = 1.0;
+        assert!(even_odd_balance_db(&odd_only).is_none());
+
+        // H1 alone must not count toward either side.
+        let mut h1_only = [0.0f32; 16];
+        h1_only[0] = 1.0;
+        assert!(even_odd_balance_db(&h1_only).is_none());
+    }
+
+    #[test]
+    fn singers_formant_counts_only_band_partials() {
+        // f0 = 300 Hz: harmonics at 2800..=3400 are H10 (3000) and H11 (3300).
+        let mut amps = [0.0f32; 32];
+        for a in amps.iter_mut().take(11) {
+            *a = 1.0;
+        }
+        let pct = singers_formant_pct(&amps, 300.0).unwrap();
+        assert!((pct - 2.0 / 11.0 * 100.0).abs() < 0.1, "pct {pct}");
+
+        assert!(singers_formant_pct(&amps, 0.0).is_none());
+        assert!(singers_formant_pct(&[0.0; 32], 300.0).is_none());
     }
 
     #[test]
