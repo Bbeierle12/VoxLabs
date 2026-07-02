@@ -13,7 +13,7 @@
 //! compute speaker embeddings yet).
 
 use crate::concurrency::{EngineEvent, Telemetry};
-use crate::types::{Formant, VocalProfile};
+use crate::types::{Formant, MAX_PARTIALS, VocalProfile};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke,
     StrokeKind, pos2, vec2,
@@ -137,6 +137,9 @@ pub struct DashboardApp {
 
     /// Waveform bar half-heights (px), scrolling left; length 110.
     wave: Vec<f32>,
+    /// EMA-smoothed harmonic amplitudes for the ladder (profiles arrive every
+    /// ~46 ms; raw bars at repaint rate read as flicker, not music).
+    harm_ema: [f32; MAX_PARTIALS],
     /// Real f0 samples collected while recording (mean shown in the result).
     rec_f0_acc: Vec<f32>,
     /// Last valid formants seen while recording.
@@ -187,6 +190,7 @@ impl DashboardApp {
             result: None,
             export_queued: false,
             wave: vec![2.0; 110],
+            harm_ema: [0.0; MAX_PARTIALS],
             rec_f0_acc: Vec::new(),
             rec_formants: None,
             next_session_num: 2482,
@@ -317,6 +321,13 @@ impl eframe::App for DashboardApp {
         if matches!(self.rec, RecState::Recording { .. }) && self.current_profile.valid {
             self.rec_f0_acc.push(self.current_profile.f0);
             self.rec_formants = Some(self.current_profile.formants);
+        }
+        for (ema, &a) in self
+            .harm_ema
+            .iter_mut()
+            .zip(&self.current_profile.partial_amplitudes)
+        {
+            *ema += 0.3 * (a - *ema);
         }
         self.push_wave_sample();
 
@@ -947,6 +958,10 @@ impl DashboardApp {
         });
         ui.add_space(14.0);
 
+        // Harmonic series (live, musician-facing).
+        self.harmonics_card(ui);
+        ui.add_space(14.0);
+
         // Analyzing card.
         if let RecState::Analyzing { start, .. } = self.rec {
             glass(22.0).show(ui, |ui| {
@@ -1097,6 +1112,174 @@ impl DashboardApp {
                 );
             });
         }
+    }
+
+    /// Live harmonic-series card: per-partial ladder (dB bars, note names,
+    /// cents) plus the timbre metrics strip (tilt, even/odd, singer's formant).
+    fn harmonics_card(&self, ui: &mut egui::Ui) {
+        const ROWS: usize = 16;
+        let valid = self.current_profile.valid && self.current_profile.f0 > 0.0;
+        let f0 = self.current_profile.f0;
+
+        glass(24.0).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+
+            // Header: title + live fundamental note readout.
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Harmonic series")
+                        .size(13.0)
+                        .color(INK)
+                        .strong(),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let readout = if valid {
+                        crate::math::freq_to_note(f0)
+                            .map(|n| format!("{}{} · {:+.0}¢", n.name, n.octave, n.cents))
+                            .unwrap_or_else(|| "—".into())
+                    } else {
+                        "—".into()
+                    };
+                    ui.label(
+                        RichText::new(readout)
+                            .font(FontId::monospace(13.0))
+                            .color(TEAL_DARK)
+                            .strong(),
+                    );
+                });
+            });
+            ui.add_space(10.0);
+
+            // Ladder: dB relative to the strongest partial, floored at −48 dB.
+            let max_amp = self
+                .harm_ema
+                .iter()
+                .take(ROWS)
+                .cloned()
+                .fold(0.0f32, f32::max);
+            let audible = max_amp > 1e-5;
+            let label_font = FontId::monospace(10.0);
+            for k in 0..ROWS {
+                let db = if audible && self.harm_ema[k] > 1e-6 {
+                    (20.0 * (self.harm_ema[k] / max_amp).log10()).max(-48.0)
+                } else {
+                    -48.0
+                };
+                let frac = 1.0 + db / 48.0;
+
+                ui.horizontal(|ui| {
+                    let (hr, _) = ui.allocate_exact_size(vec2(28.0, 16.0), Sense::hover());
+                    ui.painter().text(
+                        hr.left_center(),
+                        Align2::LEFT_CENTER,
+                        format!("H{}", k + 1),
+                        label_font.clone(),
+                        ink(115),
+                    );
+
+                    let note = if valid {
+                        crate::math::freq_to_note((k + 1) as f32 * f0)
+                            .map(|n| format!("{}{} {:+.0}¢", n.name, n.octave, n.cents))
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
+                    let (nr, _) = ui.allocate_exact_size(vec2(76.0, 16.0), Sense::hover());
+                    ui.painter().text(
+                        nr.left_center(),
+                        Align2::LEFT_CENTER,
+                        note,
+                        label_font.clone(),
+                        ink(166),
+                    );
+
+                    let db_w = 46.0;
+                    let bar_w = (ui.available_width() - db_w).max(20.0);
+                    let (br, _) = ui.allocate_exact_size(vec2(bar_w, 16.0), Sense::hover());
+                    let track =
+                        Rect::from_min_size(pos2(br.left(), br.center().y - 4.0), vec2(bar_w, 8.0));
+                    ui.painter().rect_filled(track, 4.0, ink(10));
+                    if frac > 0.02 {
+                        // Same teal→cyan ramp as the waveform, low → high partials.
+                        let t = k as f32 / (ROWS - 1) as f32;
+                        let color = Color32::from_rgb(
+                            (14.0 + t * 20.0) as u8,
+                            (148.0 + t * 63.0) as u8,
+                            (136.0 + t * 102.0) as u8,
+                        );
+                        let fill = Rect::from_min_size(
+                            track.min,
+                            vec2(track.width() * frac.clamp(0.0, 1.0), 8.0),
+                        );
+                        ui.painter().rect_filled(fill, 4.0, color);
+                    }
+
+                    let (dr, _) = ui.allocate_exact_size(vec2(db_w, 16.0), Sense::hover());
+                    let db_str = if audible && db > -48.0 {
+                        format!("{db:+.0} dB")
+                    } else {
+                        "—".into()
+                    };
+                    ui.painter().text(
+                        dr.right_center(),
+                        Align2::RIGHT_CENTER,
+                        db_str,
+                        FontId::monospace(9.5),
+                        ink(128),
+                    );
+                });
+                ui.add_space(2.0);
+            }
+
+            // Metrics strip, same pattern as the F0/LEVEL/ELAPSED readouts.
+            ui.add_space(9.0);
+            let sep = ui.available_rect_before_wrap();
+            ui.painter().line_segment(
+                [pos2(sep.left(), sep.top()), pos2(sep.right(), sep.top())],
+                Stroke::new(1.0, ink(18)),
+            );
+            ui.add_space(11.0);
+
+            let (tilt, balance, formant_pct) = if valid {
+                (
+                    crate::math::spectral_tilt_db_per_octave(&self.harm_ema),
+                    crate::math::even_odd_balance_db(&self.harm_ema),
+                    crate::math::singers_formant_pct(&self.harm_ema, f0),
+                )
+            } else {
+                (None, None, None)
+            };
+            let fmt = |v: Option<f32>, unit: &str| {
+                v.map(|v| format!("{v:+.1} {unit}"))
+                    .unwrap_or_else(|| "—".into())
+            };
+            let cells = [
+                ("TILT", fmt(tilt, "dB/oct")),
+                ("EVEN/ODD", fmt(balance, "dB")),
+                (
+                    "SINGER'S FMT",
+                    formant_pct
+                        .map(|p| format!("{p:.0} %"))
+                        .unwrap_or_else(|| "—".into()),
+                ),
+            ];
+            ui.columns(3, |cols| {
+                for (col, (label, value)) in cols.iter_mut().zip(cells) {
+                    col.label(
+                        RichText::new(label)
+                            .font(FontId::monospace(9.5))
+                            .color(ink(115)),
+                    );
+                    col.add_space(3.0);
+                    col.label(
+                        RichText::new(value)
+                            .font(FontId::monospace(13.0))
+                            .color(INK)
+                            .strong(),
+                    );
+                }
+            });
+        });
     }
 
     fn screen_sessions(&mut self, ui: &mut egui::Ui) {
