@@ -4,6 +4,27 @@ pub struct Formant {
     pub bandwidth: f32,
 }
 
+/// A detected vibrato: oscillation rate and extent (± cents around the mean).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Vibrato {
+    pub rate_hz: f32,
+    pub extent_cents: f32,
+}
+
+/// Per-frame voice-quality metrics. All `None` until the analysis has enough
+/// voiced signal to say something honest.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VoiceMetrics {
+    /// Harmonics-to-noise ratio (dB); breathiness/clarity.
+    pub hnr_db: Option<f32>,
+    /// H1–H2 level difference (dB); phonation type (breathy vs pressed).
+    pub h1_h2_db: Option<f32>,
+    /// Detected vibrato; `None` when no stable 3–9 Hz oscillation dominates.
+    pub vibrato: Option<Vibrato>,
+    /// RMS cents deviation of the sustain after drift + vibrato removal.
+    pub steadiness_cents: Option<f32>,
+}
+
 pub const MAX_PARTIALS: usize = 32;
 
 #[derive(Debug, Clone, Copy)]

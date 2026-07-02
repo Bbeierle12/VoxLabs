@@ -25,6 +25,10 @@ mod android;
 
 mod concurrency;
 mod math;
+// f0-contour metrics (vibrato/steadiness): used by the desktop and Android
+// analysis loops; the web target has no analysis thread yet.
+#[cfg(not(target_arch = "wasm32"))]
+mod metrics;
 mod synthesis;
 mod types;
 mod ui;
