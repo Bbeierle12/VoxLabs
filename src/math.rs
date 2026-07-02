@@ -1,4 +1,4 @@
-use crate::types::Formant;
+use crate::types::{Formant, MAX_PARTIALS};
 use aberth::AberthSolver;
 use std::f32::consts::PI;
 
@@ -388,6 +388,56 @@ pub fn lpc_coefficients(samples: &[f32], order: usize, preemph: f32) -> Vec<f32>
     levinson_durbin(&r, order)
 }
 
+// ── Harmonic series ──────────────────────────────────────────────────────────
+
+/// Amplitudes of the first [`MAX_PARTIALS`] harmonics of `f0`, measured by a
+/// Hann-windowed Goertzel evaluation of the DFT at exactly k·f0. No FFT: f0 is
+/// already known from YIN, so the analysis bins can sit on the harmonics
+/// themselves instead of a fixed grid.
+///
+/// Returns linear peak amplitudes (a full-scale sine measures ≈ 1.0 at H1).
+/// Harmonics at or above Nyquist — and everything when `f0` is non-positive or
+/// the frame is degenerate — are 0.
+pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; MAX_PARTIALS] {
+    let mut amps = [0.0f32; MAX_PARTIALS];
+    let n = samples.len();
+    if n < 32 || f0 <= 0.0 || sample_rate <= 0.0 {
+        return amps;
+    }
+
+    // Hann window; its coherent gain (Σw / 2) normalizes the DFT magnitude
+    // back to sinusoid peak amplitude.
+    let m = (n - 1) as f32;
+    let mut windowed = vec![0.0f32; n];
+    let mut wsum = 0.0f32;
+    for (i, (w, &x)) in windowed.iter_mut().zip(samples).enumerate() {
+        let win = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+        *w = x * win;
+        wsum += win;
+    }
+    let norm = 2.0 / wsum;
+
+    let nyquist = sample_rate / 2.0;
+    for (k, amp) in amps.iter_mut().enumerate() {
+        let freq = (k + 1) as f32 * f0;
+        if freq >= nyquist {
+            break;
+        }
+        // Goertzel recurrence at `freq`.
+        let omega = 2.0 * PI * freq / sample_rate;
+        let coeff = 2.0 * omega.cos();
+        let (mut s1, mut s2) = (0.0f32, 0.0f32);
+        for &x in &windowed {
+            let s0 = x + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = (s1 * s1 + s2 * s2 - coeff * s1 * s2).max(0.0);
+        *amp = power.sqrt() * norm;
+    }
+    amps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,6 +573,70 @@ mod tests {
             formants[0].bandwidth,
             expected_bw
         );
+    }
+
+    /// Bandlimited sawtooth: Σ sin(2π k f t)/k for k·f below Nyquist.
+    fn sawtooth(f: f32, sr: f32, n: usize, max_k: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / sr;
+                (1..=max_k)
+                    .filter(|&k| (k as f32) * f < sr / 2.0)
+                    .map(|k| (2.0 * PI * k as f32 * f * t).sin() / k as f32)
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn harmonics_of_sawtooth_follow_one_over_k() {
+        let (sr, f0) = (44_100.0, 110.0);
+        let buf = sawtooth(f0, sr, 2048, 16);
+        let amps = harmonic_amplitudes(&buf, sr, f0);
+        assert!(amps[0] > 0.5, "H1 amp {}", amps[0]);
+        for k in 1..8 {
+            let expected = amps[0] / (k + 1) as f32;
+            let got = amps[k];
+            assert!(
+                (got - expected).abs() < expected * 0.25,
+                "H{} = {got}, expected ~{expected}",
+                k + 1
+            );
+        }
+    }
+
+    #[test]
+    fn harmonics_of_sine_isolate_h1() {
+        let (sr, f0) = (44_100.0, 220.0);
+        let buf = sine(f0, sr, 2048);
+        let amps = harmonic_amplitudes(&buf, sr, f0);
+        assert!(
+            (amps[0] - 1.0).abs() < 0.05,
+            "H1 {} should be ~1.0",
+            amps[0]
+        );
+        for (k, &a) in amps.iter().enumerate().skip(1) {
+            assert!(a < 0.01, "H{} should be ~0, got {a}", k + 1);
+        }
+    }
+
+    #[test]
+    fn harmonics_truncate_at_nyquist() {
+        let (sr, f0) = (22_050.0, 5_000.0);
+        let buf = sine(f0, sr, 2048);
+        let amps = harmonic_amplitudes(&buf, sr, f0);
+        assert!(amps[0] > 0.9, "H1 {} audible", amps[0]);
+        // 3 · 5000 = 15000 ≥ Nyquist (11025) — zero from H3 up.
+        assert_eq!(amps[2], 0.0);
+        assert_eq!(amps[31], 0.0);
+    }
+
+    #[test]
+    fn harmonics_degenerate_inputs_are_silent() {
+        assert_eq!(harmonic_amplitudes(&[0.0; 16], 44_100.0, 110.0), [0.0; 32]);
+        let buf = sine(220.0, 44_100.0, 2048);
+        assert_eq!(harmonic_amplitudes(&buf, 44_100.0, 0.0), [0.0; 32]);
+        assert_eq!(harmonic_amplitudes(&buf, 44_100.0, -5.0), [0.0; 32]);
     }
 
     #[test]
