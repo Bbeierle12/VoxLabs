@@ -611,6 +611,84 @@ pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<
     })
 }
 
+/// Cepstral peak prominence in dB (Hillenbrand-style): Hann-windowed FFT →
+/// dB power spectrum → FFT again → dB cepstrum; the peak in the 60–500 Hz
+/// quefrency band is measured against a linear regression of the cepstrum
+/// over the analysis range. High CPP = strong, clean periodicity; breathy or
+/// dysphonic voices read low.
+///
+/// Absolute values depend on the recipe (window, normalization) — treat as an
+/// internally-consistent relative measure, like our HNR.
+pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    let n = samples.len();
+    if n < 256 || sample_rate <= 0.0 {
+        return None;
+    }
+    if samples.iter().map(|s| s * s).sum::<f32>() < 1e-9 {
+        return None; // silence
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n);
+
+    // Hann-windowed spectrum.
+    let m = (n - 1) as f32;
+    let mut buf: Vec<Complex<f32>> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+            Complex::new(x * w, 0.0)
+        })
+        .collect();
+    fft.process(&mut buf);
+
+    // dB power spectrum is real and even, so its FFT is the real cepstrum.
+    let mut logspec: Vec<Complex<f32>> = buf
+        .iter()
+        .map(|c| Complex::new(10.0 * (c.norm_sqr() + 1e-12).log10(), 0.0))
+        .collect();
+    fft.process(&mut logspec);
+    let ceps_db: Vec<f32> = logspec
+        .iter()
+        .map(|c| 10.0 * (c.norm_sqr() / (n as f32) / (n as f32) + 1e-12).log10())
+        .collect();
+
+    // Voice pitch quefrency band: 60–500 Hz.
+    let q_lo = (sample_rate / 500.0).ceil() as usize;
+    let q_hi = ((sample_rate / 60.0).floor() as usize).min(n / 2 - 1);
+    if q_lo + 4 >= q_hi {
+        return None;
+    }
+
+    // Regression baseline over the full analyzed quefrency range.
+    let range = q_lo..n / 2;
+    let cnt = range.len() as f32;
+    let mx = range.clone().map(|q| q as f32).sum::<f32>() / cnt;
+    let my = range.clone().map(|q| ceps_db[q]).sum::<f32>() / cnt;
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for q in range {
+        let dx = q as f32 - mx;
+        num += dx * (ceps_db[q] - my);
+        den += dx * dx;
+    }
+    if den < 1e-9 {
+        return None;
+    }
+    let slope = num / den;
+
+    let q_pk = (q_lo..=q_hi)
+        .max_by(|&a, &b| {
+            ceps_db[a]
+                .partial_cmp(&ceps_db[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(q_lo);
+    Some(ceps_db[q_pk] - (my + slope * (q_pk as f32 - mx)))
+}
+
 // ── Musical mapping & timbre metrics ─────────────────────────────────────────
 
 /// A 12-TET note name for a frequency: pitch class, octave, and signed cents
@@ -986,6 +1064,26 @@ mod tests {
             .collect();
         assert!(cycle_perturbation(&noise, sr, 220.0).is_none());
         assert!(cycle_perturbation(&[0.0; 2048], sr, 220.0).is_none());
+    }
+
+    #[test]
+    fn cpp_separates_periodic_from_noise() {
+        let sr = 44_100.0;
+        let voiced = sawtooth(220.0, sr, 2048, 16);
+        let noise: Vec<f32> = (0..2048)
+            .map(|i| ((i as f32 * 12.9898).sin() * 43758.5).fract() - 0.5)
+            .collect();
+
+        let cpp_voiced = cpp_db(&voiced, sr).expect("voiced CPP");
+        let cpp_noise = cpp_db(&noise, sr).expect("noise CPP");
+        assert!(
+            cpp_voiced > cpp_noise + 5.0,
+            "voiced {cpp_voiced} should clearly exceed noise {cpp_noise}"
+        );
+        assert!(cpp_voiced.is_finite() && cpp_noise.is_finite());
+
+        assert!(cpp_db(&[0.0; 2048], sr).is_none());
+        assert!(cpp_db(&voiced[..64], sr).is_none());
     }
 
     #[test]

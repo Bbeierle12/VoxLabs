@@ -18,6 +18,8 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 aberth = "0.4.1"
 anyhow = "1.0.102"
+# CPP (cepstral peak prominence): pure-Rust FFT, fine on Android and wasm.
+rustfft = "6"
 atomic_float = "1.1.0"
 bytemuck = "1.25.0"
 crossbeam-utils = "0.8.21"
