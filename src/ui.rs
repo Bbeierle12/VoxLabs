@@ -171,6 +171,9 @@ pub struct DashboardApp {
     jitter_disp: Option<f32>,
     shimmer_disp: Option<f32>,
     cpp_disp: Option<f32>,
+    /// Bozeman's F1/H2 "turning over" distance in semitones (see
+    /// [`crate::math::semitones_from`]), display-smoothed.
+    turnover_disp: Option<f32>,
     next_session_num: u32,
     rng: u64,
 }
@@ -288,6 +291,7 @@ impl DashboardApp {
             jitter_disp: None,
             shimmer_disp: None,
             cpp_disp: None,
+            turnover_disp: None,
             next_session_num: 2482,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
@@ -477,6 +481,15 @@ impl eframe::App for DashboardApp {
             self.current_profile.metrics.shimmer_db,
         );
         smooth(&mut self.cpp_disp, self.current_profile.metrics.cpp_db);
+        // Bozeman F1/H2 crossing: derived straight from f0 + F1, both already
+        // in the profile, so it needs no engine-side plumbing of its own.
+        let f1 = self.current_profile.formants[0].frequency;
+        let turnover_raw = if self.current_profile.valid && f1 > 0.0 {
+            crate::math::semitones_from(2.0 * self.current_profile.f0, f1)
+        } else {
+            None
+        };
+        smooth(&mut self.turnover_disp, turnover_raw);
         self.push_wave_sample();
 
         let full = ui.max_rect();
@@ -1264,6 +1277,79 @@ impl DashboardApp {
 
     /// Live harmonic-series card: per-partial ladder (dB bars, note names,
     /// cents) plus the timbre metrics strip (tilt, even/odd, singer's formant).
+    /// Bozeman's F1/H2 "turning over" gauge: shows the second harmonic's
+    /// position relative to the first formant — negative (open timbre,
+    /// *voce aperta*) below the crossing, zero at the acoustic passaggio
+    /// event, positive (closed/covered timbre, *voce chiusa*) above it. The
+    /// amber zone width follows Bozeman's note that the perceptual
+    /// transition spans "about a major second to a major third" centered on
+    /// the crossing (Journal of Singing, 2010).
+    fn turning_over_gauge(&self, ui: &mut egui::Ui) {
+        const RANGE: f32 = 6.0; // displayed span, ± semitones
+        const TURN_ZONE: f32 = 2.0; // half-width of the amber "turning" band
+
+        let semis = self.turnover_disp;
+        let (state, color) = match semis {
+            Some(s) if s < -TURN_ZONE => ("OPEN", TEAL),
+            Some(s) if s > TURN_ZONE => ("CLOSED", CYAN_DEEP),
+            Some(_) => ("TURNING", AMBER),
+            None => ("—", ink(115)),
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("F1 / H2 · PASSAGGIO")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let numeric = semis
+                    .map(|s| format!("{s:+.1} st"))
+                    .unwrap_or_else(|| "—".into());
+                ui.label(
+                    RichText::new(format!("{state}  {numeric}"))
+                        .font(FontId::monospace(10.5))
+                        .color(color)
+                        .strong(),
+                );
+            });
+        });
+        ui.add_space(5.0);
+
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
+        let track = Rect::from_min_size(
+            pos2(rect.left(), rect.center().y - 4.0),
+            vec2(rect.width(), 8.0),
+        );
+        let to_x = |st: f32| -> f32 {
+            let t = ((st + RANGE) / (2.0 * RANGE)).clamp(0.0, 1.0);
+            track.left() + t * track.width()
+        };
+
+        ui.painter().rect_filled(track, 4.0, ink(10));
+        // Amber "turning" zone band, centered on the crossing.
+        let zone = Rect::from_min_max(
+            pos2(to_x(-TURN_ZONE), track.top()),
+            pos2(to_x(TURN_ZONE), track.bottom()),
+        );
+        ui.painter()
+            .rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(217, 119, 6, 46));
+        // Crossing tick at exactly 0 semitones — the acoustic passaggio event.
+        let cx = to_x(0.0);
+        ui.painter().line_segment(
+            [pos2(cx, track.top() - 3.0), pos2(cx, track.bottom() + 3.0)],
+            Stroke::new(1.5, ink(90)),
+        );
+
+        if let Some(s) = semis {
+            let mx = to_x(s.clamp(-RANGE, RANGE));
+            let my = track.center().y;
+            ui.painter().circle_filled(pos2(mx, my), 6.0, color);
+            ui.painter()
+                .circle_stroke(pos2(mx, my), 6.0, Stroke::new(1.0, white(230)));
+        }
+    }
+
     fn harmonics_card(&self, ui: &mut egui::Ui) {
         const ROWS: usize = 16;
         let valid = self.current_profile.valid && self.current_profile.f0 > 0.0;
@@ -1300,6 +1386,9 @@ impl DashboardApp {
                 });
             });
             ui.add_space(10.0);
+
+            self.turning_over_gauge(ui);
+            ui.add_space(12.0);
 
             // Ladder: dB relative to the strongest partial, floored at −48 dB.
             let max_amp = self
