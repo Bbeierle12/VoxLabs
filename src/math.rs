@@ -689,6 +689,54 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
     Some(ceps_db[q_pk] - (my + slope * (q_pk as f32 - mx)))
 }
 
+/// Spectral centroid in Hz: the power-weighted mean frequency of the full
+/// magnitude spectrum over 80 Hz–min(8000, Nyquist), not just the harmonic
+/// ladder — this deliberately includes inter-harmonic noise energy, which is
+/// what makes it a meaningful "brightness" measure distinct from the tilt of
+/// the harmonics alone.
+pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
+    use rustfft::{FftPlanner, num_complex::Complex};
+
+    let n = samples.len();
+    if n < 256 || sample_rate <= 0.0 {
+        return None;
+    }
+    if samples.iter().map(|s| s * s).sum::<f32>() < 1e-9 {
+        return None; // silence
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(n);
+
+    let m = (n - 1) as f32;
+    let mut buf: Vec<Complex<f32>> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+            Complex::new(x * w, 0.0)
+        })
+        .collect();
+    fft.process(&mut buf);
+
+    let bin_hz = sample_rate / n as f32;
+    let lo_bin = (80.0 / bin_hz).ceil() as usize;
+    let hi_bin = ((8000.0f32.min(sample_rate / 2.0)) / bin_hz).floor() as usize;
+    let hi_bin = hi_bin.min(n / 2);
+    if lo_bin >= hi_bin {
+        return None;
+    }
+
+    let (mut num, mut den) = (0.0f32, 0.0f32);
+    for bin in lo_bin..hi_bin {
+        let amp = buf[bin].norm();
+        let freq = bin as f32 * bin_hz;
+        num += freq * amp;
+        den += amp;
+    }
+    (den > 1e-9).then(|| num / den)
+}
+
 // ── Musical mapping & timbre metrics ─────────────────────────────────────────
 
 /// A 12-TET note name for a frequency: pitch class, octave, and signed cents
@@ -1101,6 +1149,49 @@ mod tests {
 
         assert!(cpp_db(&[0.0; 2048], sr).is_none());
         assert!(cpp_db(&voiced[..64], sr).is_none());
+    }
+
+    #[test]
+    fn centroid_of_pure_tone_is_that_tone() {
+        let sr = 44_100.0;
+        let buf = sine(1000.0, sr, 2048);
+        let c = spectral_centroid(&buf, sr).expect("centroid");
+        assert!((c - 1000.0).abs() < 30.0, "centroid {c} should be ~1000 Hz");
+    }
+
+    #[test]
+    fn centroid_of_two_tones_is_between_them_weighted() {
+        let sr = 44_100.0;
+        // Equal-amplitude 500 Hz + 1500 Hz should centroid near the midpoint;
+        // boosting the higher tone should pull it up.
+        let equal: Vec<f32> = sine(500.0, sr, 2048)
+            .iter()
+            .zip(sine(1500.0, sr, 2048))
+            .map(|(a, b)| a + b)
+            .collect();
+        let c_equal = spectral_centroid(&equal, sr).expect("equal centroid");
+        assert!(
+            (c_equal - 1000.0).abs() < 60.0,
+            "equal-weight centroid {c_equal} should be ~1000 Hz"
+        );
+
+        let boosted: Vec<f32> = sine(500.0, sr, 2048)
+            .iter()
+            .zip(sine(1500.0, sr, 2048))
+            .map(|(a, b)| a + 4.0 * b)
+            .collect();
+        let c_boosted = spectral_centroid(&boosted, sr).expect("boosted centroid");
+        assert!(
+            c_boosted > c_equal,
+            "boosting the higher tone should raise centroid: {c_boosted} vs {c_equal}"
+        );
+    }
+
+    #[test]
+    fn centroid_degenerate_inputs_are_none() {
+        assert!(spectral_centroid(&[0.0; 2048], 44_100.0).is_none());
+        assert!(spectral_centroid(&sine(1000.0, 44_100.0, 2048), 0.0).is_none());
+        assert!(spectral_centroid(&sine(1000.0, 44_100.0, 64), 44_100.0).is_none());
     }
 
     #[test]
