@@ -255,6 +255,9 @@ pub struct AnalysisEngine {
     ui_profile_tx: Input<VocalProfile>,
     /// Last successfully measured formants, held across unvoiced frames.
     last_formants: [Formant; 3],
+    /// f0-contour tracker for vibrato/steadiness. Lazily built on the first
+    /// frame because the contour rate depends on the mic sample rate.
+    contour: Option<crate::metrics::F0Contour>,
 }
 
 impl AnalysisEngine {
@@ -268,6 +271,7 @@ impl AnalysisEngine {
             profile_tx,
             ui_profile_tx,
             last_formants: DEFAULT_FORMANTS,
+            contour: None,
         })
     }
 
@@ -320,10 +324,33 @@ impl AnalysisEngine {
             [0.0; crate::types::MAX_PARTIALS]
         };
 
+        // Voice-quality metrics: per-frame HNR / H1–H2 plus contour-level
+        // vibrato and steadiness over the last ~2 s of voicing.
+        let contour = self.contour.get_or_insert_with(|| {
+            crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32)
+        });
+        contour.push(f0, voiced);
+        let (vibrato, steadiness_cents) = contour.analyze();
+        let metrics = crate::types::VoiceMetrics {
+            hnr_db: if voiced {
+                crate::math::hnr_db(audio_in, sample_rate, f0)
+            } else {
+                None
+            },
+            h1_h2_db: if voiced {
+                crate::math::h1_h2_db(&partial_amplitudes)
+            } else {
+                None
+            },
+            vibrato,
+            steadiness_cents,
+        };
+
         let profile = VocalProfile {
             f0,
             formants,
             partial_amplitudes,
+            metrics,
             valid: voiced,
         };
 

@@ -34,6 +34,8 @@ pub struct VocalProfile {
     /// Measured amplitude of each harmonic k·f0 (linear peak, Goertzel at the
     /// harmonic frequencies). Zeroed when the frame is unvoiced.
     pub partial_amplitudes: [f32; MAX_PARTIALS],
+    /// Voice-quality metrics (HNR, H1–H2, vibrato, steadiness).
+    pub metrics: VoiceMetrics,
     pub valid: bool,
 }
 
@@ -46,6 +48,7 @@ impl Default for VocalProfile {
                 bandwidth: 0.0,
             }; 3],
             partial_amplitudes: [0.0; MAX_PARTIALS],
+            metrics: VoiceMetrics::default(),
             valid: false,
         }
     }

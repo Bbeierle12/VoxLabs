@@ -144,6 +144,8 @@ fn cpu_analysis_loop(
 
     let mut last_formants = DEFAULT_FORMANTS;
     let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
+    // f0-contour tracker for vibrato/steadiness, mirroring the desktop path.
+    let mut contour = crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32);
 
     loop {
         while let Ok(sample) = audio_rx.pop() {
@@ -181,10 +183,29 @@ fn cpu_analysis_loop(
                 [0.0; crate::types::MAX_PARTIALS]
             };
 
+            // Voice-quality metrics, mirroring the desktop analysis path.
+            contour.push(f0, voiced);
+            let (vibrato, steadiness_cents) = contour.analyze();
+            let metrics = crate::types::VoiceMetrics {
+                hnr_db: if voiced {
+                    math::hnr_db(frame, sample_rate, f0)
+                } else {
+                    None
+                },
+                h1_h2_db: if voiced {
+                    math::h1_h2_db(&partial_amplitudes)
+                } else {
+                    None
+                },
+                vibrato,
+                steadiness_cents,
+            };
+
             let profile = VocalProfile {
                 f0,
                 formants: last_formants,
                 partial_amplitudes,
+                metrics,
                 valid: voiced,
             };
             profile_tx.write(profile);
