@@ -9,3 +9,5 @@ dist/
 
 # Agent worktrees / harness scratch (transient; never track).
 /.claude/
+
+.idea/
