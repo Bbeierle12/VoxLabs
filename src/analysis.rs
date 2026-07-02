@@ -356,6 +356,11 @@ impl AnalysisEngine {
             } else {
                 None
             },
+            centroid_hz: if voiced {
+                crate::math::spectral_centroid(audio_in, sample_rate)
+            } else {
+                None
+            },
         };
 
         let profile = VocalProfile {

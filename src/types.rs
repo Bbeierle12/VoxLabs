@@ -30,6 +30,9 @@ pub struct VoiceMetrics {
     pub shimmer_db: Option<f32>,
     /// Cepstral peak prominence (dB): periodicity strength / breathiness.
     pub cpp_db: Option<f32>,
+    /// Spectral centroid (Hz): full-spectrum power-weighted mean frequency,
+    /// driving the Dark..Brilliant brightness classification.
+    pub centroid_hz: Option<f32>,
 }
 
 pub const MAX_PARTIALS: usize = 32;

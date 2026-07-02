@@ -211,6 +211,11 @@ fn cpu_analysis_loop(
                 } else {
                     None
                 },
+                centroid_hz: if voiced {
+                    math::spectral_centroid(frame, sample_rate)
+                } else {
+                    None
+                },
             };
 
             let profile = VocalProfile {
