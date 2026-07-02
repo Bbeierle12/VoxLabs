@@ -499,6 +499,118 @@ pub fn h1_h2_db(amps: &[f32]) -> Option<f32> {
     (max > 1e-6 && a1 > floor && a2 > floor).then(|| 20.0 * (a1 / a2).log10())
 }
 
+/// Cycle-to-cycle perturbation measures from one analysis frame.
+#[derive(Debug, Clone, Copy)]
+pub struct CyclePerturbation {
+    /// Jitter (local), %: mean |T_i − T_{i+1}| / mean T · 100.
+    pub jitter_pct: f32,
+    /// Shimmer (local), dB: mean |20·log10(A_{i+1}/A_i)| over adjacent cycles.
+    pub shimmer_db: f32,
+}
+
+/// Cycle marks by peak-picking: one positive peak per pitch period, each
+/// refined parabolically for sub-sample precision (0.5 % jitter at a
+/// 200-sample period is a single sample — integer marks would drown it).
+///
+/// Returns `None` unless the frame yields ≥ 5 peaks whose spacings all sit
+/// within ±30 % of the YIN period — a tracking failure reads as "no
+/// measurement", never as a wild number. The ≥ 5-cycle requirement puts a
+/// floor on measurable pitch: f0 ≥ ~5·sr/frame (≈ 112 Hz @ 44.1 k / 2048).
+pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<CyclePerturbation> {
+    let n = samples.len();
+    if f0 <= 0.0 || sample_rate <= 0.0 || n < 64 {
+        return None;
+    }
+    let period = sample_rate / f0;
+    if period < 8.0 {
+        return None;
+    }
+
+    // Refined (position, height) of the maximum in [lo, hi).
+    let peak_in = |lo: usize, hi: usize| -> Option<(f32, f32)> {
+        let hi = hi.min(n);
+        if lo + 1 >= hi {
+            return None;
+        }
+        let mut best = lo;
+        for i in lo..hi {
+            if samples[i] > samples[best] {
+                best = i;
+            }
+        }
+        if best == 0 || best + 1 >= n {
+            return Some((best as f32, samples[best]));
+        }
+        let (y0, y1, y2) = (samples[best - 1], samples[best], samples[best + 1]);
+        let denom = y0 - 2.0 * y1 + y2;
+        if denom.abs() < 1e-12 {
+            return Some((best as f32, y1));
+        }
+        let delta = ((y0 - y2) / (2.0 * denom)).clamp(-0.5, 0.5);
+        let height = y1 - (y0 - y2) * delta / 4.0;
+        Some((best as f32 + delta, height))
+    };
+
+    // First mark: strongest sample in the first 1.5 periods; then march
+    // forward one period at a time inside a ±30 % search window.
+    let mut marks: Vec<(f32, f32)> = Vec::new();
+    let first = peak_in(0, (1.5 * period) as usize)?;
+    marks.push(first);
+    loop {
+        let prev = marks.last().unwrap().0;
+        let lo = (prev + 0.7 * period) as usize;
+        let hi = (prev + 1.3 * period).ceil() as usize;
+        if hi > n {
+            break;
+        }
+        match peak_in(lo, hi) {
+            Some(p) => marks.push(p),
+            None => break,
+        }
+    }
+    if marks.len() < 5 {
+        return None;
+    }
+
+    let periods: Vec<f32> = marks.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    // Sanity: every interval near the YIN period, else the marks double-fired
+    // or skipped (strong formants can do this) and the numbers would be junk.
+    if periods
+        .iter()
+        .any(|&t| t < 0.7 * period || t > 1.3 * period)
+    {
+        return None;
+    }
+
+    let mean_t = periods.iter().sum::<f32>() / periods.len() as f32;
+    let jitter_pct = periods.windows(2).map(|w| (w[0] - w[1]).abs()).sum::<f32>()
+        / (periods.len() - 1) as f32
+        / mean_t
+        * 100.0;
+    // Plausibility ceiling: aperiodic input yields peaks scattered uniformly
+    // inside the search windows (~20-30 % "jitter") — the ±30 % interval
+    // check can't catch that by construction. Severe pathology is ~2-3 %;
+    // beyond 5 % the marks aren't tracking real glottal cycles.
+    if jitter_pct > 5.0 {
+        return None;
+    }
+
+    let amps: Vec<f32> = marks.iter().map(|&(_, a)| a).collect();
+    if amps.iter().any(|&a| a <= 1e-6) {
+        return None;
+    }
+    let shimmer_db = amps
+        .windows(2)
+        .map(|w| (20.0 * (w[1] / w[0]).log10()).abs())
+        .sum::<f32>()
+        / (amps.len() - 1) as f32;
+
+    Some(CyclePerturbation {
+        jitter_pct,
+        shimmer_db,
+    })
+}
+
 // ── Musical mapping & timbre metrics ─────────────────────────────────────────
 
 /// A 12-TET note name for a frequency: pitch class, octave, and signed cents
@@ -795,6 +907,85 @@ mod tests {
         let buf = sine(220.0, 44_100.0, 2048);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, 0.0), [0.0; 32]);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, -5.0), [0.0; 32]);
+    }
+
+    /// Phase-accumulator synthesis with per-cycle frequency deviation and
+    /// gain: cycle boundaries land at exact fractional sample positions, so
+    /// the imposed perturbations are the ground truth (no rounding jitter).
+    fn perturbed_tone(
+        sr: f32,
+        f_base: f32,
+        n: usize,
+        dev: impl Fn(usize) -> f32,
+        gain: impl Fn(usize) -> f32,
+    ) -> Vec<f32> {
+        let mut phase = 0.0f64; // in cycles
+        (0..n)
+            .map(|_| {
+                let cyc = phase.floor() as usize;
+                let f = f_base * (1.0 + dev(cyc));
+                let x: f32 = (1..=6)
+                    .map(|k| {
+                        ((2.0 * std::f64::consts::PI * k as f64 * phase).sin() / k as f64) as f32
+                    })
+                    .sum();
+                phase += (f / sr) as f64;
+                gain(cyc) * x
+            })
+            .collect()
+    }
+
+    #[test]
+    fn perturbation_floor_on_clean_tone() {
+        let sr = 44_100.0;
+        let buf = perturbed_tone(sr, 220.0, 2048, |_| 0.0, |_| 1.0);
+        let p = cycle_perturbation(&buf, sr, 220.0).expect("clean tone measures");
+        assert!(p.jitter_pct < 0.2, "jitter floor {}", p.jitter_pct);
+        assert!(p.shimmer_db < 0.1, "shimmer floor {}", p.shimmer_db);
+    }
+
+    #[test]
+    fn jitter_tracks_imposed_period_perturbation() {
+        // Alternating ±1 % frequency → adjacent periods differ by ~2 %.
+        let sr = 44_100.0;
+        let dev = |c: usize| if c % 2 == 0 { 0.01 } else { -0.01 };
+        let buf = perturbed_tone(sr, 220.0, 2048, dev, |_| 1.0);
+        let p = cycle_perturbation(&buf, sr, 220.0).expect("jittered tone measures");
+        assert!(
+            (p.jitter_pct - 2.0).abs() < 0.5,
+            "jitter {} should be ~2 %",
+            p.jitter_pct
+        );
+    }
+
+    #[test]
+    fn shimmer_tracks_imposed_amplitude_perturbation() {
+        // Alternating ±0.25 dB gain → adjacent cycles differ by 0.5 dB.
+        let sr = 44_100.0;
+        let g = 10f32.powf(0.25 / 20.0);
+        let gain = move |c: usize| if c % 2 == 0 { g } else { 1.0 / g };
+        let buf = perturbed_tone(sr, 220.0, 2048, |_| 0.0, gain);
+        let p = cycle_perturbation(&buf, sr, 220.0).expect("shimmered tone measures");
+        assert!(
+            (p.shimmer_db - 0.5).abs() < 0.15,
+            "shimmer {} should be ~0.5 dB",
+            p.shimmer_db
+        );
+    }
+
+    #[test]
+    fn perturbation_gates_reject_bad_frames() {
+        let sr = 44_100.0;
+        // Too few cycles: 80 Hz gives ~3.7 periods in 2048 samples.
+        let low = perturbed_tone(sr, 80.0, 2048, |_| 0.0, |_| 1.0);
+        assert!(cycle_perturbation(&low, sr, 80.0).is_none());
+        // Aperiodic noise: interval sanity gate must fire rather than
+        // returning junk numbers.
+        let noise: Vec<f32> = (0..2048)
+            .map(|i| ((i as f32 * 12.9898).sin() * 43758.5).fract() - 0.5)
+            .collect();
+        assert!(cycle_perturbation(&noise, sr, 220.0).is_none());
+        assert!(cycle_perturbation(&[0.0; 2048], sr, 220.0).is_none());
     }
 
     #[test]
