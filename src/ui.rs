@@ -171,6 +171,7 @@ pub struct DashboardApp {
     jitter_disp: Option<f32>,
     shimmer_disp: Option<f32>,
     cpp_disp: Option<f32>,
+    centroid_disp: Option<f32>,
     /// Bozeman's F1/H2 "turning over" distance in semitones (see
     /// [`crate::math::semitones_from`]), display-smoothed.
     turnover_disp: Option<f32>,
@@ -291,6 +292,7 @@ impl DashboardApp {
             jitter_disp: None,
             shimmer_disp: None,
             cpp_disp: None,
+            centroid_disp: None,
             turnover_disp: None,
             next_session_num: 2482,
             rng: 0x9E37_79B9_7F4A_7C15,
@@ -481,6 +483,10 @@ impl eframe::App for DashboardApp {
             self.current_profile.metrics.shimmer_db,
         );
         smooth(&mut self.cpp_disp, self.current_profile.metrics.cpp_db);
+        smooth(
+            &mut self.centroid_disp,
+            self.current_profile.metrics.centroid_hz,
+        );
         // Bozeman F1/H2 crossing: derived straight from f0 + F1, both already
         // in the profile, so it needs no engine-side plumbing of its own.
         let f1 = self.current_profile.formants[0].frequency;
@@ -1284,6 +1290,66 @@ impl DashboardApp {
     /// amber zone width follows Bozeman's note that the perceptual
     /// transition spans "about a major second to a major third" centered on
     /// the crossing (Journal of Singing, 2010).
+    /// Cents tuning needle: ±50¢ around the current note, glowing teal within
+    /// ±5¢ ("in tune"), amber otherwise. Ported from the Personal Harmonic
+    /// Identifier prototype's needle meter — previously cents were text-only.
+    fn cents_needle_gauge(&self, ui: &mut egui::Ui) {
+        const RANGE: f32 = 50.0;
+        let valid = self.current_profile.valid && self.current_profile.f0 > 0.0;
+        let cents = if valid {
+            crate::math::freq_to_note(self.current_profile.f0).map(|n| n.cents)
+        } else {
+            None
+        };
+        let in_tune = cents.is_some_and(|c| c.abs() <= 5.0);
+        let color = if in_tune { TEAL } else { AMBER };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("TUNING")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let text = match cents {
+                    Some(c) if in_tune => format!("IN TUNE  {c:+.0}¢"),
+                    Some(c) => format!("{c:+.0}¢"),
+                    None => "—".into(),
+                };
+                ui.label(
+                    RichText::new(text)
+                        .font(FontId::monospace(10.5))
+                        .color(color)
+                        .strong(),
+                );
+            });
+        });
+        ui.add_space(5.0);
+
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::hover());
+        let track = Rect::from_min_size(
+            pos2(rect.left(), rect.center().y - 3.0),
+            vec2(rect.width(), 6.0),
+        );
+        let to_x = |c: f32| -> f32 {
+            let t = ((c + RANGE) / (2.0 * RANGE)).clamp(0.0, 1.0);
+            track.left() + t * track.width()
+        };
+        ui.painter().rect_filled(track, 3.0, ink(10));
+        let cx = to_x(0.0);
+        ui.painter().line_segment(
+            [pos2(cx, track.top() - 3.0), pos2(cx, track.bottom() + 3.0)],
+            Stroke::new(1.5, ink(90)),
+        );
+        if let Some(c) = cents {
+            let mx = to_x(c.clamp(-RANGE, RANGE));
+            let my = track.center().y;
+            ui.painter().circle_filled(pos2(mx, my), 5.0, color);
+            ui.painter()
+                .circle_stroke(pos2(mx, my), 5.0, Stroke::new(1.0, white(230)));
+        }
+    }
+
     fn turning_over_gauge(&self, ui: &mut egui::Ui) {
         const RANGE: f32 = 6.0; // displayed span, ± semitones
         const TURN_ZONE: f32 = 2.0; // half-width of the amber "turning" band
@@ -1386,6 +1452,9 @@ impl DashboardApp {
                 });
             });
             ui.add_space(10.0);
+
+            self.cents_needle_gauge(ui);
+            ui.add_space(12.0);
 
             self.turning_over_gauge(ui);
             ui.add_space(12.0);
@@ -1538,6 +1607,29 @@ impl DashboardApp {
                         self.cpp_disp
                             .map(|v| format!("{v:.0} dB"))
                             .unwrap_or_else(|| "—".into()),
+                    ),
+                ],
+                [
+                    (
+                        "CENTROID",
+                        self.centroid_disp
+                            .map(|v| format!("{v:.0} Hz"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    (
+                        "VOICE CLASS",
+                        if valid {
+                            crate::math::voice_class(f0).to_string()
+                        } else {
+                            "—".into()
+                        },
+                    ),
+                    (
+                        "BRIGHTNESS",
+                        self.centroid_disp
+                            .map(crate::math::brightness_class)
+                            .unwrap_or("—")
+                            .to_string(),
                     ),
                 ],
             ];
