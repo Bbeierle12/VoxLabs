@@ -728,8 +728,8 @@ pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
     }
 
     let (mut num, mut den) = (0.0f32, 0.0f32);
-    for bin in lo_bin..hi_bin {
-        let amp = buf[bin].norm();
+    for (bin, c) in buf.iter().enumerate().take(hi_bin).skip(lo_bin) {
+        let amp = c.norm();
         let freq = bin as f32 * bin_hz;
         num += freq * amp;
         den += amp;
@@ -902,10 +902,10 @@ pub fn brightness_class(centroid_hz: f32) -> &'static str {
 /// the strongest partial (as displayed on the harmonic ladder); only
 /// H2..H16 count toward the "strong harmonic" tally, matching the prototype.
 pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'static str {
-    if let Some(db) = even_odd_db {
-        if db < -6.0 {
-            return "Hollow · odd-dominant";
-        }
+    if let Some(db) = even_odd_db
+        && db < -6.0
+    {
+        return "Hollow · odd-dominant";
     }
     let strong = rel_amps.iter().skip(1).filter(|&&a| a > 0.25).count();
     if strong >= 6 {
