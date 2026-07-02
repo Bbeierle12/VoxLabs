@@ -174,11 +174,18 @@ fn cpu_analysis_loop(
                 }
             }
 
+            // Harmonic series at k·f0, mirroring the desktop analysis path.
+            let partial_amplitudes = if voiced {
+                math::harmonic_amplitudes(frame, sample_rate, f0)
+            } else {
+                [0.0; crate::types::MAX_PARTIALS]
+            };
+
             let profile = VocalProfile {
                 f0,
                 formants: last_formants,
+                partial_amplitudes,
                 valid: voiced,
-                ..VocalProfile::default()
             };
             profile_tx.write(profile);
             ui_profile_tx.write(profile);

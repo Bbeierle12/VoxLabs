@@ -10,8 +10,8 @@ pub const MAX_PARTIALS: usize = 32;
 pub struct VocalProfile {
     pub f0: f32,
     pub formants: [Formant; 3], // F1, F2, F3
-    /// Reserved: per-harmonic amplitudes for a future richer synthesis envelope.
-    #[allow(dead_code)]
+    /// Measured amplitude of each harmonic k·f0 (linear peak, Goertzel at the
+    /// harmonic frequencies). Zeroed when the frame is unvoiced.
     pub partial_amplitudes: [f32; MAX_PARTIALS],
     pub valid: bool,
 }

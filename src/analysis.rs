@@ -312,11 +312,19 @@ impl AnalysisEngine {
         }
         let formants = self.last_formants;
 
+        // Harmonic series at k·f0 (drives the musician-facing ladder);
+        // silent when unvoiced rather than holding stale bars.
+        let partial_amplitudes = if voiced {
+            crate::math::harmonic_amplitudes(audio_in, sample_rate, f0)
+        } else {
+            [0.0; crate::types::MAX_PARTIALS]
+        };
+
         let profile = VocalProfile {
             f0,
             formants,
+            partial_amplitudes,
             valid: voiced,
-            ..VocalProfile::default()
         };
 
         // Publish to synthesis + UI (VocalProfile is Copy).
