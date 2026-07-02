@@ -51,6 +51,14 @@ pub struct ConcurrencyBridges {
     pub audio_tx: Producer<f32>,
     pub audio_rx: Consumer<f32>,
 
+    // Spectrogram magnitudes, one FFT frame in dB (Analysis -> UI waterfall)
+    pub spectrum_tx: Input<Vec<f32>>,
+    pub spectrum_rx: Output<Vec<f32>>,
+
+    // Raw waveform, most recent analysis frame (Analysis -> UI oscilloscope)
+    pub scope_tx: Input<Vec<f32>>,
+    pub scope_rx: Output<Vec<f32>>,
+
     // Event updates (UI -> Synthesis)
     pub event_tx: Producer<EngineEvent>,
     pub event_rx: Consumer<EngineEvent>,
@@ -71,6 +79,14 @@ impl ConcurrencyBridges {
         let (ui_profile_tx, ui_profile_rx) = TripleBuffer::new(&VocalProfile::default()).split();
         let (audio_tx, audio_rx) = RingBuffer::new(8192);
         let (event_tx, event_rx) = RingBuffer::new(256);
+        let (spectrum_tx, spectrum_rx) = TripleBuffer::new(&vec![
+            crate::spectrogram::DB_FLOOR;
+            crate::spectrogram::N_BINS
+        ])
+        .split();
+        // Raw scope buffer sized to one analysis frame; the UI reads its length
+        // generically, so the exact size here is only the pre-signal default.
+        let (scope_tx, scope_rx) = TripleBuffer::new(&vec![0.0f32; 2048]).split();
         let telemetry = Arc::new(Telemetry::new());
 
         Self {
@@ -80,6 +96,10 @@ impl ConcurrencyBridges {
             ui_profile_rx,
             audio_tx,
             audio_rx,
+            spectrum_tx,
+            spectrum_rx,
+            scope_tx,
+            scope_rx,
             event_tx,
             event_rx,
             telemetry,

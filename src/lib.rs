@@ -29,6 +29,10 @@ mod math;
 // analysis loops; the web target has no analysis thread yet.
 #[cfg(not(target_arch = "wasm32"))]
 mod metrics;
+// Scrolling-spectrogram STFT. Compiled on all targets (its consts size the
+// UI's waterfall buffers); the engine itself is driven only by the desktop
+// and Android analysis loops.
+mod spectrogram;
 mod synthesis;
 mod types;
 mod ui;
@@ -56,6 +60,10 @@ pub fn run() -> anyhow::Result<()> {
 
     let mut audio_rx = bridges.audio_rx;
     let ui_profile_tx = bridges.ui_profile_tx;
+    let spectrum_tx = bridges.spectrum_tx;
+    let spectrum_rx = bridges.spectrum_rx;
+    let scope_tx = bridges.scope_tx;
+    let scope_rx = bridges.scope_rx;
 
     // Determine the real microphone sample rate up front so the analysis DSP
     // scales its frequencies correctly. Previously process_frame was fed a
@@ -71,8 +79,13 @@ pub fn run() -> anyhow::Result<()> {
 
     // Start background analysis thread
     thread::spawn(move || {
-        let mut engine = pollster::block_on(AnalysisEngine::new(profile_tx, ui_profile_tx))
-            .expect("Failed to init AnalysisEngine");
+        let mut engine = pollster::block_on(AnalysisEngine::new(
+            profile_tx,
+            ui_profile_tx,
+            spectrum_tx,
+            scope_tx,
+        ))
+        .expect("Failed to init AnalysisEngine");
 
         // Persistent accumulator. Each tick we drain *everything* available from
         // the ring buffer, then process as many whole frames as we have, carrying
@@ -112,12 +125,15 @@ pub fn run() -> anyhow::Result<()> {
     eframe::run_native(
         "Voice Harmonic Engine",
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             Ok(Box::new(DashboardApp::new(
                 cc,
                 bridges.event_tx,
                 bridges.telemetry.clone(),
                 bridges.ui_profile_rx,
+                spectrum_rx,
+                scope_rx,
+                input_sample_rate,
             )))
         }),
     )

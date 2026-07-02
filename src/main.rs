@@ -41,6 +41,8 @@ fn main() {
         let event_tx = bridges.event_tx;
         let telemetry = bridges.telemetry.clone();
         let ui_profile_rx = bridges.ui_profile_rx;
+        let spectrum_rx = bridges.spectrum_rx;
+        let scope_rx = bridges.scope_rx;
 
         eframe::WebRunner::new()
             .start(
@@ -52,6 +54,11 @@ fn main() {
                         event_tx,
                         telemetry,
                         ui_profile_rx,
+                        spectrum_rx,
+                        scope_rx,
+                        // Web has no analysis thread; a nominal rate keeps the
+                        // spectrogram bin→Hz map well-formed (it stays idle).
+                        48_000.0,
                     )))
                 }),
             )

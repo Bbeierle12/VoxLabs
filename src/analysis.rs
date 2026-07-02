@@ -258,12 +258,20 @@ pub struct AnalysisEngine {
     /// f0-contour tracker for vibrato/steadiness. Lazily built on the first
     /// frame because the contour rate depends on the mic sample rate.
     contour: Option<crate::metrics::F0Contour>,
+    /// Scrolling-spectrogram STFT. Lazily built on the first frame (needs the
+    /// mic sample rate); publishes magnitude frames to the UI waterfall.
+    spectrogram: Option<crate::spectrogram::Spectrogram>,
+    spectrum_tx: Input<Vec<f32>>,
+    /// Raw waveform publisher for the UI oscilloscope.
+    scope_tx: Input<Vec<f32>>,
 }
 
 impl AnalysisEngine {
     pub async fn new(
         profile_tx: Input<VocalProfile>,
         ui_profile_tx: Input<VocalProfile>,
+        spectrum_tx: Input<Vec<f32>>,
+        scope_tx: Input<Vec<f32>>,
     ) -> anyhow::Result<Self> {
         let gpu = GpuYin::new().await?;
         Ok(Self {
@@ -272,6 +280,9 @@ impl AnalysisEngine {
             ui_profile_tx,
             last_formants: DEFAULT_FORMANTS,
             contour: None,
+            spectrogram: None,
+            spectrum_tx,
+            scope_tx,
         })
     }
 
@@ -374,6 +385,18 @@ impl AnalysisEngine {
         // Publish to synthesis + UI (VocalProfile is Copy).
         self.profile_tx.write(profile);
         self.ui_profile_tx.write(profile);
+
+        // Feed the spectrogram the same frame and publish its latest magnitude
+        // frame for the UI waterfall (the hop-based engine emits several frames
+        // per call; the newest is what the UI samples each repaint).
+        let spectrogram = self
+            .spectrogram
+            .get_or_insert_with(crate::spectrogram::Spectrogram::new);
+        spectrogram.process_block(audio_in);
+        self.spectrum_tx.write(spectrogram.magnitudes_db().to_vec());
+
+        // Raw waveform for the oscilloscope.
+        self.scope_tx.write(audio_in.to_vec());
 
         Ok(())
     }

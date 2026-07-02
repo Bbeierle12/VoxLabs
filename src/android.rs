@@ -66,6 +66,8 @@ fn android_main(app: AndroidApp) {
     let profile_tx = bridges.profile_tx;
     let ui_profile_tx = bridges.ui_profile_tx;
     let audio_rx = bridges.audio_rx;
+    let spectrum_tx = bridges.spectrum_tx;
+    let scope_tx = bridges.scope_tx;
 
     // Query the mic rate up front so DSP frequency scaling is correct; fall back
     // if unavailable (permission not yet granted / no input device).
@@ -74,7 +76,14 @@ fn android_main(app: AndroidApp) {
 
     // CPU YIN + LPC on the non-real-time analysis thread.
     thread::spawn(move || {
-        cpu_analysis_loop(profile_tx, ui_profile_tx, audio_rx, input_sample_rate);
+        cpu_analysis_loop(
+            profile_tx,
+            ui_profile_tx,
+            audio_rx,
+            spectrum_tx,
+            scope_tx,
+            input_sample_rate,
+        );
     });
 
     // cpal AAudio engine. Non-fatal on failure: without RECORD_AUDIO the input
@@ -97,6 +106,8 @@ fn android_main(app: AndroidApp) {
     let event_tx = bridges.event_tx;
     let telemetry = bridges.telemetry.clone();
     let ui_profile_rx = bridges.ui_profile_rx;
+    let spectrum_rx = bridges.spectrum_rx;
+    let scope_rx = bridges.scope_rx;
 
     let native_options = eframe::NativeOptions {
         android_app: Some(app),
@@ -114,6 +125,9 @@ fn android_main(app: AndroidApp) {
                 event_tx,
                 telemetry,
                 ui_profile_rx,
+                spectrum_rx,
+                scope_rx,
+                input_sample_rate,
             )))
         }),
     ) {
@@ -134,10 +148,13 @@ fn query_input_sample_rate() -> Option<f32> {
 /// frame estimates f0 (YIN) and — on voiced frames — the formants (decimate →
 /// LPC → root-solve), publishing the profile to synthesis + UI. This mirrors
 /// `AnalysisEngine::process_frame`'s CPU path but never touches wgpu.
+#[allow(clippy::too_many_arguments)]
 fn cpu_analysis_loop(
     mut profile_tx: Input<VocalProfile>,
     mut ui_profile_tx: Input<VocalProfile>,
     mut audio_rx: Consumer<f32>,
+    mut spectrum_tx: Input<Vec<f32>>,
+    mut scope_tx: Input<Vec<f32>>,
     sample_rate: f32,
 ) {
     use crate::math;
@@ -146,6 +163,8 @@ fn cpu_analysis_loop(
     let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
     // f0-contour tracker for vibrato/steadiness, mirroring the desktop path.
     let mut contour = crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32);
+    // Scrolling-spectrogram STFT, mirroring the desktop path.
+    let mut spectrogram = crate::spectrogram::Spectrogram::new();
 
     loop {
         while let Ok(sample) = audio_rx.pop() {
@@ -227,6 +246,11 @@ fn cpu_analysis_loop(
             };
             profile_tx.write(profile);
             ui_profile_tx.write(profile);
+
+            // Spectrogram + oscilloscope feeds, mirroring the desktop path.
+            spectrogram.process_block(frame);
+            spectrum_tx.write(spectrogram.magnitudes_db().to_vec());
+            scope_tx.write(frame.to_vec());
 
             accumulator.drain(..ANALYSIS_FRAME);
         }
