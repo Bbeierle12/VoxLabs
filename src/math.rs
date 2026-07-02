@@ -473,10 +473,17 @@ pub fn freq_to_note(hz: f32) -> Option<Note> {
 /// against log2(harmonic number). A sawtooth's 1/k rolloff measures ≈ −6
 /// dB/oct; a brighter, more pressed voice is shallower (closer to 0).
 pub fn spectral_tilt_db_per_octave(amps: &[f32]) -> Option<f32> {
+    let max = amps.iter().cloned().fold(0.0f32, f32::max);
+    if max <= 1e-6 {
+        return None;
+    }
+    // Only fit partials within 48 dB of the strongest one: bins below that are
+    // numerical noise whose ~−100 dB levels would drag the slope toward −∞.
+    let floor = max * 10f32.powf(-48.0 / 20.0);
     let pts: Vec<(f32, f32)> = amps
         .iter()
         .enumerate()
-        .filter(|&(_, &a)| a > 1e-6)
+        .filter(|&(_, &a)| a > floor)
         .map(|(k, &a)| (((k + 1) as f32).log2(), 20.0 * a.log10()))
         .collect();
     if pts.len() < 2 {
@@ -775,6 +782,16 @@ mod tests {
 
         assert!(spectral_tilt_db_per_octave(&[1.0]).is_none());
         assert!(spectral_tilt_db_per_octave(&[0.0; 8]).is_none());
+    }
+
+    #[test]
+    fn tilt_ignores_partials_below_noise_floor() {
+        // A bandlimited source measures near-zero (but not exactly zero) in
+        // the bins above its last harmonic; those must not skew the fit.
+        let mut amps: Vec<f32> = (1..=8).map(|k| 1.0 / k as f32).collect();
+        amps.extend([1e-5f32; 8]); // ~−100 dB numerical residue
+        let tilt = spectral_tilt_db_per_octave(&amps).unwrap();
+        assert!((tilt + 6.02).abs() < 0.1, "tilt {tilt} should stay ~ −6");
     }
 
     #[test]
