@@ -13,7 +13,7 @@
 //! compute speaker embeddings yet).
 
 use crate::concurrency::{EngineEvent, Telemetry};
-use crate::types::{Formant, MAX_PARTIALS, VocalProfile};
+use crate::types::{Formant, MAX_PARTIALS, Vibrato, VocalProfile};
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Layout, Pos2, Rect, RichText, Sense, Shape, Stroke,
     StrokeKind, pos2, vec2,
@@ -80,8 +80,13 @@ struct Session {
     subj: String,
     date: String,
     f0: f32,
-    hnr: f32,
     match_pct: f32,
+    /// Measured over the capture (means / stop-time snapshot). Seeded demo
+    /// rows carry plausible static values; `None` = not measured.
+    hnr_db: Option<f32>,
+    h1_h2_db: Option<f32>,
+    vibrato: Option<Vibrato>,
+    steadiness_cents: Option<f32>,
     /// Real measured formants when the session came from a live capture;
     /// `None` for the seeded demo archive (detail view derives mock values).
     formants: Option<[Formant; 3]>,
@@ -90,7 +95,10 @@ struct Session {
 struct CaptureResult {
     match_pct: f32,
     f0: f32,
-    hnr: f32,
+    hnr_db: Option<f32>,
+    h1_h2_db: Option<f32>,
+    vibrato: Option<Vibrato>,
+    steadiness_cents: Option<f32>,
     formants: Option<[Formant; 3]>,
 }
 
@@ -142,8 +150,15 @@ pub struct DashboardApp {
     harm_ema: [f32; MAX_PARTIALS],
     /// Real f0 samples collected while recording (mean shown in the result).
     rec_f0_acc: Vec<f32>,
+    /// Real per-frame metrics collected while recording (means stored).
+    rec_hnr_acc: Vec<f32>,
+    rec_h1h2_acc: Vec<f32>,
     /// Last valid formants seen while recording.
     rec_formants: Option<[Formant; 3]>,
+    /// Display-smoothed live readouts (raw values update every ~46 ms and
+    /// flicker as digits). `None` = unvoiced/unknown.
+    hnr_disp: Option<f32>,
+    h1h2_disp: Option<f32>,
     next_session_num: u32,
     rng: u64,
 }
@@ -161,13 +176,30 @@ impl DashboardApp {
         visuals.window_fill = BG_BASE;
         cc.egui_ctx.set_visuals(visuals);
 
-        let seed = |id: &str, subj: &str, date: &str, f0: f32, hnr: f32, m: f32| Session {
+        // Seeded demo archive: plausible static values, marked apart from live
+        // captures only by `formants: None`.
+        #[allow(clippy::too_many_arguments)]
+        let seed = |id: &str,
+                    subj: &str,
+                    date: &str,
+                    f0: f32,
+                    m: f32,
+                    hnr: f32,
+                    h1h2: f32,
+                    vib: Option<(f32, f32)>,
+                    steady: f32| Session {
             id: id.into(),
             subj: subj.into(),
             date: date.into(),
             f0,
-            hnr,
             match_pct: m,
+            hnr_db: Some(hnr),
+            h1_h2_db: Some(h1h2),
+            vibrato: vib.map(|(rate_hz, extent_cents)| Vibrato {
+                rate_hz,
+                extent_cents,
+            }),
+            steadiness_cents: Some(steady),
             formants: None,
         };
 
@@ -180,11 +212,61 @@ impl DashboardApp {
             filter: Filter::All,
             rec: RecState::Idle,
             sessions: vec![
-                seed("VS-2481", "S-0417", "Jul 1 · 09:12", 118.4, 21.7, 96.2),
-                seed("VS-2480", "S-0392", "Jun 30 · 16:40", 214.9, 19.3, 91.8),
-                seed("VS-2479", "S-0417", "Jun 29 · 11:05", 121.2, 20.4, 94.5),
-                seed("VS-2478", "S-0105", "Jun 28 · 14:22", 187.5, 16.1, 62.3),
-                seed("VS-2477", "S-0233", "Jun 27 · 10:48", 132.8, 18.9, 88.1),
+                seed(
+                    "VS-2481",
+                    "S-0417",
+                    "Jul 1 · 09:12",
+                    118.4,
+                    96.2,
+                    21.7,
+                    4.2,
+                    Some((5.6, 42.0)),
+                    9.0,
+                ),
+                seed(
+                    "VS-2480",
+                    "S-0392",
+                    "Jun 30 · 16:40",
+                    214.9,
+                    91.8,
+                    19.3,
+                    6.8,
+                    Some((5.1, 55.0)),
+                    12.0,
+                ),
+                seed(
+                    "VS-2479",
+                    "S-0417",
+                    "Jun 29 · 11:05",
+                    121.2,
+                    94.5,
+                    20.4,
+                    3.9,
+                    Some((5.7, 38.0)),
+                    8.0,
+                ),
+                seed(
+                    "VS-2478",
+                    "S-0105",
+                    "Jun 28 · 14:22",
+                    187.5,
+                    62.3,
+                    16.1,
+                    12.5,
+                    None,
+                    28.0,
+                ),
+                seed(
+                    "VS-2477",
+                    "S-0233",
+                    "Jun 27 · 10:48",
+                    132.8,
+                    88.1,
+                    18.9,
+                    7.4,
+                    Some((4.8, 61.0)),
+                    14.0,
+                ),
             ],
             selected: None,
             result: None,
@@ -192,7 +274,11 @@ impl DashboardApp {
             wave: vec![2.0; 110],
             harm_ema: [0.0; MAX_PARTIALS],
             rec_f0_acc: Vec::new(),
+            rec_hnr_acc: Vec::new(),
+            rec_h1h2_acc: Vec::new(),
             rec_formants: None,
+            hnr_disp: None,
+            h1h2_disp: None,
             next_session_num: 2482,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
@@ -241,11 +327,18 @@ impl DashboardApp {
                 self.rec_f0_acc.iter().sum::<f32>() / self.rec_f0_acc.len() as f32
             };
             let match_pct = ((92.0 + self.rand01() * 6.0) * 10.0).round() / 10.0;
-            let hnr = ((19.0 + self.rand01() * 4.0) * 10.0).round() / 10.0;
+            let mean =
+                |acc: &[f32]| (!acc.is_empty()).then(|| acc.iter().sum::<f32>() / acc.len() as f32);
+            // Vibrato/steadiness are contour-level: snapshot the stop-time
+            // values rather than averaging per-frame reports.
+            let m = self.current_profile.metrics;
             self.result = Some(CaptureResult {
                 match_pct,
                 f0: (f0 * 10.0).round() / 10.0,
-                hnr,
+                hnr_db: mean(&self.rec_hnr_acc),
+                h1_h2_db: mean(&self.rec_h1h2_acc),
+                vibrato: m.vibrato,
+                steadiness_cents: m.steadiness_cents,
                 formants: self.rec_formants,
             });
             self.rec = RecState::Done { elapsed };
@@ -255,6 +348,8 @@ impl DashboardApp {
     fn start_rec(&mut self, now: f64) {
         self.rec = RecState::Recording { start: now };
         self.rec_f0_acc.clear();
+        self.rec_hnr_acc.clear();
+        self.rec_h1h2_acc.clear();
         self.rec_formants = None;
         self.result = None;
     }
@@ -275,8 +370,11 @@ impl DashboardApp {
                 subj: "S-0417".into(),
                 date: "Today".into(),
                 f0: res.f0,
-                hnr: res.hnr,
                 match_pct: res.match_pct,
+                hnr_db: res.hnr_db,
+                h1_h2_db: res.h1_h2_db,
+                vibrato: res.vibrato,
+                steadiness_cents: res.steadiness_cents,
                 formants: res.formants,
             };
             self.next_session_num += 1;
@@ -321,6 +419,12 @@ impl eframe::App for DashboardApp {
         if matches!(self.rec, RecState::Recording { .. }) && self.current_profile.valid {
             self.rec_f0_acc.push(self.current_profile.f0);
             self.rec_formants = Some(self.current_profile.formants);
+            if let Some(h) = self.current_profile.metrics.hnr_db {
+                self.rec_hnr_acc.push(h);
+            }
+            if let Some(h) = self.current_profile.metrics.h1_h2_db {
+                self.rec_h1h2_acc.push(h);
+            }
         }
         for (ema, &a) in self
             .harm_ema
@@ -329,6 +433,14 @@ impl eframe::App for DashboardApp {
         {
             *ema += 0.3 * (a - *ema);
         }
+        // Display smoothing for the digit readouts; reset when the value goes
+        // away so stale numbers never linger.
+        let smooth = |disp: &mut Option<f32>, v: Option<f32>| match (disp.as_mut(), v) {
+            (Some(d), Some(v)) => *d += 0.2 * (v - *d),
+            _ => *disp = v,
+        };
+        smooth(&mut self.hnr_disp, self.current_profile.metrics.hnr_db);
+        smooth(&mut self.h1h2_disp, self.current_profile.metrics.h1_h2_db);
         self.push_wave_sample();
 
         let full = ui.max_rect();
@@ -1133,13 +1245,16 @@ impl DashboardApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let readout = if valid {
+                    let mut readout = if valid {
                         crate::math::freq_to_note(f0)
                             .map(|n| format!("{}{} · {:+.0}¢", n.name, n.octave, n.cents))
                             .unwrap_or_else(|| "—".into())
                     } else {
                         "—".into()
                     };
+                    if let Some(v) = self.current_profile.metrics.vibrato {
+                        readout += &format!(" · vib {:.1} Hz ±{:.0}¢", v.rate_hz, v.extent_cents);
+                    }
                     ui.label(
                         RichText::new(readout)
                             .font(FontId::monospace(13.0))
@@ -1253,32 +1368,55 @@ impl DashboardApp {
                 v.map(|v| format!("{v:+.1} {unit}"))
                     .unwrap_or_else(|| "—".into())
             };
-            let cells = [
-                ("TILT", fmt(tilt, "dB/oct")),
-                ("EVEN/ODD", fmt(balance, "dB")),
-                (
-                    "SINGER'S FMT",
-                    formant_pct
-                        .map(|p| format!("{p:.0} %"))
-                        .unwrap_or_else(|| "—".into()),
-                ),
+            let steadiness = self.current_profile.metrics.steadiness_cents;
+            let rows = [
+                [
+                    ("TILT", fmt(tilt, "dB/oct")),
+                    ("EVEN/ODD", fmt(balance, "dB")),
+                    (
+                        "SINGER'S FMT",
+                        formant_pct
+                            .map(|p| format!("{p:.0} %"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ],
+                [
+                    ("H1–H2", fmt(self.h1h2_disp, "dB")),
+                    (
+                        "HNR",
+                        self.hnr_disp
+                            .map(|v| format!("{v:.0} dB"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    (
+                        "STEADINESS",
+                        steadiness
+                            .map(|s| format!("{s:.0} ¢"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ],
             ];
-            ui.columns(3, |cols| {
-                for (col, (label, value)) in cols.iter_mut().zip(cells) {
-                    col.label(
-                        RichText::new(label)
-                            .font(FontId::monospace(9.5))
-                            .color(ink(115)),
-                    );
-                    col.add_space(3.0);
-                    col.label(
-                        RichText::new(value)
-                            .font(FontId::monospace(13.0))
-                            .color(INK)
-                            .strong(),
-                    );
+            for (i, row) in rows.into_iter().enumerate() {
+                if i > 0 {
+                    ui.add_space(10.0);
                 }
-            });
+                ui.columns(3, |cols| {
+                    for (col, (label, value)) in cols.iter_mut().zip(row) {
+                        col.label(
+                            RichText::new(label)
+                                .font(FontId::monospace(9.5))
+                                .color(ink(115)),
+                        );
+                        col.add_space(3.0);
+                        col.label(
+                            RichText::new(value)
+                                .font(FontId::monospace(13.0))
+                                .color(INK)
+                                .strong(),
+                        );
+                    }
+                });
+            }
         });
     }
 
@@ -1517,11 +1655,19 @@ impl DashboardApp {
         });
         ui.add_space(14.0);
 
-        // Acoustic parameters (prototype-derived jitter/shimmer/CPP).
-        let jit = 0.31 + (100.0 - sel.match_pct).max(0.0) * 0.012;
-        let shim = 0.21 + (100.0 - sel.match_pct).max(0.0) * 0.009;
-        let cpp = 13.1 + (sel.match_pct - 90.0) * 0.1;
+        // Acoustic parameters — measured values only (means / stop-time
+        // snapshot from the capture; static demo values for seeded rows).
+        // Reference ranges are musician guidance, not diagnosis; the neutral
+        // dot means "not measured".
         let dot = |ok: bool| if ok { TEAL } else { AMBER };
+        let opt_dot = |v: Option<f32>, ok: fn(f32) -> bool| match v {
+            Some(v) => dot(ok(v)),
+            None => ink(64),
+        };
+        let opt_val = |v: Option<f32>, unit: &str, digits: usize| match v {
+            Some(v) => format!("{v:.digits$} {unit}"),
+            None => "—".into(),
+        };
         let params: [(String, String, &str, Color32); 5] = [
             (
                 "F0 mean".into(),
@@ -1530,28 +1676,33 @@ impl DashboardApp {
                 dot((85.0..=255.0).contains(&sel.f0)),
             ),
             (
-                "Jitter (local)".into(),
-                format!("{jit:.2} %"),
-                "< 1.04 %",
-                dot(jit < 1.04),
-            ),
-            (
-                "Shimmer".into(),
-                format!("{shim:.2} dB"),
-                "< 0.35 dB",
-                dot(shim < 0.35),
-            ),
-            (
                 "HNR".into(),
-                format!("{:.1} dB", sel.hnr),
+                opt_val(sel.hnr_db, "dB", 1),
                 "> 17 dB",
-                dot(sel.hnr > 17.0),
+                opt_dot(sel.hnr_db, |v| v > 17.0),
             ),
             (
-                "CPP smoothed".into(),
-                format!("{cpp:.1} dB"),
-                "> 11 dB",
-                dot(cpp > 11.0),
+                "H1–H2".into(),
+                opt_val(sel.h1_h2_db, "dB", 1),
+                "0–10 dB",
+                opt_dot(sel.h1_h2_db, |v| (0.0..=10.0).contains(&v)),
+            ),
+            (
+                "Vibrato".into(),
+                sel.vibrato
+                    .map(|v| format!("{:.1} Hz ±{:.0}¢", v.rate_hz, v.extent_cents))
+                    .unwrap_or_else(|| "—".into()),
+                "4.5–6.5 Hz",
+                match sel.vibrato {
+                    Some(v) => dot((4.5..=6.5).contains(&v.rate_hz)),
+                    None => ink(64),
+                },
+            ),
+            (
+                "Steadiness".into(),
+                opt_val(sel.steadiness_cents, "¢", 0),
+                "< 15 ¢",
+                opt_dot(sel.steadiness_cents, |v| v < 15.0),
             ),
         ];
 

@@ -94,8 +94,7 @@ impl F0Contour {
 
         let is_vibrato = explained >= VIB_MIN_EXPLAINED
             && extent >= VIB_MIN_EXTENT
-            && rate >= VIB_MIN_HZ + VIB_EDGE_HZ
-            && rate <= VIB_MAX_HZ - VIB_EDGE_HZ;
+            && (VIB_MIN_HZ + VIB_EDGE_HZ..=VIB_MAX_HZ - VIB_EDGE_HZ).contains(&rate);
 
         if is_vibrato {
             (
