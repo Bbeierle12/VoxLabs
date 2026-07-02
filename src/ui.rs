@@ -1739,7 +1739,8 @@ impl DashboardApp {
             for (name, value, reference, dot_color) in &params {
                 ui.add_space(11.0);
                 ui.horizontal(|ui| {
-                    let name_w = ui.available_width() - 86.0 - 92.0 - 12.0 - 24.0;
+                    // Value column sized for the widest case ("5.1 Hz ±55¢").
+                    let name_w = ui.available_width() - 104.0 - 84.0 - 12.0 - 24.0;
                     ui.allocate_ui_with_layout(
                         vec2(name_w, 18.0),
                         Layout::left_to_right(Align::Center),
@@ -1749,10 +1750,10 @@ impl DashboardApp {
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        vec2(86.0, 18.0),
+                        vec2(104.0, 18.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_width(86.0);
+                            ui.set_width(104.0);
                             ui.label(
                                 RichText::new(value)
                                     .font(FontId::monospace(13.0))
@@ -1762,10 +1763,10 @@ impl DashboardApp {
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        vec2(92.0, 18.0),
+                        vec2(84.0, 18.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_width(92.0);
+                            ui.set_width(84.0);
                             ui.label(
                                 RichText::new(*reference)
                                     .font(FontId::monospace(10.5))
