@@ -570,6 +570,7 @@ impl DashboardApp {
             .clone();
         let (badge, badge_bg, badge_fg) = Self::badge_style(hero.match_pct);
         glass(24.0).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(96.0, 96.0), Sense::hover());
                 ring_gauge(
@@ -1124,23 +1125,19 @@ impl DashboardApp {
                 let text = RichText::new(label)
                     .font(header_font.clone())
                     .color(ink(115));
-                if w > 0.0 {
-                    ui.allocate_ui_with_layout(
-                        vec2(w, 14.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.label(text);
-                        },
-                    );
+                let w = if w > 0.0 {
+                    w
                 } else {
-                    ui.allocate_ui_with_layout(
-                        vec2(ui.available_width() - 62.0 - 68.0 - 31.0, 14.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            ui.label(text);
-                        },
-                    );
-                }
+                    ui.available_width() - 62.0 - 68.0 - 31.0
+                };
+                ui.allocate_ui_with_layout(
+                    vec2(w, 14.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        ui.set_width(w);
+                        ui.label(text);
+                    },
+                );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(15.0);
@@ -1174,6 +1171,7 @@ impl DashboardApp {
                         vec2(78.0, 34.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
+                            ui.set_width(78.0);
                             ui.label(
                                 RichText::new(&s.id)
                                     .font(FontId::monospace(12.5))
@@ -1187,6 +1185,7 @@ impl DashboardApp {
                         vec2(subj_w, 34.0),
                         Layout::top_down(Align::Min),
                         |ui| {
+                            ui.set_width(subj_w);
                             ui.label(RichText::new(&s.subj).size(13.0).color(INK).strong());
                             ui.label(RichText::new(&s.date).size(10.5).color(ink(115)));
                         },
@@ -1195,6 +1194,7 @@ impl DashboardApp {
                         vec2(58.0, 34.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
+                            ui.set_width(58.0);
                             ui.label(
                                 RichText::new(format!("{:.0}", s.f0))
                                     .font(FontId::monospace(12.5))
@@ -1286,6 +1286,7 @@ impl DashboardApp {
 
         // Verification score card.
         glass(24.0).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(86.0, 86.0), Sense::hover());
                 ring_gauge(
@@ -1393,6 +1394,7 @@ impl DashboardApp {
                         vec2(name_w, 18.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
+                            ui.set_width(name_w);
                             ui.label(RichText::new(name).size(13.0).color(ink(191)));
                         },
                     );
@@ -1400,6 +1402,7 @@ impl DashboardApp {
                         vec2(86.0, 18.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
+                            ui.set_width(86.0);
                             ui.label(
                                 RichText::new(value)
                                     .font(FontId::monospace(13.0))
@@ -1412,6 +1415,7 @@ impl DashboardApp {
                         vec2(92.0, 18.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
+                            ui.set_width(92.0);
                             ui.label(
                                 RichText::new(*reference)
                                     .font(FontId::monospace(10.5))
