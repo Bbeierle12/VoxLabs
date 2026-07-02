@@ -40,6 +40,19 @@ const MATCH_THRESHOLD: f32 = 85.0;
 /// Content column width — the prototype is a 428 px phone layout.
 const COL_WIDTH: f32 = 430.0;
 
+/// Safe-area padding for Android's edge-to-edge rendering (status bar /
+/// gesture bar). Zero elsewhere: desktop and web windows are not overlaid.
+const TOP_INSET: f32 = if cfg!(target_os = "android") {
+    40.0
+} else {
+    0.0
+};
+const BOTTOM_INSET: f32 = if cfg!(target_os = "android") {
+    18.0
+} else {
+    0.0
+};
+
 fn ink(a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(11, 43, 49, a)
 }
@@ -322,6 +335,9 @@ impl eframe::App for DashboardApp {
             .show(&mut col_ui, |ui| {
                 egui::Frame::default().inner_margin(18.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                    // Android renders edge-to-edge under the system bars and
+                    // eframe exposes no safe-area insets, so pad past them.
+                    ui.add_space(TOP_INSET);
                     match self.screen {
                         Screen::Overview => self.screen_overview(ui),
                         Screen::Capture => self.screen_capture(ui, now),
@@ -329,7 +345,7 @@ impl eframe::App for DashboardApp {
                         Screen::Detail => self.screen_detail(ui),
                     }
                     // Clearance for the floating tab bar.
-                    ui.add_space(104.0);
+                    ui.add_space(104.0 + BOTTOM_INSET);
                 });
             });
 
@@ -1489,7 +1505,7 @@ impl DashboardApp {
 
     fn tab_bar(&mut self, ctx: egui::Context, _now: f64) {
         egui::Area::new(egui::Id::new("voxlab_tab_bar"))
-            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -16.0))
+            .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -16.0 - BOTTOM_INSET))
             .order(egui::Order::Foreground)
             .show(&ctx, |ui| {
                 egui::Frame::default()
