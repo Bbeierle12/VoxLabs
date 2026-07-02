@@ -720,6 +720,23 @@ pub fn freq_to_note(hz: f32) -> Option<Note> {
     })
 }
 
+/// Signed distance in semitones from `freq` to `reference` (positive = `freq`
+/// above `reference`). `None` for non-positive/non-finite input.
+///
+/// This is the general form of Bozeman's acoustic-registration event: calling
+/// `semitones_from(2.0 * f0, f1)` gives the "F1/H2 crossing" distance — the
+/// second harmonic's position relative to the first formant. Negative while
+/// H2 sits below F1 (open timbre, *voce aperta*), crossing zero at the
+/// acoustic passaggio event ("turning over"), positive once H2 has cleared F1
+/// (close timbre, *voce chiusa*). The same helper gives the treble-voice
+/// analog via `semitones_from(f0, f1)` (F1/H1 tracking).
+pub fn semitones_from(freq: f32, reference: f32) -> Option<f32> {
+    if freq <= 0.0 || reference <= 0.0 || !freq.is_finite() || !reference.is_finite() {
+        return None;
+    }
+    Some(12.0 * (freq / reference).log2())
+}
+
 /// Spectral tilt in dB/octave: least-squares slope of harmonic level (dB)
 /// against log2(harmonic number). A sawtooth's 1/k rolloff measures ≈ −6
 /// dB/oct; a brighter, more pressed voice is shallower (closer to 0).
@@ -1166,6 +1183,48 @@ mod tests {
         assert!(freq_to_note(0.0).is_none());
         assert!(freq_to_note(-100.0).is_none());
         assert!(freq_to_note(f32::NAN).is_none());
+    }
+
+    #[test]
+    fn semitones_from_basic_intervals() {
+        assert!((semitones_from(440.0, 440.0).unwrap()).abs() < 0.01);
+        assert!((semitones_from(880.0, 440.0).unwrap() - 12.0).abs() < 0.01);
+        assert!((semitones_from(220.0, 440.0).unwrap() + 12.0).abs() < 0.01);
+        // A perfect fifth up is 7 semitones (well-known 3:2 ratio approx).
+        assert!((semitones_from(660.0, 440.0).unwrap() - 7.02).abs() < 0.05);
+    }
+
+    #[test]
+    fn semitones_from_degenerate_inputs_are_none() {
+        assert!(semitones_from(0.0, 440.0).is_none());
+        assert!(semitones_from(440.0, 0.0).is_none());
+        assert!(semitones_from(-1.0, 440.0).is_none());
+        assert!(semitones_from(f32::NAN, 440.0).is_none());
+        assert!(semitones_from(440.0, f32::INFINITY).is_none());
+    }
+
+    #[test]
+    fn turning_over_crossing_reads_zero_at_h2_equals_f1() {
+        // Bozeman's F1/H2 crossing: f0 at exactly F1/2 puts H2 on top of F1 —
+        // the acoustic passaggio event — which this helper must read as 0.
+        let f1 = 700.0;
+        let f0_at_crossing = f1 / 2.0;
+        let semis = semitones_from(2.0 * f0_at_crossing, f1).unwrap();
+        assert!(semis.abs() < 0.01, "crossing should read ~0, got {semis}");
+
+        // Below the crossing pitch, H2 sits below F1 (open timbre): negative.
+        let below = semitones_from(2.0 * (f0_at_crossing - 50.0), f1).unwrap();
+        assert!(
+            below < 0.0,
+            "below crossing should be negative, got {below}"
+        );
+
+        // Above it, H2 has cleared F1 (turned over): positive.
+        let above = semitones_from(2.0 * (f0_at_crossing + 50.0), f1).unwrap();
+        assert!(
+            above > 0.0,
+            "above crossing should be positive, got {above}"
+        );
     }
 
     #[test]
