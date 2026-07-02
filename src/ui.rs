@@ -87,6 +87,9 @@ struct Session {
     h1_h2_db: Option<f32>,
     vibrato: Option<Vibrato>,
     steadiness_cents: Option<f32>,
+    jitter_pct: Option<f32>,
+    shimmer_db: Option<f32>,
+    cpp_db: Option<f32>,
     /// Real measured formants when the session came from a live capture;
     /// `None` for the seeded demo archive (detail view derives mock values).
     formants: Option<[Formant; 3]>,
@@ -99,6 +102,9 @@ struct CaptureResult {
     h1_h2_db: Option<f32>,
     vibrato: Option<Vibrato>,
     steadiness_cents: Option<f32>,
+    jitter_pct: Option<f32>,
+    shimmer_db: Option<f32>,
+    cpp_db: Option<f32>,
     formants: Option<[Formant; 3]>,
 }
 
@@ -153,12 +159,18 @@ pub struct DashboardApp {
     /// Real per-frame metrics collected while recording (means stored).
     rec_hnr_acc: Vec<f32>,
     rec_h1h2_acc: Vec<f32>,
+    rec_jitter_acc: Vec<f32>,
+    rec_shimmer_acc: Vec<f32>,
+    rec_cpp_acc: Vec<f32>,
     /// Last valid formants seen while recording.
     rec_formants: Option<[Formant; 3]>,
     /// Display-smoothed live readouts (raw values update every ~46 ms and
     /// flicker as digits). `None` = unvoiced/unknown.
     hnr_disp: Option<f32>,
     h1h2_disp: Option<f32>,
+    jitter_disp: Option<f32>,
+    shimmer_disp: Option<f32>,
+    cpp_disp: Option<f32>,
     next_session_num: u32,
     rng: u64,
 }
@@ -177,29 +189,30 @@ impl DashboardApp {
         cc.egui_ctx.set_visuals(visuals);
 
         // Seeded demo archive: plausible static values, marked apart from live
-        // captures only by `formants: None`.
-        #[allow(clippy::too_many_arguments)]
+        // captures only by `formants: None`. Metric tuple order:
+        // (hnr, h1h2, steadiness, jitter, shimmer, cpp).
         let seed = |id: &str,
                     subj: &str,
                     date: &str,
                     f0: f32,
                     m: f32,
-                    hnr: f32,
-                    h1h2: f32,
-                    vib: Option<(f32, f32)>,
-                    steady: f32| Session {
+                    met: (f32, f32, f32, f32, f32, f32),
+                    vib: Option<(f32, f32)>| Session {
             id: id.into(),
             subj: subj.into(),
             date: date.into(),
             f0,
             match_pct: m,
-            hnr_db: Some(hnr),
-            h1_h2_db: Some(h1h2),
+            hnr_db: Some(met.0),
+            h1_h2_db: Some(met.1),
+            steadiness_cents: Some(met.2),
+            jitter_pct: Some(met.3),
+            shimmer_db: Some(met.4),
+            cpp_db: Some(met.5),
             vibrato: vib.map(|(rate_hz, extent_cents)| Vibrato {
                 rate_hz,
                 extent_cents,
             }),
-            steadiness_cents: Some(steady),
             formants: None,
         };
 
@@ -218,10 +231,8 @@ impl DashboardApp {
                     "Jul 1 · 09:12",
                     118.4,
                     96.2,
-                    21.7,
-                    4.2,
+                    (21.7, 4.2, 9.0, 0.38, 0.18, 15.2),
                     Some((5.6, 42.0)),
-                    9.0,
                 ),
                 seed(
                     "VS-2480",
@@ -229,10 +240,8 @@ impl DashboardApp {
                     "Jun 30 · 16:40",
                     214.9,
                     91.8,
-                    19.3,
-                    6.8,
+                    (19.3, 6.8, 12.0, 0.52, 0.24, 13.6),
                     Some((5.1, 55.0)),
-                    12.0,
                 ),
                 seed(
                     "VS-2479",
@@ -240,10 +249,8 @@ impl DashboardApp {
                     "Jun 29 · 11:05",
                     121.2,
                     94.5,
-                    20.4,
-                    3.9,
+                    (20.4, 3.9, 8.0, 0.41, 0.20, 14.8),
                     Some((5.7, 38.0)),
-                    8.0,
                 ),
                 seed(
                     "VS-2478",
@@ -251,10 +258,8 @@ impl DashboardApp {
                     "Jun 28 · 14:22",
                     187.5,
                     62.3,
-                    16.1,
-                    12.5,
+                    (16.1, 12.5, 28.0, 1.82, 0.61, 9.5),
                     None,
-                    28.0,
                 ),
                 seed(
                     "VS-2477",
@@ -262,10 +267,8 @@ impl DashboardApp {
                     "Jun 27 · 10:48",
                     132.8,
                     88.1,
-                    18.9,
-                    7.4,
+                    (18.9, 7.4, 14.0, 0.66, 0.29, 12.9),
                     Some((4.8, 61.0)),
-                    14.0,
                 ),
             ],
             selected: None,
@@ -276,9 +279,15 @@ impl DashboardApp {
             rec_f0_acc: Vec::new(),
             rec_hnr_acc: Vec::new(),
             rec_h1h2_acc: Vec::new(),
+            rec_jitter_acc: Vec::new(),
+            rec_shimmer_acc: Vec::new(),
+            rec_cpp_acc: Vec::new(),
             rec_formants: None,
             hnr_disp: None,
             h1h2_disp: None,
+            jitter_disp: None,
+            shimmer_disp: None,
+            cpp_disp: None,
             next_session_num: 2482,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
@@ -339,6 +348,9 @@ impl DashboardApp {
                 h1_h2_db: mean(&self.rec_h1h2_acc),
                 vibrato: m.vibrato,
                 steadiness_cents: m.steadiness_cents,
+                jitter_pct: mean(&self.rec_jitter_acc),
+                shimmer_db: mean(&self.rec_shimmer_acc),
+                cpp_db: mean(&self.rec_cpp_acc),
                 formants: self.rec_formants,
             });
             self.rec = RecState::Done { elapsed };
@@ -350,6 +362,9 @@ impl DashboardApp {
         self.rec_f0_acc.clear();
         self.rec_hnr_acc.clear();
         self.rec_h1h2_acc.clear();
+        self.rec_jitter_acc.clear();
+        self.rec_shimmer_acc.clear();
+        self.rec_cpp_acc.clear();
         self.rec_formants = None;
         self.result = None;
     }
@@ -375,6 +390,9 @@ impl DashboardApp {
                 h1_h2_db: res.h1_h2_db,
                 vibrato: res.vibrato,
                 steadiness_cents: res.steadiness_cents,
+                jitter_pct: res.jitter_pct,
+                shimmer_db: res.shimmer_db,
+                cpp_db: res.cpp_db,
                 formants: res.formants,
             };
             self.next_session_num += 1;
@@ -425,6 +443,15 @@ impl eframe::App for DashboardApp {
             if let Some(h) = self.current_profile.metrics.h1_h2_db {
                 self.rec_h1h2_acc.push(h);
             }
+            if let Some(j) = self.current_profile.metrics.jitter_pct {
+                self.rec_jitter_acc.push(j);
+            }
+            if let Some(s) = self.current_profile.metrics.shimmer_db {
+                self.rec_shimmer_acc.push(s);
+            }
+            if let Some(c) = self.current_profile.metrics.cpp_db {
+                self.rec_cpp_acc.push(c);
+            }
         }
         for (ema, &a) in self
             .harm_ema
@@ -441,6 +468,15 @@ impl eframe::App for DashboardApp {
         };
         smooth(&mut self.hnr_disp, self.current_profile.metrics.hnr_db);
         smooth(&mut self.h1h2_disp, self.current_profile.metrics.h1_h2_db);
+        smooth(
+            &mut self.jitter_disp,
+            self.current_profile.metrics.jitter_pct,
+        );
+        smooth(
+            &mut self.shimmer_disp,
+            self.current_profile.metrics.shimmer_db,
+        );
+        smooth(&mut self.cpp_disp, self.current_profile.metrics.cpp_db);
         self.push_wave_sample();
 
         let full = ui.max_rect();
@@ -1395,6 +1431,26 @@ impl DashboardApp {
                             .unwrap_or_else(|| "—".into()),
                     ),
                 ],
+                [
+                    (
+                        "JITTER",
+                        self.jitter_disp
+                            .map(|v| format!("{v:.2} %"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    (
+                        "SHIMMER",
+                        self.shimmer_disp
+                            .map(|v| format!("{v:.2} dB"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                    (
+                        "CPP",
+                        self.cpp_disp
+                            .map(|v| format!("{v:.0} dB"))
+                            .unwrap_or_else(|| "—".into()),
+                    ),
+                ],
             ];
             for (i, row) in rows.into_iter().enumerate() {
                 if i > 0 {
@@ -1668,7 +1724,7 @@ impl DashboardApp {
             Some(v) => format!("{v:.digits$} {unit}"),
             None => "—".into(),
         };
-        let params: [(String, String, &str, Color32); 5] = [
+        let params: [(String, String, &str, Color32); 8] = [
             (
                 "F0 mean".into(),
                 format!("{:.1} Hz", sel.f0),
@@ -1676,10 +1732,28 @@ impl DashboardApp {
                 dot((85.0..=255.0).contains(&sel.f0)),
             ),
             (
+                "Jitter (local)".into(),
+                opt_val(sel.jitter_pct, "%", 2),
+                "< 1.04 %",
+                opt_dot(sel.jitter_pct, |v| v < 1.04),
+            ),
+            (
+                "Shimmer".into(),
+                opt_val(sel.shimmer_db, "dB", 2),
+                "< 0.35 dB",
+                opt_dot(sel.shimmer_db, |v| v < 0.35),
+            ),
+            (
                 "HNR".into(),
                 opt_val(sel.hnr_db, "dB", 1),
                 "> 17 dB",
                 opt_dot(sel.hnr_db, |v| v > 17.0),
+            ),
+            (
+                "CPP".into(),
+                opt_val(sel.cpp_db, "dB", 1),
+                "> 11 dB",
+                opt_dot(sel.cpp_db, |v| v > 11.0),
             ),
             (
                 "H1–H2".into(),
