@@ -1043,7 +1043,7 @@ mod tests {
     fn jitter_tracks_imposed_period_perturbation() {
         // Alternating ±1 % frequency → adjacent periods differ by ~2 %.
         let sr = 44_100.0;
-        let dev = |c: usize| if c % 2 == 0 { 0.01 } else { -0.01 };
+        let dev = |c: usize| if c.is_multiple_of(2) { 0.01 } else { -0.01 };
         let buf = perturbed_tone(sr, 220.0, 2048, dev, |_| 1.0);
         let p = cycle_perturbation(&buf, sr, 220.0).expect("jittered tone measures");
         assert!(
@@ -1058,7 +1058,7 @@ mod tests {
         // Alternating ±0.25 dB gain → adjacent cycles differ by 0.5 dB.
         let sr = 44_100.0;
         let g = 10f32.powf(0.25 / 20.0);
-        let gain = move |c: usize| if c % 2 == 0 { g } else { 1.0 / g };
+        let gain = move |c: usize| if c.is_multiple_of(2) { g } else { 1.0 / g };
         let buf = perturbed_tone(sr, 220.0, 2048, |_| 0.0, gain);
         let p = cycle_perturbation(&buf, sr, 220.0).expect("shimmered tone measures");
         assert!(
