@@ -90,6 +90,10 @@ struct Session {
     jitter_pct: Option<f32>,
     shimmer_db: Option<f32>,
     cpp_db: Option<f32>,
+    centroid_hz: Option<f32>,
+    /// Mean relative harmonic profile (H1..H16, normalized to the strongest
+    /// partial) over the capture; drives the Detail screen's Timbre caption.
+    profile: [f32; 16],
     /// Real measured formants when the session came from a live capture;
     /// `None` for the seeded demo archive (detail view derives mock values).
     formants: Option<[Formant; 3]>,
@@ -105,6 +109,8 @@ struct CaptureResult {
     jitter_pct: Option<f32>,
     shimmer_db: Option<f32>,
     cpp_db: Option<f32>,
+    centroid_hz: Option<f32>,
+    profile: [f32; 16],
     formants: Option<[Formant; 3]>,
 }
 
@@ -162,6 +168,11 @@ pub struct DashboardApp {
     rec_jitter_acc: Vec<f32>,
     rec_shimmer_acc: Vec<f32>,
     rec_cpp_acc: Vec<f32>,
+    rec_centroid_acc: Vec<f32>,
+    /// Running sum + frame count for the mean relative harmonic profile over
+    /// the capture (snapshots of `harm_ema`, normalized to its own max).
+    rec_profile_sum: [f32; 16],
+    rec_profile_n: u32,
     /// Last valid formants seen while recording.
     rec_formants: Option<[Formant; 3]>,
     /// Display-smoothed live readouts (raw values update every ~46 ms and
@@ -194,13 +205,13 @@ impl DashboardApp {
 
         // Seeded demo archive: plausible static values, marked apart from live
         // captures only by `formants: None`. Metric tuple order:
-        // (hnr, h1h2, steadiness, jitter, shimmer, cpp).
+        // (hnr, h1h2, steadiness, jitter, shimmer, cpp, centroid_hz).
         let seed = |id: &str,
                     subj: &str,
                     date: &str,
                     f0: f32,
                     m: f32,
-                    met: (f32, f32, f32, f32, f32, f32),
+                    met: (f32, f32, f32, f32, f32, f32, f32),
                     vib: Option<(f32, f32)>| Session {
             id: id.into(),
             subj: subj.into(),
@@ -213,6 +224,9 @@ impl DashboardApp {
             jitter_pct: Some(met.3),
             shimmer_db: Some(met.4),
             cpp_db: Some(met.5),
+            centroid_hz: Some(met.6),
+            // Plausible generic 1/k harmonic decay — seed data, not measured.
+            profile: std::array::from_fn(|i| 1.0 / (i + 1) as f32),
             vibrato: vib.map(|(rate_hz, extent_cents)| Vibrato {
                 rate_hz,
                 extent_cents,
@@ -235,7 +249,7 @@ impl DashboardApp {
                     "Jul 1 · 09:12",
                     118.4,
                     96.2,
-                    (21.7, 4.2, 9.0, 0.38, 0.18, 15.2),
+                    (21.7, 4.2, 9.0, 0.38, 0.18, 15.2, 1450.0),
                     Some((5.6, 42.0)),
                 ),
                 seed(
@@ -244,7 +258,7 @@ impl DashboardApp {
                     "Jun 30 · 16:40",
                     214.9,
                     91.8,
-                    (19.3, 6.8, 12.0, 0.52, 0.24, 13.6),
+                    (19.3, 6.8, 12.0, 0.52, 0.24, 13.6, 2050.0),
                     Some((5.1, 55.0)),
                 ),
                 seed(
@@ -253,7 +267,7 @@ impl DashboardApp {
                     "Jun 29 · 11:05",
                     121.2,
                     94.5,
-                    (20.4, 3.9, 8.0, 0.41, 0.20, 14.8),
+                    (20.4, 3.9, 8.0, 0.41, 0.20, 14.8, 1380.0),
                     Some((5.7, 38.0)),
                 ),
                 seed(
@@ -262,7 +276,7 @@ impl DashboardApp {
                     "Jun 28 · 14:22",
                     187.5,
                     62.3,
-                    (16.1, 12.5, 28.0, 1.82, 0.61, 9.5),
+                    (16.1, 12.5, 28.0, 1.82, 0.61, 9.5, 3100.0),
                     None,
                 ),
                 seed(
@@ -271,7 +285,7 @@ impl DashboardApp {
                     "Jun 27 · 10:48",
                     132.8,
                     88.1,
-                    (18.9, 7.4, 14.0, 0.66, 0.29, 12.9),
+                    (18.9, 7.4, 14.0, 0.66, 0.29, 12.9, 1720.0),
                     Some((4.8, 61.0)),
                 ),
             ],
@@ -286,6 +300,9 @@ impl DashboardApp {
             rec_jitter_acc: Vec::new(),
             rec_shimmer_acc: Vec::new(),
             rec_cpp_acc: Vec::new(),
+            rec_centroid_acc: Vec::new(),
+            rec_profile_sum: [0.0; 16],
+            rec_profile_n: 0,
             rec_formants: None,
             hnr_disp: None,
             h1h2_disp: None,
@@ -347,6 +364,12 @@ impl DashboardApp {
             // Vibrato/steadiness are contour-level: snapshot the stop-time
             // values rather than averaging per-frame reports.
             let m = self.current_profile.metrics;
+            let profile = if self.rec_profile_n > 0 {
+                let n = self.rec_profile_n as f32;
+                std::array::from_fn(|i| self.rec_profile_sum[i] / n)
+            } else {
+                [0.0; 16]
+            };
             self.result = Some(CaptureResult {
                 match_pct,
                 f0: (f0 * 10.0).round() / 10.0,
@@ -357,6 +380,8 @@ impl DashboardApp {
                 jitter_pct: mean(&self.rec_jitter_acc),
                 shimmer_db: mean(&self.rec_shimmer_acc),
                 cpp_db: mean(&self.rec_cpp_acc),
+                centroid_hz: mean(&self.rec_centroid_acc),
+                profile,
                 formants: self.rec_formants,
             });
             self.rec = RecState::Done { elapsed };
@@ -371,6 +396,9 @@ impl DashboardApp {
         self.rec_jitter_acc.clear();
         self.rec_shimmer_acc.clear();
         self.rec_cpp_acc.clear();
+        self.rec_centroid_acc.clear();
+        self.rec_profile_sum = [0.0; 16];
+        self.rec_profile_n = 0;
         self.rec_formants = None;
         self.result = None;
     }
@@ -399,6 +427,8 @@ impl DashboardApp {
                 jitter_pct: res.jitter_pct,
                 shimmer_db: res.shimmer_db,
                 cpp_db: res.cpp_db,
+                centroid_hz: res.centroid_hz,
+                profile: res.profile,
                 formants: res.formants,
             };
             self.next_session_num += 1;
@@ -458,6 +488,9 @@ impl eframe::App for DashboardApp {
             if let Some(c) = self.current_profile.metrics.cpp_db {
                 self.rec_cpp_acc.push(c);
             }
+            if let Some(c) = self.current_profile.metrics.centroid_hz {
+                self.rec_centroid_acc.push(c);
+            }
         }
         for (ema, &a) in self
             .harm_ema
@@ -465,6 +498,22 @@ impl eframe::App for DashboardApp {
             .zip(&self.current_profile.partial_amplitudes)
         {
             *ema += 0.3 * (a - *ema);
+        }
+        if matches!(self.rec, RecState::Recording { .. }) && self.current_profile.valid {
+            // Snapshot the just-updated harm_ema (normalized to its own max)
+            // for the capture-mean profile driving the Timbre classification.
+            let max_amp = self
+                .harm_ema
+                .iter()
+                .take(16)
+                .cloned()
+                .fold(0.0f32, f32::max);
+            if max_amp > 1e-6 {
+                for (sum, &a) in self.rec_profile_sum.iter_mut().zip(&self.harm_ema[..16]) {
+                    *sum += a / max_amp;
+                }
+                self.rec_profile_n += 1;
+            }
         }
         // Display smoothing for the digit readouts; reset when the value goes
         // away so stale numbers never linger.
@@ -2071,6 +2120,25 @@ impl DashboardApp {
                     col.allocate_exact_size(vec2(rect.width(), 52.0), Sense::hover());
                 }
             });
+
+            // Personal Harmonic Identifier port: plain-language classifiers
+            // derived at render time from the session's stored profile, not
+            // pre-rendered strings.
+            ui.add_space(10.0);
+            let even_odd = crate::math::even_odd_balance_db(&sel.profile);
+            let timbre = crate::math::timbre_description(&sel.profile, even_odd);
+            let voice_class = crate::math::voice_class(sel.f0);
+            let brightness = sel
+                .centroid_hz
+                .map(crate::math::brightness_class)
+                .unwrap_or("—");
+            ui.label(
+                RichText::new(format!(
+                    "Voice Class: {voice_class}  ·  Brightness: {brightness}  ·  Timbre: {timbre}"
+                ))
+                .size(11.5)
+                .color(ink(140)),
+            );
         });
         ui.add_space(14.0);
 
