@@ -55,10 +55,10 @@ const BOTTOM_INSET: f32 = if cfg!(target_os = "android") {
 
 // ── spectrogram waterfall ─────────────────────────────────────────────────────
 
-/// Which visualization the analyzer card shows in its switchable region.
+/// Which visualization fills the switchable region *below* the always-present
+/// harmonic ladder.
 #[derive(PartialEq, Clone, Copy)]
 enum VizMode {
-    Ladder,
     Radial,
     Spectrogram,
     Scope,
@@ -445,7 +445,7 @@ impl DashboardApp {
             centroid_disp: None,
             turnover_disp: None,
 
-            viz_mode: VizMode::Ladder,
+            viz_mode: VizMode::Spectrogram,
             spectrum_rx,
             scope_rx,
             sample_rate,
@@ -1615,7 +1615,6 @@ impl DashboardApp {
     /// region: `Ladder | Radial | Spectro | Scope`.
     fn viz_mode_switch(&mut self, ui: &mut egui::Ui) {
         let modes = [
-            (VizMode::Ladder, "Ladder"),
             (VizMode::Radial, "Radial"),
             (VizMode::Spectrogram, "Spectro"),
             (VizMode::Scope, "Scope"),
@@ -1833,12 +1832,15 @@ impl DashboardApp {
             self.turning_over_gauge(ui);
             ui.add_space(12.0);
 
-            // Switchable visualization region: harmonic ladder (default),
-            // radial signature, spectrogram waterfall, or oscilloscope.
+            // The harmonic ladder is always shown.
+            harmonic_ladder(ui, &self.harm_ema, valid, f0);
+            ui.add_space(12.0);
+
+            // Secondary switchable visualization below the ladder: radial
+            // signature, spectrogram waterfall, or oscilloscope.
             self.viz_mode_switch(ui);
             ui.add_space(10.0);
             match self.viz_mode {
-                VizMode::Ladder => harmonic_ladder(ui, &self.harm_ema, valid, f0),
                 VizMode::Radial => radial_view(ui, &self.harm_ema, valid),
                 VizMode::Spectrogram => self.spectrogram_view(ui),
                 VizMode::Scope => self.scope_view(ui, valid, f0),
