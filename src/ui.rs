@@ -13,7 +13,7 @@
 //! compute speaker embeddings yet).
 
 use crate::concurrency::{EngineEvent, Telemetry};
-use crate::types::{Formant, MAX_PARTIALS, Vibrato, VocalProfile};
+use crate::types::{Formant, MAX_PARTIALS, Vibrato, VocalProfile, Voiceprint};
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, RichText, Sense, Shape,
     Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2,
@@ -206,8 +206,9 @@ struct Session {
     /// Mean relative harmonic profile (H1..H16, normalized to the strongest
     /// partial) over the capture; drives the Detail screen's Timbre caption.
     profile: [f32; 16],
-    /// Real measured formants when the session came from a live capture;
-    /// `None` for the seeded demo archive (detail view derives mock values).
+    /// Real measured formants; always `Some` now that the archive holds only
+    /// real captures. (The session's voiceprint is derivable from these +
+    /// `profile` + `centroid_hz` via `math::build_voiceprint` when needed.)
     formants: Option<[Formant; 3]>,
 }
 
@@ -224,6 +225,10 @@ struct CaptureResult {
     centroid_hz: Option<f32>,
     profile: [f32; 16],
     formants: Option<[Formant; 3]>,
+    voiceprint: Voiceprint,
+    /// True when no reference was enrolled yet: this capture is the reference
+    /// candidate (shown as "Reference" rather than a similarity score).
+    is_reference: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -315,6 +320,13 @@ pub struct DashboardApp {
     wf_pixels: Vec<u8>,
     wf_lut: [Color32; 256],
 
+    /// Enrolled reference voiceprint (set by the first saved capture). Every
+    /// later capture's match % is a real similarity against this. `None` until
+    /// enrollment. In-memory only — re-enroll each session for now.
+    enrolled: Option<Voiceprint>,
+    /// Short human ID for the enrolled reference (e.g. "V-3F9A").
+    enrolled_id: Option<String>,
+
     next_session_num: u32,
     rng: u64,
 }
@@ -336,37 +348,10 @@ impl DashboardApp {
         visuals.window_fill = BG_BASE;
         cc.egui_ctx.set_visuals(visuals);
 
-        // Seeded demo archive: plausible static values, marked apart from live
-        // captures only by `formants: None`. Metric tuple order:
-        // (hnr, h1h2, steadiness, jitter, shimmer, cpp, centroid_hz).
-        let seed = |id: &str,
-                    subj: &str,
-                    date: &str,
-                    f0: f32,
-                    m: f32,
-                    met: (f32, f32, f32, f32, f32, f32, f32),
-                    vib: Option<(f32, f32)>| Session {
-            id: id.into(),
-            subj: subj.into(),
-            date: date.into(),
-            f0,
-            match_pct: m,
-            hnr_db: Some(met.0),
-            h1_h2_db: Some(met.1),
-            steadiness_cents: Some(met.2),
-            jitter_pct: Some(met.3),
-            shimmer_db: Some(met.4),
-            cpp_db: Some(met.5),
-            centroid_hz: Some(met.6),
-            // Plausible generic 1/k harmonic decay — seed data, not measured.
-            profile: std::array::from_fn(|i| 1.0 / (i + 1) as f32),
-            vibrato: vib.map(|(rate_hz, extent_cents)| Vibrato {
-                rate_hz,
-                extent_cents,
-            }),
-            formants: None,
-        };
-
+        // Real archive: starts empty. The first saved capture enrolls the
+        // reference voiceprint; every session here is a real capture with a
+        // real match score. (No seeded demo rows — they had no audio behind
+        // them and so could carry no real voiceprint.)
         Self {
             event_tx,
             telemetry,
@@ -375,53 +360,7 @@ impl DashboardApp {
             screen: Screen::Overview,
             filter: Filter::All,
             rec: RecState::Idle,
-            sessions: vec![
-                seed(
-                    "VS-2481",
-                    "S-0417",
-                    "Jul 1 · 09:12",
-                    118.4,
-                    96.2,
-                    (21.7, 4.2, 9.0, 0.38, 0.18, 15.2, 1450.0),
-                    Some((5.6, 42.0)),
-                ),
-                seed(
-                    "VS-2480",
-                    "S-0392",
-                    "Jun 30 · 16:40",
-                    214.9,
-                    91.8,
-                    (19.3, 6.8, 12.0, 0.52, 0.24, 13.6, 2050.0),
-                    Some((5.1, 55.0)),
-                ),
-                seed(
-                    "VS-2479",
-                    "S-0417",
-                    "Jun 29 · 11:05",
-                    121.2,
-                    94.5,
-                    (20.4, 3.9, 8.0, 0.41, 0.20, 14.8, 1380.0),
-                    Some((5.7, 38.0)),
-                ),
-                seed(
-                    "VS-2478",
-                    "S-0105",
-                    "Jun 28 · 14:22",
-                    187.5,
-                    62.3,
-                    (16.1, 12.5, 28.0, 1.82, 0.61, 9.5, 3100.0),
-                    None,
-                ),
-                seed(
-                    "VS-2477",
-                    "S-0233",
-                    "Jun 27 · 10:48",
-                    132.8,
-                    88.1,
-                    (18.9, 7.4, 14.0, 0.66, 0.29, 12.9, 1720.0),
-                    Some((4.8, 61.0)),
-                ),
-            ],
+            sessions: Vec::new(),
             selected: None,
             result: None,
             export_queued: false,
@@ -457,7 +396,10 @@ impl DashboardApp {
             wf_pixels: vec![0u8; SPEC_TIME_COLS * SPEC_FREQ_ROWS * 4],
             wf_lut: build_heat_lut(),
 
-            next_session_num: 2482,
+            enrolled: None,
+            enrolled_id: None,
+
+            next_session_num: 1,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -496,15 +438,13 @@ impl DashboardApp {
         if let RecState::Analyzing { start, elapsed } = self.rec
             && now - start >= 2.1
         {
-            // Real f0 mean when we heard voiced frames; otherwise the
-            // prototype's synthetic fallback. Match/HNR are mock — the
-            // engine has no speaker-verification scoring yet.
+            // Real f0 mean when we heard voiced frames; otherwise a small
+            // synthetic fallback so the readout isn't blank.
             let f0 = if self.rec_f0_acc.is_empty() {
                 114.0 + self.rand01() * 10.0
             } else {
                 self.rec_f0_acc.iter().sum::<f32>() / self.rec_f0_acc.len() as f32
             };
-            let match_pct = ((92.0 + self.rand01() * 6.0) * 10.0).round() / 10.0;
             let mean =
                 |acc: &[f32]| (!acc.is_empty()).then(|| acc.iter().sum::<f32>() / acc.len() as f32);
             // Vibrato/steadiness are contour-level: snapshot the stop-time
@@ -516,6 +456,30 @@ impl DashboardApp {
             } else {
                 [0.0; 16]
             };
+
+            // Build this capture's classical voiceprint and score it against the
+            // enrolled reference. With no reference yet, this capture *is* the
+            // reference candidate (match shown as "Reference"); once enrolled,
+            // the match is a real similarity in 0..100.
+            let voiceprint = crate::math::build_voiceprint(
+                self.rec_formants.unwrap_or(
+                    [Formant {
+                        frequency: 0.0,
+                        bandwidth: 0.0,
+                    }; 3],
+                ),
+                &profile,
+                mean(&self.rec_centroid_acc).unwrap_or(0.0),
+            );
+            let is_reference = self.enrolled.is_none();
+            let match_pct = match &self.enrolled {
+                Some(reference) => {
+                    (crate::math::voiceprint_similarity(&voiceprint, reference) * 10.0).round()
+                        / 10.0
+                }
+                None => 100.0,
+            };
+
             self.result = Some(CaptureResult {
                 match_pct,
                 f0: (f0 * 10.0).round() / 10.0,
@@ -529,6 +493,8 @@ impl DashboardApp {
                 centroid_hz: mean(&self.rec_centroid_acc),
                 profile,
                 formants: self.rec_formants,
+                voiceprint,
+                is_reference,
             });
             self.rec = RecState::Done { elapsed };
         }
@@ -560,9 +526,19 @@ impl DashboardApp {
 
     fn save_session(&mut self) {
         if let Some(res) = self.result.take() {
+            // First saved capture enrolls the reference voiceprint; its match
+            // reads 100% against itself. A short ID is derived from the print.
+            if self.enrolled.is_none() {
+                self.enrolled = Some(res.voiceprint);
+                self.enrolled_id = Some(self.derive_voice_id(&res.voiceprint));
+            }
+            let subj = self
+                .enrolled_id
+                .clone()
+                .unwrap_or_else(|| "V-????".to_string());
             let session = Session {
-                id: format!("VS-{}", self.next_session_num),
-                subj: "S-0417".into(),
+                id: format!("VS-{:03}", self.next_session_num),
+                subj,
                 date: "Today".into(),
                 f0: res.f0,
                 match_pct: res.match_pct,
@@ -583,6 +559,22 @@ impl DashboardApp {
             self.filter = Filter::All;
             self.screen = Screen::Sessions;
         }
+    }
+
+    /// A short, stable ID for a voiceprint (e.g. "V-3F9A"), hashed from its
+    /// formants + centroid so the same reference reads consistently.
+    fn derive_voice_id(&self, vp: &Voiceprint) -> String {
+        let mut h: u32 = 0x811c_9dc5;
+        for v in [
+            vp.formants[0],
+            vp.formants[1],
+            vp.formants[2],
+            vp.centroid_hz,
+        ] {
+            h ^= (v as i32) as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        format!("V-{:04X}", (h >> 16) as u16)
     }
 
     /// One waveform sample per frame: recording follows the live input RMS,
@@ -950,133 +942,163 @@ impl DashboardApp {
         });
         ui.add_space(18.0);
 
-        // Active-subject hero card.
-        let hero = self
-            .sessions
-            .iter()
-            .find(|s| s.subj == "S-0417")
-            .unwrap_or(&self.sessions[0])
-            .clone();
-        let (badge, badge_bg, badge_fg) = Self::badge_style(hero.match_pct);
+        // Reference-voiceprint hero card. Reflects real enrollment state: the
+        // ring shows the latest capture's real match; the label is the enrolled
+        // reference ID and true session count. Before enrollment it invites a
+        // first capture rather than showing a fake subject.
+        let latest = self.sessions.first().cloned();
+        let count = self.sessions.len();
+        let id_label = self.enrolled_id.clone();
         glass(24.0).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(96.0, 96.0), Sense::hover());
+                let ring_pct = latest.as_ref().map(|s| s.match_pct).unwrap_or(0.0);
+                let ring_val = latest
+                    .as_ref()
+                    .map(|s| format!("{:.1}", s.match_pct))
+                    .unwrap_or_else(|| "—".into());
                 ring_gauge(
                     ui.painter(),
                     rect,
-                    hero.match_pct,
+                    ring_pct,
                     TEAL,
-                    &format!("{:.1}", hero.match_pct),
+                    &ring_val,
                     Some("MATCH %"),
                 );
                 ui.add_space(14.0);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("Active subject").size(12.0).color(ink(140)));
-                    ui.add_space(3.0);
-                    ui.label(
-                        RichText::new("S-0417")
-                            .font(FontId::monospace(20.0))
-                            .color(INK)
-                            .strong(),
-                    );
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("Enrolled · 12 sessions · M, 34")
-                            .size(12.0)
-                            .color(ink(140)),
-                    );
-                    ui.add_space(9.0);
-                    pill_badge(ui, badge, badge_bg, badge_fg);
+                ui.vertical(|ui| match &id_label {
+                    Some(id) => {
+                        ui.label(
+                            RichText::new("Reference voiceprint")
+                                .size(12.0)
+                                .color(ink(140)),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new(id)
+                                .font(FontId::monospace(20.0))
+                                .color(INK)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        let plural = if count == 1 { "" } else { "s" };
+                        ui.label(
+                            RichText::new(format!("Enrolled · {count} session{plural}"))
+                                .size(12.0)
+                                .color(ink(140)),
+                        );
+                        ui.add_space(9.0);
+                        if let Some(s) = &latest {
+                            let (badge, bg, fg) = Self::badge_style(s.match_pct);
+                            pill_badge(ui, badge, bg, fg);
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("No voiceprint enrolled")
+                                .size(12.0)
+                                .color(ink(140)),
+                        );
+                        ui.add_space(3.0);
+                        ui.label(
+                            RichText::new("—")
+                                .font(FontId::monospace(20.0))
+                                .color(INK)
+                                .strong(),
+                        );
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Capture and save to enroll your reference")
+                                .size(12.0)
+                                .color(ink(140)),
+                        );
+                    }
                 });
             });
         });
         ui.add_space(12.0);
 
-        // Metric tiles (2 × 2) — prototype archive metrics.
-        struct Tile {
-            label: &'static str,
-            value: &'static str,
-            unit: &'static str,
-            reference: &'static str,
-            points: [(f32, f32); 8],
-        }
-        const TILES: [Tile; 4] = [
-            Tile {
-                label: "F0 MEAN",
-                value: "118.4",
-                unit: "Hz",
-                reference: "+1.2 vs enrollment",
-                points: [
-                    (0.0, 16.0),
-                    (14.0, 13.0),
-                    (28.0, 15.0),
-                    (42.0, 10.0),
-                    (56.0, 12.0),
-                    (70.0, 7.0),
-                    (84.0, 9.0),
-                    (100.0, 6.0),
-                ],
-            },
-            Tile {
-                label: "JITTER",
-                value: "0.42",
-                unit: "%",
-                reference: "ref < 1.04 %",
-                points: [
-                    (0.0, 8.0),
-                    (14.0, 11.0),
-                    (28.0, 9.0),
-                    (42.0, 13.0),
-                    (56.0, 12.0),
-                    (70.0, 15.0),
-                    (84.0, 14.0),
-                    (100.0, 16.0),
-                ],
-            },
-            Tile {
-                label: "SHIMMER",
-                value: "0.28",
-                unit: "dB",
-                reference: "ref < 0.35 dB",
-                points: [
-                    (0.0, 12.0),
-                    (14.0, 10.0),
-                    (28.0, 13.0),
-                    (42.0, 11.0),
-                    (56.0, 14.0),
-                    (70.0, 12.0),
-                    (84.0, 15.0),
-                    (100.0, 13.0),
-                ],
-            },
-            Tile {
-                label: "HNR",
-                value: "21.7",
-                unit: "dB",
-                reference: "ref > 17 dB",
-                points: [
-                    (0.0, 18.0),
-                    (14.0, 15.0),
-                    (28.0, 16.0),
-                    (42.0, 12.0),
-                    (56.0, 13.0),
-                    (70.0, 9.0),
-                    (84.0, 10.0),
-                    (100.0, 6.0),
-                ],
-            },
+        // Metric tiles (2 × 2) — real aggregates across the saved archive.
+        // Sessions are stored newest-first; `.rev()` gives oldest→newest for
+        // the trend sparkline.
+        let vals_f0: Vec<f32> = self.sessions.iter().rev().map(|s| s.f0).collect();
+        let vals_jit: Vec<f32> = self
+            .sessions
+            .iter()
+            .rev()
+            .filter_map(|s| s.jitter_pct)
+            .collect();
+        let vals_shim: Vec<f32> = self
+            .sessions
+            .iter()
+            .rev()
+            .filter_map(|s| s.shimmer_db)
+            .collect();
+        let vals_hnr: Vec<f32> = self
+            .sessions
+            .iter()
+            .rev()
+            .filter_map(|s| s.hnr_db)
+            .collect();
+
+        let mean = |v: &[f32]| (!v.is_empty()).then(|| v.iter().sum::<f32>() / v.len() as f32);
+        // Last up-to-8 values → sparkline points (higher value = toward top).
+        let spark = |v: &[f32]| -> Vec<(f32, f32)> {
+            let w = &v[v.len().saturating_sub(8)..];
+            if w.len() < 2 {
+                return Vec::new();
+            }
+            let (mn, mx) = w
+                .iter()
+                .fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            let range = (mx - mn).max(1e-6);
+            w.iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let px = i as f32 / (w.len() - 1) as f32 * 100.0;
+                    let py = 22.0 - (x - mn) / range * 20.0;
+                    (px, py)
+                })
+                .collect()
+        };
+        let fmt = |v: Option<f32>, d: usize| match v {
+            Some(x) => format!("{x:.*}", d),
+            None => "—".into(),
+        };
+        let tiles = [
+            (
+                "F0 MEAN",
+                fmt(mean(&vals_f0), 1),
+                "Hz",
+                "across saved captures",
+                spark(&vals_f0),
+            ),
+            (
+                "JITTER",
+                fmt(mean(&vals_jit), 2),
+                "%",
+                "ref < 1.04 %",
+                spark(&vals_jit),
+            ),
+            (
+                "SHIMMER",
+                fmt(mean(&vals_shim), 2),
+                "dB",
+                "ref < 0.35 dB",
+                spark(&vals_shim),
+            ),
+            (
+                "HNR",
+                fmt(mean(&vals_hnr), 1),
+                "dB",
+                "ref > 17 dB",
+                spark(&vals_hnr),
+            ),
         ];
-        for row in TILES.chunks(2) {
+        for row in tiles.chunks(2) {
             ui.columns(2, |cols| {
-                for (col, tile) in cols.iter_mut().zip(row) {
-                    let (label, value, unit, reference, pts) = (
-                        &tile.label,
-                        &tile.value,
-                        &tile.unit,
-                        &tile.reference,
-                        &tile.points,
-                    );
+                for (col, (label, value, unit, reference, pts)) in cols.iter_mut().zip(row) {
                     glass(20.0).show(col, |ui| {
                         ui.label(
                             RichText::new(*label)
@@ -1086,7 +1108,7 @@ impl DashboardApp {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label(
-                                RichText::new(*value)
+                                RichText::new(value)
                                     .font(FontId::monospace(22.0))
                                     .color(INK)
                                     .strong(),
@@ -1126,6 +1148,9 @@ impl DashboardApp {
         });
         ui.add_space(10.0);
 
+        if self.sessions.is_empty() {
+            ui.label(RichText::new("No captures yet.").size(12.5).color(ink(120)));
+        }
         let recent: Vec<(usize, Session)> =
             self.sessions.iter().take(3).cloned().enumerate().collect();
         for (i, s) in recent {
@@ -1189,15 +1214,17 @@ impl DashboardApp {
     }
 
     fn screen_capture(&mut self, ui: &mut egui::Ui, now: f64) {
+        let chip = self
+            .enrolled_id
+            .clone()
+            .unwrap_or_else(|| "Not enrolled".into());
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 self.screen_kicker(ui, "LIVE ACQUISITION", "Capture");
             });
             ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
                 let font = FontId::monospace(12.5);
-                let galley = ui
-                    .painter()
-                    .layout_no_wrap("S-0417".into(), font.clone(), INK);
+                let galley = ui.painter().layout_no_wrap(chip.clone(), font.clone(), INK);
                 let size = vec2(galley.size().x + 38.0, 30.0);
                 let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
                 ui.painter().rect(
@@ -1212,7 +1239,7 @@ impl DashboardApp {
                 ui.painter().text(
                     pos2(rect.left() + 26.0, rect.center().y),
                     Align2::LEFT_CENTER,
-                    "S-0417",
+                    &chip,
                     font,
                     INK,
                 );
@@ -1341,8 +1368,12 @@ impl DashboardApp {
                 let bar = Rect::from_min_size(rect.min, vec2(rect.width() * frac, 6.0));
                 ui.painter().rect_filled(bar, 3.0, TEAL);
                 ui.add_space(10.0);
+                let analyzing_line = match &self.enrolled_id {
+                    Some(id) => format!("EXTRACTING VOICEPRINT · SCORING VS {id}"),
+                    None => "EXTRACTING VOICEPRINT · NO REFERENCE YET".to_string(),
+                };
                 ui.label(
-                    RichText::new("EXTRACTING EMBEDDING · SCORING VS ENROLLMENT S-0417")
+                    RichText::new(analyzing_line)
                         .font(FontId::monospace(10.5))
                         .color(ink(128)),
                 );
@@ -1354,17 +1385,23 @@ impl DashboardApp {
         if matches!(self.rec, RecState::Done { .. })
             && let Some(res) = &self.result
         {
-            let (badge, badge_bg, badge_fg) = Self::badge_style(res.match_pct);
+            let is_ref = res.is_reference;
+            let (badge, badge_bg, badge_fg) = if is_ref {
+                ("Reference", teal_a(31), TEAL_DARK)
+            } else {
+                Self::badge_style(res.match_pct)
+            };
             let match_str = format!("{:.1}", res.match_pct);
+            let heading = match (&self.enrolled_id, is_ref) {
+                (_, true) => "First capture — enrolls your reference voiceprint".to_string(),
+                (Some(id), false) => format!("Similarity vs voiceprint {id}"),
+                (None, false) => "Similarity vs reference".to_string(),
+            };
             let mut save = false;
             let mut discard = false;
             glass(24.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Similarity vs voiceprint S-0417")
-                            .size(13.0)
-                            .color(ink(140)),
-                    );
+                    ui.label(RichText::new(heading).size(13.0).color(ink(140)));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         pill_badge(ui, badge, badge_bg, badge_fg);
                     });
@@ -2043,6 +2080,21 @@ impl DashboardApp {
             .map(|(i, s)| (i, s.clone()))
             .collect();
 
+        if rows.is_empty() {
+            ui.add_space(24.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(if self.sessions.is_empty() {
+                        "No captures yet — record on the Capture tab.\nYour first save enrolls your reference voiceprint."
+                    } else {
+                        "No sessions match this filter."
+                    })
+                    .size(12.5)
+                    .color(ink(120)),
+                );
+            });
+        }
+
         for (i, s) in rows {
             let (_, badge_bg, badge_fg) = Self::badge_style(s.match_pct);
             let ir = glass(18.0).show(ui, |ui| {
@@ -2119,11 +2171,15 @@ impl DashboardApp {
     }
 
     fn screen_detail(&mut self, ui: &mut egui::Ui) {
-        let sel = self
-            .selected
-            .and_then(|i| self.sessions.get(i))
-            .unwrap_or(&self.sessions[0])
-            .clone();
+        // Resolve the selected session; fall back to Sessions if the archive is
+        // empty or the selection is stale (no unwrap on an empty vec).
+        let sel = match self.selected.and_then(|i| self.sessions.get(i)) {
+            Some(s) => s.clone(),
+            None => {
+                self.screen = Screen::Sessions;
+                return;
+            }
+        };
         let (badge, badge_bg, badge_fg) = Self::badge_style(sel.match_pct);
         let ring_color = if Self::verified(sel.match_pct) {
             TEAL
@@ -2179,18 +2235,14 @@ impl DashboardApp {
                 );
                 ui.add_space(14.0);
                 ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new("Verification score")
-                            .size(12.0)
-                            .color(ink(140)),
-                    );
+                    ui.label(RichText::new("Match score").size(12.0).color(ink(140)));
                     ui.add_space(3.0);
-                    ui.label(
-                        RichText::new("vs enrolled voiceprint")
-                            .size(15.0)
-                            .color(INK)
-                            .strong(),
-                    );
+                    let vp_line = self
+                        .enrolled_id
+                        .as_ref()
+                        .map(|id| format!("vs voiceprint {id}"))
+                        .unwrap_or_else(|| "vs reference voiceprint".into());
+                    ui.label(RichText::new(vp_line).size(15.0).color(INK).strong());
                     ui.add_space(8.0);
                     pill_badge(ui, badge, badge_bg, badge_fg);
                 });

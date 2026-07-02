@@ -11,6 +11,25 @@ pub struct Vibrato {
     pub extent_cents: f32,
 }
 
+/// A pitch-invariant classical voiceprint: vocal-tract resonances (formants),
+/// spectral brightness/slope, and timbre shape. f0 is deliberately excluded so
+/// the print identifies the *voice* regardless of the note sung. Built from a
+/// capture's averaged features; compared via `math::voiceprint_similarity`.
+///
+/// This is a real, deterministic voice-*similarity* representation — good for
+/// tracking a singer's own consistency — not a forensic biometric identity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Voiceprint {
+    /// F1, F2, F3 in Hz (0.0 = unresolved).
+    pub formants: [f32; 3],
+    /// Spectral centroid (Hz).
+    pub centroid_hz: f32,
+    /// Spectral tilt (dB/octave).
+    pub tilt_db_oct: f32,
+    /// Mean relative harmonic profile, H1..H16 (normalized to the strongest).
+    pub profile: [f32; 16],
+}
+
 /// Per-frame voice-quality metrics. All `None` until the analysis has enough
 /// voiced signal to say something honest.
 #[derive(Debug, Clone, Copy, Default)]

@@ -1,4 +1,4 @@
-use crate::types::{Formant, MAX_PARTIALS};
+use crate::types::{Formant, MAX_PARTIALS, Voiceprint};
 use aberth::AberthSolver;
 use std::f32::consts::PI;
 
@@ -917,6 +917,88 @@ pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'stati
     }
 }
 
+// ── Classical voiceprint & similarity ────────────────────────────────────────
+
+/// Rough adult-voice population `(mean, std)` for each scalar voiceprint
+/// feature, used to z-score before comparison so heterogeneous units (Hz vs
+/// dB/oct) contribute on a common scale. Approximate — good enough to weight
+/// the features sensibly, not a calibrated model.
+const VP_STATS: [(f32, f32); 5] = [
+    (500.0, 150.0),  // F1
+    (1500.0, 350.0), // F2
+    (2600.0, 400.0), // F3
+    (1800.0, 700.0), // centroid
+    (-9.0, 4.0),     // tilt dB/oct
+];
+
+/// Build a pitch-invariant voiceprint from a capture's averaged features.
+/// `formants` are F1/F2/F3 (Hz), `profile` the mean relative harmonic
+/// amplitudes (H1..), `centroid_hz` the mean spectral centroid. Tilt is
+/// derived from the profile. f0 is intentionally not an input.
+pub fn build_voiceprint(formants: [Formant; 3], profile: &[f32], centroid_hz: f32) -> Voiceprint {
+    let mut p = [0.0f32; 16];
+    for (slot, &v) in p.iter_mut().zip(profile) {
+        *slot = v;
+    }
+    Voiceprint {
+        formants: [
+            formants[0].frequency,
+            formants[1].frequency,
+            formants[2].frequency,
+        ],
+        centroid_hz,
+        tilt_db_oct: spectral_tilt_db_per_octave(&p).unwrap_or(-9.0),
+        profile: p,
+    }
+}
+
+/// Similarity between two voiceprints in `0..=100`. Two parts:
+///   * scalar resonance/brightness (F1/F2/F3, centroid, tilt) — z-scored, with
+///     a Gaussian falloff on the RMS z-distance (identical → 1, ~1σ mean
+///     difference → ~0.6, ~2σ → ~0.14); weight 0.6.
+///   * timbre — cosine similarity of the harmonic profiles; weight 0.4.
+///
+/// Identical voiceprints score 100. A real, explainable voice-*similarity*
+/// score (self-consistency), not forensic speaker recognition — classical
+/// formant/timbre features conflate "same vowel/effort" with "same voice".
+pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> f32 {
+    // Scalar part: RMS distance over z-scored features.
+    let a_scalars = [
+        a.formants[0],
+        a.formants[1],
+        a.formants[2],
+        a.centroid_hz,
+        a.tilt_db_oct,
+    ];
+    let b_scalars = [
+        b.formants[0],
+        b.formants[1],
+        b.formants[2],
+        b.centroid_hz,
+        b.tilt_db_oct,
+    ];
+    let mut sumsq = 0.0f32;
+    for i in 0..5 {
+        let (_, std) = VP_STATS[i];
+        let dz = (a_scalars[i] - b_scalars[i]) / std;
+        sumsq += dz * dz;
+    }
+    let rms_z = (sumsq / 5.0).sqrt();
+    let scalar_sim = (-0.5 * rms_z * rms_z).exp();
+
+    // Timbre part: cosine of the (non-negative) harmonic profiles.
+    let dot: f32 = a.profile.iter().zip(&b.profile).map(|(x, y)| x * y).sum();
+    let na: f32 = a.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb: f32 = b.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let timbre_sim = if na > 1e-9 && nb > 1e-9 {
+        (dot / (na * nb)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    ((0.6 * scalar_sim + 0.4 * timbre_sim) * 100.0).clamp(0.0, 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1503,6 +1585,68 @@ mod tests {
         balanced[2] = 0.4;
         balanced[3] = 0.4;
         assert_eq!(timbre_description(&balanced, Some(0.0)), "Balanced");
+    }
+
+    fn fmt3(a: f32, b: f32, c: f32) -> [Formant; 3] {
+        [
+            Formant {
+                frequency: a,
+                bandwidth: 80.0,
+            },
+            Formant {
+                frequency: b,
+                bandwidth: 120.0,
+            },
+            Formant {
+                frequency: c,
+                bandwidth: 160.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn voiceprint_identical_scores_100() {
+        let profile: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        let vp = build_voiceprint(fmt3(520.0, 1480.0, 2610.0), &profile, 1750.0);
+        let s = voiceprint_similarity(&vp, &vp);
+        assert!((s - 100.0).abs() < 0.01, "identical should be 100, got {s}");
+    }
+
+    #[test]
+    fn voiceprint_different_voice_scores_lower() {
+        let prof_a: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        let a = build_voiceprint(fmt3(500.0, 1500.0, 2600.0), &prof_a, 1700.0);
+
+        // A clearly different voice: formants shifted ~2σ, brighter centroid,
+        // shallower tilt (via a flatter profile).
+        let prof_b: Vec<f32> = (1..=16).map(|k| 1.0 / (k as f32).sqrt()).collect();
+        let b = build_voiceprint(fmt3(760.0, 2150.0, 3300.0), &prof_b, 3200.0);
+
+        let self_score = voiceprint_similarity(&a, &a);
+        let cross = voiceprint_similarity(&a, &b);
+        assert!(
+            cross < self_score - 25.0,
+            "different voice {cross} should be well below self {self_score}"
+        );
+        assert!(
+            (0.0..=100.0).contains(&cross),
+            "score out of range: {cross}"
+        );
+    }
+
+    #[test]
+    fn voiceprint_closer_voice_scores_higher() {
+        let prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        let ref_vp = build_voiceprint(fmt3(500.0, 1500.0, 2600.0), &prof, 1800.0);
+        // Near neighbor (small formant drift) vs far (large drift).
+        let near = build_voiceprint(fmt3(515.0, 1530.0, 2630.0), &prof, 1850.0);
+        let far = build_voiceprint(fmt3(650.0, 1900.0, 3050.0), &prof, 2600.0);
+        let s_near = voiceprint_similarity(&ref_vp, &near);
+        let s_far = voiceprint_similarity(&ref_vp, &far);
+        assert!(
+            s_near > s_far,
+            "nearer voice {s_near} should score above farther {s_far}"
+        );
     }
 
     #[test]
