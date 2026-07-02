@@ -331,6 +331,11 @@ impl AnalysisEngine {
         });
         contour.push(f0, voiced);
         let (vibrato, steadiness_cents) = contour.analyze();
+        let perturbation = if voiced {
+            crate::math::cycle_perturbation(audio_in, sample_rate, f0)
+        } else {
+            None
+        };
         let metrics = crate::types::VoiceMetrics {
             hnr_db: if voiced {
                 crate::math::hnr_db(audio_in, sample_rate, f0)
@@ -344,6 +349,13 @@ impl AnalysisEngine {
             },
             vibrato,
             steadiness_cents,
+            jitter_pct: perturbation.map(|p| p.jitter_pct),
+            shimmer_db: perturbation.map(|p| p.shimmer_db),
+            cpp_db: if voiced {
+                crate::math::cpp_db(audio_in, sample_rate)
+            } else {
+                None
+            },
         };
 
         let profile = VocalProfile {

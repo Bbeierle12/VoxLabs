@@ -186,6 +186,11 @@ fn cpu_analysis_loop(
             // Voice-quality metrics, mirroring the desktop analysis path.
             contour.push(f0, voiced);
             let (vibrato, steadiness_cents) = contour.analyze();
+            let perturbation = if voiced {
+                math::cycle_perturbation(frame, sample_rate, f0)
+            } else {
+                None
+            };
             let metrics = crate::types::VoiceMetrics {
                 hnr_db: if voiced {
                     math::hnr_db(frame, sample_rate, f0)
@@ -199,6 +204,13 @@ fn cpu_analysis_loop(
                 },
                 vibrato,
                 steadiness_cents,
+                jitter_pct: perturbation.map(|p| p.jitter_pct),
+                shimmer_db: perturbation.map(|p| p.shimmer_db),
+                cpp_db: if voiced {
+                    math::cpp_db(frame, sample_rate)
+                } else {
+                    None
+                },
             };
 
             let profile = VocalProfile {

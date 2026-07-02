@@ -23,6 +23,13 @@ pub struct VoiceMetrics {
     pub vibrato: Option<Vibrato>,
     /// RMS cents deviation of the sustain after drift + vibrato removal.
     pub steadiness_cents: Option<f32>,
+    /// Jitter (local, %): cycle-to-cycle period perturbation. Needs ≥ 5
+    /// cycles per frame, so `None` below ~112 Hz.
+    pub jitter_pct: Option<f32>,
+    /// Shimmer (local, dB): cycle-to-cycle amplitude perturbation.
+    pub shimmer_db: Option<f32>,
+    /// Cepstral peak prominence (dB): periodicity strength / breathiness.
+    pub cpp_db: Option<f32>,
 }
 
 pub const MAX_PARTIALS: usize = 32;
