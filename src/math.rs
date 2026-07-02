@@ -438,6 +438,67 @@ pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; 
     amps
 }
 
+/// Harmonics-to-noise ratio in dB, Boersma/Praat style: the normalized
+/// autocorrelation `r = ACF(T)/ACF(0)` at the pitch period `T = sr/f0`
+/// (parabolic-refined around the nearest integer lag, per-count normalized so
+/// the shrinking overlap doesn't bias `r` down), mapped through
+/// `10·log10(r / (1 − r))` and clamped to ±40 dB.
+///
+/// This reads a couple of dB below Praat's windowed implementation — treat it
+/// as a relative training signal, not a clinical instrument.
+pub fn hnr_db(samples: &[f32], sample_rate: f32, f0: f32) -> Option<f32> {
+    let n = samples.len();
+    if f0 <= 0.0 || sample_rate <= 0.0 || n < 64 {
+        return None;
+    }
+    let lag = sample_rate / f0;
+    let lag_i = lag.round() as usize;
+    if lag_i < 2 || lag_i + 2 >= n {
+        return None;
+    }
+
+    // Per-count-normalized autocorrelation at one lag.
+    let r_at = |l: usize| -> f32 {
+        let sum: f32 = samples[..n - l]
+            .iter()
+            .zip(&samples[l..])
+            .map(|(a, b)| a * b)
+            .sum();
+        sum / (n - l) as f32
+    };
+    let r0 = r_at(0);
+    if r0 <= 1e-12 {
+        return None;
+    }
+
+    // Parabolic vertex through the three lags around the period gives the
+    // true (non-integer-lag) correlation peak height.
+    let (y0, y1, y2) = (r_at(lag_i - 1), r_at(lag_i), r_at(lag_i + 1));
+    let denom = y0 - 2.0 * y1 + y2;
+    let peak = if denom.abs() < 1e-12 {
+        y1
+    } else {
+        y1 - (y0 - y2) * (y0 - y2) / (8.0 * denom)
+    };
+
+    let r = (peak / r0).clamp(-0.9999, 0.9999);
+    if r <= 0.0 {
+        return Some(-40.0);
+    }
+    Some((10.0 * (r / (1.0 - r)).log10()).clamp(-40.0, 40.0))
+}
+
+/// H1–H2 in dB: the level difference between the first two harmonics, the
+/// standard phonation-type measure (large = breathy/flowy, small or negative
+/// = pressed). `None` when either harmonic sits below the −48 dB relative
+/// floor (same floor as the ladder display).
+pub fn h1_h2_db(amps: &[f32]) -> Option<f32> {
+    let (a1, a2) = (*amps.first()?, *amps.get(1)?);
+    let max = amps.iter().cloned().fold(0.0f32, f32::max);
+    let floor = max * 10f32.powf(-48.0 / 20.0);
+    (max > 1e-6 && a1 > floor && a2 > floor).then(|| 20.0 * (a1 / a2).log10())
+}
+
 // ── Musical mapping & timbre metrics ─────────────────────────────────────────
 
 /// A 12-TET note name for a frequency: pitch class, octave, and signed cents
@@ -734,6 +795,62 @@ mod tests {
         let buf = sine(220.0, 44_100.0, 2048);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, 0.0), [0.0; 32]);
         assert_eq!(harmonic_amplitudes(&buf, 44_100.0, -5.0), [0.0; 32]);
+    }
+
+    #[test]
+    fn hnr_of_pure_sine_hits_ceiling() {
+        let buf = sine(220.0, 44_100.0, 2048);
+        let hnr = hnr_db(&buf, 44_100.0, 220.0).unwrap();
+        assert!(hnr > 25.0, "pure tone HNR {hnr} should be very high");
+    }
+
+    #[test]
+    fn hnr_tracks_known_snr() {
+        // Sine (power 0.5) + deterministic pseudo-noise at a known level.
+        let sr = 44_100.0;
+        let tone = sine(220.0, sr, 2048);
+        let noise: Vec<f32> = (0..2048)
+            .map(|i| {
+                let x = i as f32;
+                (((x * 12.9898).sin() * 43758.5).fract() - 0.5) * 0.2
+            })
+            .collect();
+        let sig_pow: f32 = tone.iter().map(|s| s * s).sum::<f32>() / 2048.0;
+        let noise_pow: f32 = noise.iter().map(|s| s * s).sum::<f32>() / 2048.0;
+        let expected = 10.0 * (sig_pow / noise_pow).log10();
+
+        let mixed: Vec<f32> = tone.iter().zip(&noise).map(|(a, b)| a + b).collect();
+        let hnr = hnr_db(&mixed, sr, 220.0).unwrap();
+        assert!(
+            (hnr - expected).abs() < 3.0,
+            "HNR {hnr} should be near true SNR {expected}"
+        );
+    }
+
+    #[test]
+    fn hnr_degenerate_inputs_are_none() {
+        let buf = sine(220.0, 44_100.0, 2048);
+        assert!(hnr_db(&buf, 44_100.0, 0.0).is_none());
+        assert!(hnr_db(&buf, 44_100.0, 30_000.0).is_none()); // lag < 2
+        assert!(hnr_db(&[0.0; 2048], 44_100.0, 220.0).is_none()); // silence
+        assert!(hnr_db(&buf[..32], 44_100.0, 220.0).is_none()); // too short
+    }
+
+    #[test]
+    fn h1_h2_of_sawtooth_is_six_db() {
+        let amps: Vec<f32> = (1..=8).map(|k| 1.0 / k as f32).collect();
+        let d = h1_h2_db(&amps).unwrap();
+        assert!((d - 6.02).abs() < 0.05, "H1-H2 {d}");
+
+        // Missing H2 → None, not infinity.
+        let mut no_h2 = amps.clone();
+        no_h2[1] = 0.0;
+        assert!(h1_h2_db(&no_h2).is_none());
+        assert!(h1_h2_db(&[0.0; 8]).is_none());
+
+        // Pressed voice: H2 louder than H1 → negative.
+        let pressed = [0.5f32, 1.0, 0.3, 0.2];
+        assert!(h1_h2_db(&pressed).unwrap() < 0.0);
     }
 
     #[test]
