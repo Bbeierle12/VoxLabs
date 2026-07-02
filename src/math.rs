@@ -851,6 +851,72 @@ pub fn singers_formant_pct(amps: &[f32], f0: f32) -> Option<f32> {
     (total > 1e-12).then(|| band / total * 100.0)
 }
 
+/// Rough vocal-range classification from mean fundamental frequency. Ported
+/// from the Personal Harmonic Identifier prototype's thresholds; a coarse
+/// label, not a diagnosis.
+pub fn voice_class(mean_f0: f32) -> &'static str {
+    if mean_f0 <= 0.0 || !mean_f0.is_finite() {
+        return "—";
+    }
+    if mean_f0 < 130.0 {
+        "Bass"
+    } else if mean_f0 < 175.0 {
+        "Baritone"
+    } else if mean_f0 < 220.0 {
+        "Tenor"
+    } else if mean_f0 < 290.0 {
+        "Alto"
+    } else if mean_f0 < 370.0 {
+        "Mezzo-Soprano"
+    } else {
+        "Soprano"
+    }
+}
+
+/// Brightness classification from spectral centroid. Same thresholds as the
+/// Personal Harmonic Identifier prototype.
+pub fn brightness_class(centroid_hz: f32) -> &'static str {
+    if centroid_hz <= 0.0 || !centroid_hz.is_finite() {
+        return "—";
+    }
+    if centroid_hz < 1200.0 {
+        "Dark"
+    } else if centroid_hz < 2200.0 {
+        "Warm"
+    } else if centroid_hz < 3200.0 {
+        "Balanced"
+    } else if centroid_hz < 4400.0 {
+        "Bright"
+    } else {
+        "Brilliant"
+    }
+}
+
+/// Plain-language timbre description from the harmonic profile's shape.
+///
+/// Adapted (not identical) from the source prototype: that version compared
+/// a *linear* odd/even amplitude-sum ratio against 1.9; ours reuses
+/// [`even_odd_balance_db`]'s power-ratio dB value instead of recomputing a
+/// separate linear ratio, with an independently chosen dB threshold for the
+/// same "clearly hollow" judgment call. `rel_amps` are amplitudes relative to
+/// the strongest partial (as displayed on the harmonic ladder); only
+/// H2..H16 count toward the "strong harmonic" tally, matching the prototype.
+pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'static str {
+    if let Some(db) = even_odd_db {
+        if db < -6.0 {
+            return "Hollow · odd-dominant";
+        }
+    }
+    let strong = rel_amps.iter().skip(1).filter(|&&a| a > 0.25).count();
+    if strong >= 6 {
+        "Rich · complex"
+    } else if strong <= 2 {
+        "Pure · flute-like"
+    } else {
+        "Balanced"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1382,6 +1448,61 @@ mod tests {
 
         assert!(singers_formant_pct(&amps, 0.0).is_none());
         assert!(singers_formant_pct(&[0.0; 32], 300.0).is_none());
+    }
+
+    #[test]
+    fn voice_class_thresholds() {
+        assert_eq!(voice_class(100.0), "Bass");
+        assert_eq!(voice_class(150.0), "Baritone");
+        assert_eq!(voice_class(200.0), "Tenor");
+        assert_eq!(voice_class(250.0), "Alto");
+        assert_eq!(voice_class(320.0), "Mezzo-Soprano");
+        assert_eq!(voice_class(400.0), "Soprano");
+        assert_eq!(voice_class(0.0), "—");
+        assert_eq!(voice_class(-10.0), "—");
+        assert_eq!(voice_class(f32::NAN), "—");
+    }
+
+    #[test]
+    fn brightness_class_thresholds() {
+        assert_eq!(brightness_class(800.0), "Dark");
+        assert_eq!(brightness_class(1800.0), "Warm");
+        assert_eq!(brightness_class(2800.0), "Balanced");
+        assert_eq!(brightness_class(4000.0), "Bright");
+        assert_eq!(brightness_class(5000.0), "Brilliant");
+        assert_eq!(brightness_class(0.0), "—");
+        assert_eq!(brightness_class(f32::NAN), "—");
+    }
+
+    #[test]
+    fn timbre_description_branches() {
+        // Hollow: even/odd dB clearly negative (odd-dominant) wins regardless
+        // of harmonic count.
+        assert_eq!(
+            timbre_description(&[1.0; 16], Some(-10.0)),
+            "Hollow · odd-dominant"
+        );
+
+        // Rich: >=6 of H2..H16 above the 0.25 relative-amplitude threshold.
+        let mut rich = [0.0f32; 16];
+        for a in rich.iter_mut() {
+            *a = 0.4;
+        }
+        assert_eq!(timbre_description(&rich, Some(0.0)), "Rich · complex");
+
+        // Pure: only H1 strong, everything else below threshold.
+        let mut pure = [0.0f32; 16];
+        pure[0] = 1.0;
+        assert_eq!(timbre_description(&pure, Some(0.0)), "Pure · flute-like");
+        assert_eq!(timbre_description(&pure, None), "Pure · flute-like");
+
+        // Balanced: a middling number of strong harmonics, even/odd neutral.
+        let mut balanced = [0.0f32; 16];
+        balanced[0] = 1.0;
+        balanced[1] = 0.4;
+        balanced[2] = 0.4;
+        balanced[3] = 0.4;
+        assert_eq!(timbre_description(&balanced, Some(0.0)), "Balanced");
     }
 
     #[test]
