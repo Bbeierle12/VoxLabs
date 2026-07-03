@@ -200,7 +200,11 @@ fn glass(corner: f32) -> egui::Frame {
 
 // ── model ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+// Struct-level serde(default): a session written by a build with fewer fields
+// (or a future build's file read by this one) loads with defaults instead of
+// failing deserialization and discarding the whole archive.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub(crate) struct Session {
     id: String,
     subj: String,
@@ -323,6 +327,9 @@ pub struct DashboardApp {
     rec_frames_total: u32,
     /// Two-tap confirm state for the Overview card's re-enroll control.
     reenroll_armed: bool,
+    /// User-facing persistence problem (unreadable archive at startup, failed
+    /// save). Shown as a dismissible banner above every screen.
+    persist_notice: Option<String>,
     /// Real per-frame metrics collected while recording (means stored).
     rec_hnr_acc: Vec<f32>,
     rec_h1h2_acc: Vec<f32>,
@@ -400,10 +407,14 @@ impl DashboardApp {
         // and are reloaded here. A never-saved (or web) archive comes back
         // empty, with the first capture enrolling the reference. Every session
         // is a real capture with a real match score — no seeded demo rows.
-        let saved = store_path
+        // An unreadable archive is backed up by `load` and reported via the
+        // notice banner rather than silently discarded.
+        let loaded = store_path
             .as_deref()
             .map(crate::persist::load)
             .unwrap_or_default();
+        let saved = loaded.state;
+        let persist_notice = loaded.notice;
         Self {
             event_tx,
             telemetry,
@@ -421,6 +432,7 @@ impl DashboardApp {
             rec_f0_acc: Vec::new(),
             rec_frames_total: 0,
             reenroll_armed: false,
+            persist_notice,
             rec_hnr_acc: Vec::new(),
             rec_h1h2_acc: Vec::new(),
             rec_jitter_acc: Vec::new(),
@@ -459,17 +471,21 @@ impl DashboardApp {
         }
     }
 
-    /// Write the current reference + archive to `store_path` (best-effort;
-    /// no-op on web). Called whenever the archive changes.
-    fn persist_state(&self) {
+    /// Write the current reference + archive to `store_path` (no-op on web).
+    /// Called whenever the archive changes. A failed write surfaces in the
+    /// notice banner — the UI must never claim a save that didn't stick.
+    fn persist_state(&mut self) {
         if let Some(path) = &self.store_path {
             let state = crate::persist::ArchiveState {
+                version: crate::persist::ARCHIVE_VERSION,
                 enrolled: self.enrolled,
                 enrolled_id: self.enrolled_id.clone(),
                 next_session_num: self.next_session_num,
                 sessions: self.sessions.clone(),
             };
-            crate::persist::save(path, &state);
+            if let Err(msg) = crate::persist::save(path, &state) {
+                self.persist_notice = Some(msg);
+            }
         }
     }
 
@@ -821,6 +837,40 @@ impl eframe::App for DashboardApp {
                     // Android renders edge-to-edge under the system bars and
                     // eframe exposes no safe-area insets, so pad past them.
                     ui.add_space(TOP_INSET);
+                    // Persistence problems (unreadable archive, failed save)
+                    // stay visible on every screen until dismissed.
+                    if let Some(notice) = self.persist_notice.clone() {
+                        glass(16.0).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let close_w = 26.0;
+                                ui.allocate_ui_with_layout(
+                                    vec2(ui.available_width() - close_w, 0.0),
+                                    Layout::left_to_right(Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            RichText::new(notice.as_str())
+                                                .size(12.0)
+                                                .color(AMBER_TEXT),
+                                        );
+                                    },
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    let resp = ui
+                                        .add(
+                                            egui::Label::new(
+                                                RichText::new("✕").size(13.0).color(ink(140)),
+                                            )
+                                            .sense(Sense::click()),
+                                        )
+                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                                    if resp.clicked() {
+                                        self.persist_notice = None;
+                                    }
+                                });
+                            });
+                        });
+                        ui.add_space(10.0);
+                    }
                     match self.screen {
                         Screen::Overview => self.screen_overview(ui),
                         Screen::Capture => self.screen_capture(ui, now),
