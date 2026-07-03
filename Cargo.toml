@@ -50,8 +50,12 @@ eframe = { version = "0.34.3", default-features = false, features = [
 
 # Native desktop + Android: real audio I/O (cpal). cpal's Android backend is
 # pure-NDK AAudio (ndk "audio" + jni), both already in the lockfile.
+# chrono (clock only, no default features) stamps saved sessions with the real
+# local date; its tz lookup works on Android too (iana-time-zone). The web
+# target skips it — no persistence there, so sessions are ephemeral anyway.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.18.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 
 # Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
 # logger, plus winit's default backends (x11/wayland, matching eframe's stock

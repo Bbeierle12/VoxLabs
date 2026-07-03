@@ -6,11 +6,13 @@
 //! backdrop blur, so the glass is approximated with translucent white fills,
 //! hairline strokes and soft shadows.
 //!
-//! Data policy (mirrors the prototype): the live acquisition readouts are
-//! REAL — f0/formants from the analysis engine, input level from the audio
-//! callback's RMS telemetry — while the session archive, HNR/jitter/shimmer
-//! and match scoring are the prototype's mock layer (the engine does not
-//! compute speaker embeddings yet).
+//! Data policy: everything shown is REAL. Live acquisition readouts come from
+//! the analysis engine (f0/formants) and the audio callback's RMS telemetry;
+//! HNR/jitter/shimmer/CPP are measured per capture; the session archive holds
+//! only real captures; and match scoring is a deterministic classical
+//! voiceprint similarity against the enrolled reference (see `math::
+//! voiceprint_similarity`) — a voice-consistency measure, not a forensic
+//! biometric. The archive persists to disk via the `persist` module.
 
 use crate::concurrency::{EngineEvent, Telemetry};
 use crate::types::{Formant, MAX_PARTIALS, Vibrato, VocalProfile, Voiceprint};
@@ -194,8 +196,8 @@ pub(crate) struct Session {
     date: String,
     f0: f32,
     match_pct: f32,
-    /// Measured over the capture (means / stop-time snapshot). Seeded demo
-    /// rows carry plausible static values; `None` = not measured.
+    /// Measured over the capture (means / stop-time snapshot); `None` = not
+    /// measured (e.g. too little voiced signal).
     hnr_db: Option<f32>,
     h1_h2_db: Option<f32>,
     vibrato: Option<Vibrato>,
@@ -230,6 +232,21 @@ struct CaptureResult {
     /// True when no reference was enrolled yet: this capture is the reference
     /// candidate (shown as "Reference" rather than a similarity score).
     is_reference: bool,
+}
+
+/// The real local date a session is saved ("2026-07-02"), stored on the
+/// session so reloaded archives show when each capture actually happened.
+/// Web builds have no clock access via chrono (and no persistence), so they
+/// keep the ephemeral "Today".
+fn today_string() -> String {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        chrono::Local::now().format("%Y-%m-%d").to_string()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        "Today".to_string()
+    }
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -563,7 +580,7 @@ impl DashboardApp {
             let session = Session {
                 id: format!("VS-{:03}", self.next_session_num),
                 subj,
-                date: "Today".into(),
+                date: today_string(),
                 f0: res.f0,
                 match_pct: res.match_pct,
                 hnr_db: res.hnr_db,
