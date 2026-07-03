@@ -12,14 +12,29 @@ const YIN_F0_MIN: f32 = 50.0;
 const YIN_F0_MAX: f32 = 1000.0;
 const YIN_THRESHOLD: f32 = 0.12;
 
+thread_local! {
+    // rustfft's planner caches plans by size; sharing one per thread means
+    // cpp_db/spectral_centroid plan their FFT once instead of on every voiced
+    // analysis frame (Spectrogram keeps its own plan the same way).
+    static FFT_PLANNER: std::cell::RefCell<rustfft::FftPlanner<f32>> =
+        std::cell::RefCell::new(rustfft::FftPlanner::new());
+}
+
 /// Solves the Yule-Walker equations using Levinson-Durbin recursion.
 /// Returns the prediction-error polynomial `A(z) = [1, a1, .., ap]`, i.e. the
 /// residual is `e[n] = x[n] + Σ aⱼ x[n-j]`, so the roots of `A(z)` are the
 /// LPC poles — the form `formants_from_lpc` consumes directly.
+///
+/// Requires autocorrelation lags `0..=order`; an undersized `autocorr` cannot
+/// constrain the model and yields the identity polynomial `[1, 0, ..]` (an
+/// all-pass "no prediction") rather than indexing out of bounds.
 pub fn levinson_durbin(autocorr: &[f32], order: usize) -> Vec<f32> {
     let mut a = vec![0.0; order + 1];
-    let mut e = autocorr[0];
     a[0] = 1.0;
+    if autocorr.len() < order + 1 {
+        return a;
+    }
+    let mut e = autocorr[0];
 
     for i in 1..=order {
         if e.abs() < 1e-9 {
@@ -116,8 +131,10 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; 3] {
 }
 
 /// Computes a parabolic interpolation around the minimum lag `tau`.
+/// Boundary lags (and any `tau` without two in-bounds neighbours, including on
+/// an empty slice) are returned unrefined.
 pub fn parabolic_interpolation(diff_fn: &[f32], tau: usize) -> f32 {
-    if tau == 0 || tau >= diff_fn.len() - 1 {
+    if tau == 0 || tau + 1 >= diff_fn.len() {
         return tau as f32;
     }
 
@@ -145,11 +162,16 @@ pub struct PitchEstimate {
 /// YIN difference function `d(tau)` for `tau in 0..=max_lag`:
 /// `d(tau) = sum_{j=0}^{window-1} (x[j] - x[j+tau])^2`, with `d(0) = 0`.
 ///
-/// The caller must guarantee `window + max_lag <= samples.len()` so every
+/// The caller should guarantee `window + max_lag <= samples.len()` so every
 /// `x[j+tau]` is in bounds — the same contract the GPU buffer sizing honors.
 /// (The original 1024-sample buffer violated it, biasing the high lags.)
+/// An undersized frame returns the all-zero difference, which downstream CMND
+/// normalization turns into a zero-confidence (unvoiced) estimate.
 pub fn yin_difference(samples: &[f32], window: usize, max_lag: usize) -> Vec<f32> {
     let mut diff = vec![0.0f32; max_lag + 1];
+    if samples.len() < window + max_lag {
+        return diff;
+    }
     for tau in 1..=max_lag {
         let mut sum = 0.0f32;
         for j in 0..window {
@@ -398,12 +420,14 @@ pub fn lpc_coefficients(samples: &[f32], order: usize, preemph: f32) -> Vec<f32>
 /// themselves instead of a fixed grid.
 ///
 /// Returns linear peak amplitudes (a full-scale sine measures ≈ 1.0 at H1).
-/// Harmonics at or above Nyquist — and everything when `f0` is non-positive or
-/// the frame is degenerate — are 0.
+/// Harmonics at or above Nyquist — and everything when `f0` or `sample_rate`
+/// is non-positive or non-finite, or the frame is degenerate — are 0.
 pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; MAX_PARTIALS] {
     let mut amps = [0.0f32; MAX_PARTIALS];
     let n = samples.len();
-    if n < 32 || f0 <= 0.0 || sample_rate <= 0.0 {
+    // `!(x > 0.0)` (not `x <= 0.0`): NaN fails every comparison, so the
+    // negated form routes NaN to the zero return instead of a NaN Goertzel.
+    if n < 32 || !(f0.is_finite() && f0 > 0.0) || !(sample_rate.is_finite() && sample_rate > 0.0) {
         return amps;
     }
 
@@ -622,7 +646,7 @@ pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<
 /// Absolute values depend on the recipe (window, normalization) — treat as an
 /// internally-consistent relative measure, like our HNR.
 pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
-    use rustfft::{FftPlanner, num_complex::Complex};
+    use rustfft::num_complex::Complex;
 
     let n = samples.len();
     if n < 256 || sample_rate <= 0.0 {
@@ -632,8 +656,7 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
         return None; // silence
     }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n);
+    let fft = FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
 
     // Hann-windowed spectrum.
     let m = (n - 1) as f32;
@@ -658,9 +681,15 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
         .map(|c| 10.0 * (c.norm_sqr() / (n as f32) / (n as f32) + 1e-12).log10())
         .collect();
 
-    // Voice pitch quefrency band: 60–500 Hz.
+    // Voice pitch quefrency band: 60–500 Hz. If the frame is too short to
+    // reach the 60 Hz end at this sample rate (e.g. 2048 samples at 96 kHz),
+    // refuse rather than search a truncated band and report the prominence of
+    // some spurious higher-pitch bin.
     let q_lo = (sample_rate / 500.0).ceil() as usize;
-    let q_hi = ((sample_rate / 60.0).floor() as usize).min(n / 2 - 1);
+    let q_hi = (sample_rate / 60.0).floor() as usize;
+    if q_hi > n / 2 - 1 {
+        return None;
+    }
     if q_lo + 4 >= q_hi {
         return None;
     }
@@ -700,7 +729,7 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
 /// and the `brightness_class` thresholds were tuned against this
 /// magnitude-weighted form — keep them in sync if this ever changes.
 pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
-    use rustfft::{FftPlanner, num_complex::Complex};
+    use rustfft::num_complex::Complex;
 
     let n = samples.len();
     if n < 256 || sample_rate <= 0.0 {
@@ -710,8 +739,7 @@ pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
         return None; // silence
     }
 
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n);
+    let fft = FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n));
 
     let m = (n - 1) as f32;
     let mut buf: Vec<Complex<f32>> = samples
@@ -842,7 +870,8 @@ pub fn even_odd_balance_db(amps: &[f32]) -> Option<f32> {
 /// Percentage of harmonic energy in the singer's-formant band (2.8–3.4 kHz) —
 /// the resonance cluster that lets a trained voice project over an ensemble.
 pub fn singers_formant_pct(amps: &[f32], f0: f32) -> Option<f32> {
-    if f0 <= 0.0 {
+    // Negated form so NaN/Inf f0 reads as unmeasurable (None), never Some(0.0).
+    if !(f0.is_finite() && f0 > 0.0) {
         return None;
     }
     let (mut band, mut total) = (0.0f32, 0.0f32);
@@ -1112,6 +1141,70 @@ mod tests {
         for (k, (&got, &want)) in a.iter().zip(&a_true).enumerate() {
             assert!((got - want).abs() < 0.05, "a[{k}] = {got}, want {want}");
         }
+    }
+
+    #[test]
+    fn levinson_durbin_undersized_autocorr_is_identity() {
+        for (r, order) in [(&[][..], 4usize), (&[1.0f32, 0.5][..], 4)] {
+            let a = levinson_durbin(r, order);
+            assert_eq!(a.len(), order + 1);
+            assert_eq!(a[0], 1.0);
+            assert!(a[1..].iter().all(|&c| c == 0.0), "{a:?}");
+        }
+    }
+
+    #[test]
+    fn yin_difference_undersized_input_returns_zeros() {
+        // 100 samples cannot honor window=1024 + max_lag=50: all-zero diff,
+        // no out-of-bounds read.
+        let d = yin_difference(&vec![0.5; 100], 1024, 50);
+        assert_eq!(d.len(), 51);
+        assert!(d.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn parabolic_interpolation_boundary_inputs() {
+        // Empty slice and edge taus come back unrefined, never panic.
+        assert_eq!(parabolic_interpolation(&[], 0), 0.0);
+        assert_eq!(parabolic_interpolation(&[], 1), 1.0);
+        assert_eq!(parabolic_interpolation(&[1.0, 0.5, 1.0], 0), 0.0);
+        assert_eq!(parabolic_interpolation(&[1.0, 0.5, 1.0], 2), 2.0);
+        // Interior tau still interpolates (symmetric dip refines to itself).
+        let t = parabolic_interpolation(&[1.0, 0.0, 1.0], 1);
+        assert!((t - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn harmonic_amplitudes_rejects_non_finite_inputs() {
+        let buf = sine(220.0, 44_100.0, 2048);
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -5.0] {
+            let amps = harmonic_amplitudes(&buf, 44_100.0, bad);
+            assert!(amps.iter().all(|&a| a == 0.0), "f0={bad} leaked: {amps:?}");
+        }
+        let amps = harmonic_amplitudes(&buf, f32::NAN, 220.0);
+        assert!(amps.iter().all(|&a| a == 0.0), "NaN sample_rate leaked");
+    }
+
+    #[test]
+    fn singers_formant_pct_rejects_non_finite_f0() {
+        let amps = [1.0f32; 16];
+        for bad in [f32::NAN, f32::INFINITY, 0.0, -5.0] {
+            assert!(
+                singers_formant_pct(&amps, bad).is_none(),
+                "f0={bad} should be unmeasurable"
+            );
+        }
+    }
+
+    #[test]
+    fn cpp_db_declines_truncated_quefrency_band() {
+        // 2048 samples at 96 kHz reach only ~94 Hz, not the 60 Hz band end:
+        // refuse rather than report a spurious in-band prominence.
+        let hi = sine(220.0, 96_000.0, 2048);
+        assert!(cpp_db(&hi, 96_000.0).is_none());
+        // The same frame length at 44.1 kHz has the full band and measures.
+        let ok = sine(220.0, 44_100.0, 2048);
+        assert!(cpp_db(&ok, 44_100.0).is_some());
     }
 
     #[test]
