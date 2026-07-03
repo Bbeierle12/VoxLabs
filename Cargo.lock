@@ -3654,6 +3654,8 @@ dependencies = [
  "pollster",
  "rtrb",
  "rustfft",
+ "serde",
+ "serde_json",
  "triple_buffer",
  "wasm-bindgen",
  "wasm-bindgen-futures",

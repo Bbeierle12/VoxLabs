@@ -19,6 +19,7 @@ use eframe::egui::{
     Stroke, StrokeKind, TextureHandle, TextureOptions, pos2, vec2,
 };
 use rtrb::Producer;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use triple_buffer::Output;
@@ -186,8 +187,8 @@ fn glass(corner: f32) -> egui::Frame {
 
 // ── model ────────────────────────────────────────────────────────────────────
 
-#[derive(Clone)]
-struct Session {
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Session {
     id: String,
     subj: String,
     date: String,
@@ -322,12 +323,15 @@ pub struct DashboardApp {
 
     /// Enrolled reference voiceprint (set by the first saved capture). Every
     /// later capture's match % is a real similarity against this. `None` until
-    /// enrollment. In-memory only — re-enroll each session for now.
+    /// enrollment. Persisted to `store_path` and reloaded at startup.
     enrolled: Option<Voiceprint>,
     /// Short human ID for the enrolled reference (e.g. "V-3F9A").
     enrolled_id: Option<String>,
 
     next_session_num: u32,
+    /// Where the reference + archive are persisted (JSON). `None` on web (no
+    /// disk) — the archive then lives only for the session.
+    store_path: Option<PathBuf>,
     rng: u64,
 }
 
@@ -341,6 +345,7 @@ impl DashboardApp {
         spectrum_rx: Output<Vec<f32>>,
         scope_rx: Output<Vec<f32>>,
         sample_rate: f32,
+        store_path: Option<PathBuf>,
     ) -> Self {
         let mut visuals = egui::Visuals::light();
         visuals.override_text_color = Some(INK);
@@ -348,10 +353,14 @@ impl DashboardApp {
         visuals.window_fill = BG_BASE;
         cc.egui_ctx.set_visuals(visuals);
 
-        // Real archive: starts empty. The first saved capture enrolls the
-        // reference voiceprint; every session here is a real capture with a
-        // real match score. (No seeded demo rows — they had no audio behind
-        // them and so could carry no real voiceprint.)
+        // Real archive: the enrolled reference + saved captures persist to disk
+        // and are reloaded here. A never-saved (or web) archive comes back
+        // empty, with the first capture enrolling the reference. Every session
+        // is a real capture with a real match score — no seeded demo rows.
+        let saved = store_path
+            .as_deref()
+            .map(crate::persist::load)
+            .unwrap_or_default();
         Self {
             event_tx,
             telemetry,
@@ -360,7 +369,7 @@ impl DashboardApp {
             screen: Screen::Overview,
             filter: Filter::All,
             rec: RecState::Idle,
-            sessions: Vec::new(),
+            sessions: saved.sessions,
             selected: None,
             result: None,
             export_queued: false,
@@ -396,11 +405,26 @@ impl DashboardApp {
             wf_pixels: vec![0u8; SPEC_TIME_COLS * SPEC_FREQ_ROWS * 4],
             wf_lut: build_heat_lut(),
 
-            enrolled: None,
-            enrolled_id: None,
+            enrolled: saved.enrolled,
+            enrolled_id: saved.enrolled_id,
 
-            next_session_num: 1,
+            next_session_num: saved.next_session_num,
+            store_path,
             rng: 0x9E37_79B9_7F4A_7C15,
+        }
+    }
+
+    /// Write the current reference + archive to `store_path` (best-effort;
+    /// no-op on web). Called whenever the archive changes.
+    fn persist_state(&self) {
+        if let Some(path) = &self.store_path {
+            let state = crate::persist::ArchiveState {
+                enrolled: self.enrolled,
+                enrolled_id: self.enrolled_id.clone(),
+                next_session_num: self.next_session_num,
+                sessions: self.sessions.clone(),
+            };
+            crate::persist::save(path, &state);
         }
     }
 
@@ -555,6 +579,9 @@ impl DashboardApp {
             };
             self.next_session_num += 1;
             self.sessions.insert(0, session);
+            // Enrollment and the new capture just changed the archive — write it
+            // through so it survives a restart.
+            self.persist_state();
             self.rec = RecState::Idle;
             self.filter = Filter::All;
             self.screen = Screen::Sessions;

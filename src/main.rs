@@ -59,6 +59,9 @@ fn main() {
                         // Web has no analysis thread; a nominal rate keeps the
                         // spectrogram bin→Hz map well-formed (it stays idle).
                         48_000.0,
+                        // No filesystem in the browser: the archive lives only
+                        // for this session (disk persistence is native-only).
+                        None,
                     )))
                 }),
             )

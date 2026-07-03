@@ -1,11 +1,13 @@
-#[derive(Debug, Clone, Copy, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Formant {
     pub frequency: f32,
     pub bandwidth: f32,
 }
 
 /// A detected vibrato: oscillation rate and extent (± cents around the mean).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Vibrato {
     pub rate_hz: f32,
     pub extent_cents: f32,
@@ -18,7 +20,7 @@ pub struct Vibrato {
 ///
 /// This is a real, deterministic voice-*similarity* representation — good for
 /// tracking a singer's own consistency — not a forensic biometric identity.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Voiceprint {
     /// F1, F2, F3 in Hz (0.0 = unresolved).
     pub formants: [f32; 3],

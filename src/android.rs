@@ -109,6 +109,11 @@ fn android_main(app: AndroidApp) {
     let spectrum_rx = bridges.spectrum_rx;
     let scope_rx = bridges.scope_rx;
 
+    // The reference + archive persist here — the app's private internal storage
+    // (`/data/data/<pkg>/files`), which is writable without any permission and
+    // cleared only on uninstall. Captured before `app` moves into the options.
+    let store_path = app.internal_data_path().map(|p| p.join("archive.json"));
+
     let native_options = eframe::NativeOptions {
         android_app: Some(app),
         // glow/EGL (GLES) rather than wgpu/Vulkan for the first build.
@@ -128,6 +133,7 @@ fn android_main(app: AndroidApp) {
                 spectrum_rx,
                 scope_rx,
                 input_sample_rate,
+                store_path,
             )))
         }),
     ) {

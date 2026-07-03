@@ -25,6 +25,10 @@ mod android;
 
 mod concurrency;
 mod math;
+// Disk persistence for the enrolled reference + session archive. Compiled on
+// all targets (ui uses it); each entry point supplies the store path (or None
+// on web, which has no disk).
+mod persist;
 // f0-contour metrics (vibrato/steadiness): used by the desktop and Android
 // analysis loops; the web target has no analysis thread yet.
 #[cfg(not(target_arch = "wasm32"))]
@@ -122,6 +126,8 @@ pub fn run() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    let store_path = persist::default_store_path();
+
     eframe::run_native(
         "Voice Harmonic Engine",
         native_options,
@@ -134,6 +140,7 @@ pub fn run() -> anyhow::Result<()> {
                 spectrum_rx,
                 scope_rx,
                 input_sample_rate,
+                store_path,
             )))
         }),
     )
