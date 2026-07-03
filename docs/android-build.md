@@ -52,25 +52,28 @@ A self-signed release keystore was generated **outside the repo**:
 |-------|-------|
 | path | `~/.android-keystores/voice_harmonic_engine-release.jks` |
 | alias | `voiceharmonic` |
-| store password | `voiceharmonic` |
-| key password | `voiceharmonic` |
+| store password | in `~/.android-keystores/voice_harmonic_engine-release.password` (not in the repo) |
+| key password | same as store password |
 | cert | `CN=Voice Harmonic Engine, OU=Development, O=VoiceHarmonic, C=US` |
 | SHA-256 | `05:09:86:79:47:E7:EF:D8:C5:6E:1A:95:F9:8C:77:AD:75:CA:D8:1D:35:89:3D:E5:21:E9:5C:FB:EF:E8:9E:4E` |
 
 Regenerate (e.g. on another machine) with:
 
 ```bash
+STOREPASS="$(cat ~/.android-keystores/voice_harmonic_engine-release.password)"
 keytool -genkeypair -v \
   -keystore ~/.android-keystores/voice_harmonic_engine-release.jks \
   -alias voiceharmonic -keyalg RSA -keysize 2048 -validity 10000 \
-  -storepass voiceharmonic -keypass voiceharmonic \
+  -storepass "$STOREPASS" -keypass "$STOREPASS" \
   -dname "CN=Voice Harmonic Engine, OU=Development, O=VoiceHarmonic, L=Unknown, ST=Unknown, C=US"
 ```
 
-> This is a throwaway dev key with a documented password — fine for sideloading.
-> Generate a real, strong-password key before any Play Store distribution, and
-> keep it (Play requires all updates be signed by the same key).
-> `.gitignore` blocks `*.apk`, `*.keystore`, `*.jks`, and `dist/`.
+> This is a throwaway dev key — fine for sideloading. Its original password was
+> committed in earlier revisions of this file and remains in git history, so
+> treat this key as public knowledge; generate a real, strong-password key
+> before any Play Store distribution, and keep it (Play requires all updates be
+> signed by the same key). `.gitignore` blocks `*.apk`, `*.keystore`, `*.jks`,
+> and `dist/`.
 
 ## 3. Build the signed release APK
 
@@ -83,7 +86,7 @@ export ANDROID_SDK_ROOT="$HOME/android-sdk"
 export ANDROID_NDK_ROOT="$HOME/android-sdk/ndk/26.3.11579264"
 export ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
 export CARGO_APK_RELEASE_KEYSTORE="$HOME/.android-keystores/voice_harmonic_engine-release.jks"
-export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="voiceharmonic"
+export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat "$HOME/.android-keystores/voice_harmonic_engine-release.password")"
 export TMPDIR="$HOME/tmp"
 
 cargo apk build --lib --release

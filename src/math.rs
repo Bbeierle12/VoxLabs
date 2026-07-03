@@ -691,11 +691,14 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
     Some(ceps_db[q_pk] - (my + slope * (q_pk as f32 - mx)))
 }
 
-/// Spectral centroid in Hz: the power-weighted mean frequency of the full
-/// magnitude spectrum over 80 Hz–min(8000, Nyquist), not just the harmonic
-/// ladder — this deliberately includes inter-harmonic noise energy, which is
-/// what makes it a meaningful "brightness" measure distinct from the tilt of
-/// the harmonics alone.
+/// Spectral centroid in Hz: the magnitude-weighted mean frequency of the full
+/// spectrum over 80 Hz–min(8000, Nyquist), not just the harmonic ladder — this
+/// deliberately includes inter-harmonic noise energy, which is what makes it a
+/// meaningful "brightness" measure distinct from the tilt of the harmonics
+/// alone. Weighting is by |X(f)| (amplitude), not |X(f)|² (power): a power
+/// weighting is an equally valid statistic but reads higher for bright voices,
+/// and the `brightness_class` thresholds were tuned against this
+/// magnitude-weighted form — keep them in sync if this ever changes.
 pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
     use rustfft::{FftPlanner, num_complex::Complex};
 
@@ -1107,10 +1110,7 @@ mod tests {
         let a = levinson_durbin(&r, order);
 
         for (k, (&got, &want)) in a.iter().zip(&a_true).enumerate() {
-            assert!(
-                (got - want).abs() < 0.05,
-                "a[{k}] = {got}, want {want}"
-            );
+            assert!((got - want).abs() < 0.05, "a[{k}] = {got}, want {want}");
         }
     }
 

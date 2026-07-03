@@ -51,7 +51,10 @@ pub fn load(path: &Path) -> ArchiveState {
     match serde_json::from_slice(&bytes) {
         Ok(state) => state,
         Err(e) => {
-            log::warn!("archive at {} is unreadable ({e}); starting fresh", path.display());
+            log::warn!(
+                "archive at {} is unreadable ({e}); starting fresh",
+                path.display()
+            );
             ArchiveState::default()
         }
     }
@@ -87,7 +90,9 @@ pub fn default_store_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
+        })?;
     Some(base.join("VoxLabs").join("archive.json"))
 }
 
