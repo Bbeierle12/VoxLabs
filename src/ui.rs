@@ -40,6 +40,17 @@ const BG_BASE: Color32 = Color32::from_rgb(234, 243, 245); // between #E3EBEE / 
 /// (the prototype's `matchThreshold` prop, default 85).
 const MATCH_THRESHOLD: f32 = 85.0;
 
+/// Minimum wall-clock length and voiced fraction a capture needs before it may
+/// enroll as the reference voiceprint — the Capture hint's "8 s min", enforced.
+/// A bad reference poisons every later match, so enrollment is gated harder
+/// than ordinary session saves.
+const MIN_ENROLL_SECS: f64 = 8.0;
+const MIN_ENROLL_VOICED_FRACTION: f32 = 0.5;
+
+/// Recording auto-stops here so a capture left running off-screen can't grow
+/// its accumulators unbounded.
+const MAX_REC_SECS: f64 = 60.0;
+
 /// Content column width — the prototype is a 428 px phone layout.
 const COL_WIDTH: f32 = 430.0;
 
@@ -220,7 +231,9 @@ pub(crate) struct Session {
 
 struct CaptureResult {
     match_pct: Option<f32>,
-    f0: f32,
+    /// Mean f0 over the capture's voiced frames; `None` = no voiced signal
+    /// (nothing is fabricated for the readout, and the capture can't be saved).
+    f0: Option<f32>,
     hnr_db: Option<f32>,
     h1_h2_db: Option<f32>,
     vibrato: Option<Vibrato>,
@@ -232,9 +245,14 @@ struct CaptureResult {
     profile: [f32; 16],
     formants: Option<[Formant; 3]>,
     voiceprint: Voiceprint,
-    /// True when no reference was enrolled yet: this capture is the reference
-    /// candidate (shown as "Reference" rather than a similarity score).
+    /// True when no reference was enrolled yet AND this capture passed the
+    /// enrollment gate: saving it enrolls it as the reference (shown as
+    /// "Reference" rather than a similarity score).
     is_reference: bool,
+    /// `Some(reason)` = this capture may not be saved (no voiced signal, or a
+    /// would-be reference that failed the enrollment gate). The Save button is
+    /// withheld and the reason shown instead; `save_session` double-checks.
+    blocked: Option<String>,
 }
 
 /// The real local date a session is saved ("2026-07-02"), stored on the
@@ -300,6 +318,11 @@ pub struct DashboardApp {
     harm_ema: [f32; MAX_PARTIALS],
     /// Real f0 samples collected while recording (mean shown in the result).
     rec_f0_acc: Vec<f32>,
+    /// Update ticks while recording (voiced or not); with `rec_f0_acc.len()`
+    /// this gives the capture's voiced fraction for the enrollment gate.
+    rec_frames_total: u32,
+    /// Two-tap confirm state for the Overview card's re-enroll control.
+    reenroll_armed: bool,
     /// Real per-frame metrics collected while recording (means stored).
     rec_hnr_acc: Vec<f32>,
     rec_h1h2_acc: Vec<f32>,
@@ -396,6 +419,8 @@ impl DashboardApp {
             wave: vec![2.0; 110],
             harm_ema: [0.0; MAX_PARTIALS],
             rec_f0_acc: Vec::new(),
+            rec_frames_total: 0,
+            reenroll_armed: false,
             rec_hnr_acc: Vec::new(),
             rec_h1h2_acc: Vec::new(),
             rec_jitter_acc: Vec::new(),
@@ -490,16 +515,22 @@ impl DashboardApp {
     // ── state machine ────────────────────────────────────────────────────────
 
     fn advance(&mut self, now: f64) {
+        // A capture left running (e.g. off another screen) auto-stops so the
+        // accumulators can't grow unbounded; the tab bar shows a live dot
+        // meanwhile.
+        if let RecState::Recording { start } = self.rec
+            && now - start >= MAX_REC_SECS
+        {
+            self.stop_rec(now);
+        }
         if let RecState::Analyzing { start, elapsed } = self.rec
             && now - start >= 2.1
         {
-            // Real f0 mean when we heard voiced frames; otherwise a small
-            // synthetic fallback so the readout isn't blank.
-            let f0 = if self.rec_f0_acc.is_empty() {
-                114.0 + self.rand01() * 10.0
-            } else {
-                self.rec_f0_acc.iter().sum::<f32>() / self.rec_f0_acc.len() as f32
-            };
+            // Real f0 mean over voiced frames; a silent capture stays honest
+            // (None readout) and is blocked from saving below.
+            let f0 = (!self.rec_f0_acc.is_empty())
+                .then(|| self.rec_f0_acc.iter().sum::<f32>() / self.rec_f0_acc.len() as f32)
+                .map(|f| (f * 10.0).round() / 10.0);
             let mean =
                 |acc: &[f32]| (!acc.is_empty()).then(|| acc.iter().sum::<f32>() / acc.len() as f32);
             // Vibrato/steadiness are contour-level: snapshot the stop-time
@@ -512,26 +543,47 @@ impl DashboardApp {
                 [0.0; 16]
             };
 
-            // Build this capture's classical voiceprint and score it against the
-            // enrolled reference. With no reference yet, this capture *is* the
-            // reference candidate (match shown as "Reference"); once enrolled,
-            // the match is a real similarity in 0..100.
+            // Build this capture's classical voiceprint and score it against
+            // the enrolled reference.
             let voiceprint = crate::math::build_voiceprint(
                 self.rec_formants,
                 &profile,
                 mean(&self.rec_centroid_acc),
             );
-            let is_reference = self.enrolled.is_none();
+
+            // Enrollment gate: only a long-enough, mostly-voiced capture may
+            // become the reference (a bad reference poisons every later match).
+            let voiced_frac = if self.rec_frames_total > 0 {
+                self.rec_f0_acc.len() as f32 / self.rec_frames_total as f32
+            } else {
+                0.0
+            };
+            let enroll_eligible = f0.is_some()
+                && elapsed >= MIN_ENROLL_SECS
+                && voiced_frac >= MIN_ENROLL_VOICED_FRACTION;
+            let is_reference = self.enrolled.is_none() && enroll_eligible;
             let match_pct = match &self.enrolled {
                 Some(reference) => crate::math::voiceprint_similarity(&voiceprint, reference)
                     .map(|s| (s * 10.0).round() / 10.0),
-                // First capture: it *becomes* the reference; self-match is 100.
-                None => Some(100.0),
+                // An eligible first capture *becomes* the reference (self-match
+                // 100); an ineligible one has nothing to score against.
+                None => is_reference.then_some(100.0),
+            };
+            let blocked = if f0.is_none() {
+                Some("No voiced signal captured — nothing to save".to_string())
+            } else if self.enrolled.is_none() && !enroll_eligible {
+                Some(format!(
+                    "The reference capture needs ≥{MIN_ENROLL_SECS:.0} s of sustained voice — \
+                     this one ran {elapsed:.0} s at {:.0}% voiced",
+                    voiced_frac * 100.0
+                ))
+            } else {
+                None
             };
 
             self.result = Some(CaptureResult {
                 match_pct,
-                f0: (f0 * 10.0).round() / 10.0,
+                f0,
                 hnr_db: mean(&self.rec_hnr_acc),
                 h1_h2_db: mean(&self.rec_h1h2_acc),
                 vibrato: m.vibrato,
@@ -544,6 +596,7 @@ impl DashboardApp {
                 formants: self.rec_formants,
                 voiceprint,
                 is_reference,
+                blocked,
             });
             self.rec = RecState::Done { elapsed };
         }
@@ -552,6 +605,7 @@ impl DashboardApp {
     fn start_rec(&mut self, now: f64) {
         self.rec = RecState::Recording { start: now };
         self.rec_f0_acc.clear();
+        self.rec_frames_total = 0;
         self.rec_hnr_acc.clear();
         self.rec_h1h2_acc.clear();
         self.rec_jitter_acc.clear();
@@ -574,10 +628,16 @@ impl DashboardApp {
     }
 
     fn save_session(&mut self) {
+        // Degenerate captures may not be saved (G2): the Save button is
+        // withheld for them, and this guard keeps the archive honest even if
+        // this is reached some other way.
+        if self.result.as_ref().is_none_or(|r| r.blocked.is_some()) {
+            return;
+        }
         if let Some(res) = self.result.take() {
-            // First saved capture enrolls the reference voiceprint; its match
-            // reads 100% against itself. A short ID is derived from the print.
-            if self.enrolled.is_none() {
+            // First *eligible* saved capture enrolls the reference voiceprint;
+            // its match reads 100% against itself.
+            if self.enrolled.is_none() && res.is_reference {
                 self.enrolled = Some(res.voiceprint);
                 self.enrolled_id = Some(self.derive_voice_id(&res.voiceprint));
             }
@@ -589,7 +649,8 @@ impl DashboardApp {
                 id: format!("VS-{:03}", self.next_session_num),
                 subj,
                 date: today_string(),
-                f0: res.f0,
+                // Gated above: blocked.is_none() implies a measured f0.
+                f0: res.f0.unwrap_or(0.0),
                 match_pct: res.match_pct,
                 hnr_db: res.hnr_db,
                 h1_h2_db: res.h1_h2_db,
@@ -659,6 +720,11 @@ impl eframe::App for DashboardApp {
 
         if self.ui_profile_rx.updated() {
             self.current_profile = *self.ui_profile_rx.read();
+        }
+        if matches!(self.rec, RecState::Recording { .. }) {
+            // Count every recording tick (voiced or not) so the enrollment
+            // gate can compute the capture's voiced fraction.
+            self.rec_frames_total += 1;
         }
         if matches!(self.rec, RecState::Recording { .. }) && self.current_profile.valid {
             self.rec_f0_acc.push(self.current_profile.f0);
@@ -1001,6 +1067,8 @@ impl DashboardApp {
         let latest = self.sessions.first().cloned();
         let count = self.sessions.len();
         let id_label = self.enrolled_id.clone();
+        let reenroll_armed = self.reenroll_armed;
+        let mut reenroll_clicked = false;
         glass(24.0).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -1045,6 +1113,24 @@ impl DashboardApp {
                             let (badge, bg, fg) = Self::badge_style(s.match_pct);
                             pill_badge(ui, badge, bg, fg);
                         }
+                        ui.add_space(8.0);
+                        // Two-tap re-enroll: a bad reference is recoverable
+                        // without hand-deleting archive.json. Past sessions
+                        // keep their historical scores.
+                        let (relabel, recolor) = if reenroll_armed {
+                            ("Tap again to clear the reference", AMBER_TEXT)
+                        } else {
+                            ("Re-enroll…", ink(128))
+                        };
+                        let resp = ui
+                            .add(
+                                egui::Label::new(RichText::new(relabel).size(11.0).color(recolor))
+                                    .sense(Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if resp.clicked() {
+                            reenroll_clicked = true;
+                        }
                     }
                     None => {
                         ui.label(
@@ -1069,6 +1155,18 @@ impl DashboardApp {
                 });
             });
         });
+        if reenroll_clicked {
+            if self.reenroll_armed {
+                // Confirmed: clear the reference. The next capture that passes
+                // the enrollment gate becomes the new one on save.
+                self.enrolled = None;
+                self.enrolled_id = None;
+                self.reenroll_armed = false;
+                self.persist_state();
+            } else {
+                self.reenroll_armed = true;
+            }
+        }
         ui.add_space(12.0);
 
         // Metric tiles (2 × 2) — real aggregates across the saved archive.
@@ -1447,8 +1545,9 @@ impl DashboardApp {
             let heading = match (&self.enrolled_id, is_ref) {
                 (_, true) => "First capture — enrolls your reference voiceprint".to_string(),
                 (Some(id), false) => format!("Similarity vs voiceprint {id}"),
-                (None, false) => "Similarity vs reference".to_string(),
+                (None, false) => "No reference enrolled yet".to_string(),
             };
+            let blocked = res.blocked.clone();
             let mut save = false;
             let mut discard = false;
             glass(24.0).show(ui, |ui| {
@@ -1473,26 +1572,40 @@ impl DashboardApp {
                     );
                 });
                 ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 10.0) / 2.0;
-                    save = pill_button(
-                        ui,
-                        vec2(w, 46.0),
-                        "Save session",
-                        Color32::from_rgb(17, 166, 166),
-                        Color32::WHITE,
-                        Stroke::NONE,
-                    );
+                if let Some(reason) = &blocked {
+                    // Save is withheld (G2): say why inline; only Discard.
+                    ui.label(RichText::new(reason.as_str()).size(12.0).color(AMBER_TEXT));
                     ui.add_space(10.0);
                     discard = pill_button(
                         ui,
-                        vec2(w, 46.0),
+                        vec2(ui.available_width(), 46.0),
                         "Discard",
                         white(179),
                         INK,
                         Stroke::new(1.0, ink(31)),
                     );
-                });
+                } else {
+                    ui.horizontal(|ui| {
+                        let w = (ui.available_width() - 10.0) / 2.0;
+                        save = pill_button(
+                            ui,
+                            vec2(w, 46.0),
+                            "Save session",
+                            Color32::from_rgb(17, 166, 166),
+                            Color32::WHITE,
+                            Stroke::NONE,
+                        );
+                        ui.add_space(10.0);
+                        discard = pill_button(
+                            ui,
+                            vec2(w, 46.0),
+                            "Discard",
+                            white(179),
+                            INK,
+                            Stroke::new(1.0, ink(31)),
+                        );
+                    });
+                }
             });
             if save {
                 self.save_session();
@@ -1551,10 +1664,13 @@ impl DashboardApp {
                 }
 
                 ui.add_space(12.0);
-                let hint = if recording {
-                    "Recording — tap to stop"
+                let hint = if let RecState::Recording { start } = self.rec {
+                    format!(
+                        "Recording {:.0} s — tap to stop (auto-stops at {MAX_REC_SECS:.0} s)",
+                        now - start
+                    )
                 } else {
-                    "Tap to begin capture · sustained /a/ · 8 s min"
+                    "Tap to begin capture · sustained /a/ · 8 s min".to_string()
                 };
                 ui.label(
                     RichText::new(hint)
@@ -2371,27 +2487,22 @@ impl DashboardApp {
             ),
         ];
 
-        // Formant chips: real measurements when the session captured them,
-        // otherwise the prototype's f0-derived mock values. F4 is always
-        // derived (the engine extracts three formants).
-        let derived = [
-            420.0 + sel.f0 * 0.8,
-            1390.0 + sel.f0 * 0.8,
-            2450.0 + sel.f0 * 0.9,
-        ];
-        let mut chips: Vec<(String, f32)> = match sel.formants {
+        // Formant chips: measured values only — an unresolved formant reads
+        // "—", and there is no F4 chip (the engine extracts three formants;
+        // deriving a fourth from f0 was prototype residue, not a measurement).
+        let chips: Vec<(String, Option<f32>)> = match sel.formants {
             Some(f) => f
                 .iter()
                 .enumerate()
-                .map(|(i, f)| (format!("F{}", i + 1), f.frequency))
+                .map(|(i, f)| {
+                    (
+                        format!("F{}", i + 1),
+                        (f.frequency > 0.0).then_some(f.frequency),
+                    )
+                })
                 .collect(),
-            None => derived
-                .iter()
-                .enumerate()
-                .map(|(i, f)| (format!("F{}", i + 1), *f))
-                .collect(),
+            None => (1..=3).map(|i| (format!("F{i}"), None)).collect(),
         };
-        chips.push(("F4".into(), 3500.0 + sel.f0 * 0.95));
 
         glass(24.0).show(ui, |ui| {
             ui.label(
@@ -2474,7 +2585,10 @@ impl DashboardApp {
                     col.painter().text(
                         pos2(chip.center().x, chip.top() + 32.0),
                         Align2::CENTER_CENTER,
-                        format!("{:.0}", freq),
+                        match freq {
+                            Some(v) => format!("{v:.0}"),
+                            None => "—".to_string(),
+                        },
                         FontId::monospace(13.0),
                         TEAL_DARK,
                     );
@@ -2522,7 +2636,7 @@ impl DashboardApp {
 
     // ── floating tab bar ─────────────────────────────────────────────────────
 
-    fn tab_bar(&mut self, ctx: egui::Context, _now: f64) {
+    fn tab_bar(&mut self, ctx: egui::Context, now: f64) {
         egui::Area::new(egui::Id::new("voxlab_tab_bar"))
             .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -16.0 - BOTTOM_INSET))
             .order(egui::Order::Foreground)
@@ -2559,6 +2673,23 @@ impl DashboardApp {
                                     Screen::Capture => mic_glyph(ui.painter(), icon, fg, false),
                                     _ => list_glyph(ui.painter(), icon, fg),
                                 }
+                                // Live-capture dot: recording must stay visible
+                                // from every screen, not just Capture.
+                                if screen == Screen::Capture
+                                    && matches!(self.rec, RecState::Recording { .. })
+                                {
+                                    let pulse = (0.55 + 0.45 * (now * 4.0).sin().abs()) as f32;
+                                    ui.painter().circle_filled(
+                                        pos2(icon.right() + 3.0, icon.top() + 1.0),
+                                        3.5,
+                                        Color32::from_rgba_unmultiplied(
+                                            239,
+                                            68,
+                                            68,
+                                            (pulse * 255.0) as u8,
+                                        ),
+                                    );
+                                }
                                 ui.painter().text(
                                     pos2(rect.center().x, rect.bottom() - 9.0),
                                     Align2::CENTER_CENTER,
@@ -2568,6 +2699,9 @@ impl DashboardApp {
                                 );
                                 if resp.clicked() {
                                     self.screen = screen;
+                                    // Leaving Overview disarms a half-confirmed
+                                    // re-enroll.
+                                    self.reenroll_armed = false;
                                 }
                             }
                         });
