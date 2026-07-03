@@ -969,19 +969,29 @@ const VP_STATS: [(f32, f32); 5] = [
 /// `formants` are F1/F2/F3 (Hz), `profile` the mean relative harmonic
 /// amplitudes (H1..), `centroid_hz` the mean spectral centroid. Tilt is
 /// derived from the profile. f0 is intentionally not an input.
-pub fn build_voiceprint(formants: [Formant; 3], profile: &[f32], centroid_hz: f32) -> Voiceprint {
+///
+/// Unmeasured inputs (`None`) are stored with the struct's 0.0/`None`
+/// "unmeasured" encodings — never substituted with plausible-looking values —
+/// and `voiceprint_similarity` skips them rather than scoring them.
+pub fn build_voiceprint(
+    formants: Option<[Formant; 3]>,
+    profile: &[f32],
+    centroid_hz: Option<f32>,
+) -> Voiceprint {
     let mut p = [0.0f32; 16];
     for (slot, &v) in p.iter_mut().zip(profile) {
         *slot = v;
     }
+    let f = formants.unwrap_or(
+        [Formant {
+            frequency: 0.0,
+            bandwidth: 0.0,
+        }; 3],
+    );
     Voiceprint {
-        formants: [
-            formants[0].frequency,
-            formants[1].frequency,
-            formants[2].frequency,
-        ],
-        centroid_hz,
-        tilt_db_oct: spectral_tilt_db_per_octave(&p).unwrap_or(-9.0),
+        formants: [f[0].frequency, f[1].frequency, f[2].frequency],
+        centroid_hz: centroid_hz.unwrap_or(0.0),
+        tilt_db_oct: spectral_tilt_db_per_octave(&p),
         profile: p,
     }
 }
@@ -992,45 +1002,71 @@ pub fn build_voiceprint(formants: [Formant; 3], profile: &[f32], centroid_hz: f3
 ///     difference → ~0.6, ~2σ → ~0.14); weight 0.6.
 ///   * timbre — cosine similarity of the harmonic profiles; weight 0.4.
 ///
-/// Identical voiceprints score 100. A real, explainable voice-*similarity*
-/// score (self-consistency), not forensic speaker recognition — classical
-/// formant/timbre features conflate "same vowel/effort" with "same voice".
-pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> f32 {
-    // Scalar part: RMS distance over z-scored features.
+/// A feature that is unmeasured on either side (0.0/non-finite formant or
+/// centroid, `None`/non-finite tilt, degenerate profile) is *skipped* and the
+/// remaining features renormalized — never z-scored as if 0 Hz were data, so
+/// two failed captures cannot score as a perfect match. `None` means the two
+/// prints share no comparable feature at all ("unscorable"); the result is
+/// otherwise always finite.
+///
+/// Identical fully-measured voiceprints score 100. A real, explainable
+/// voice-*similarity* score (self-consistency), not forensic speaker
+/// recognition — classical formant/timbre features conflate "same
+/// vowel/effort" with "same voice".
+pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
+    // A measurable scalar feature: finite and physically possible (> 0 Hz for
+    // formants/centroid). Tilt is measurable whenever it is finite.
+    fn hz(v: f32) -> Option<f32> {
+        (v.is_finite() && v > 0.0).then_some(v)
+    }
     let a_scalars = [
-        a.formants[0],
-        a.formants[1],
-        a.formants[2],
-        a.centroid_hz,
-        a.tilt_db_oct,
+        hz(a.formants[0]),
+        hz(a.formants[1]),
+        hz(a.formants[2]),
+        hz(a.centroid_hz),
+        a.tilt_db_oct.filter(|t| t.is_finite()),
     ];
     let b_scalars = [
-        b.formants[0],
-        b.formants[1],
-        b.formants[2],
-        b.centroid_hz,
-        b.tilt_db_oct,
+        hz(b.formants[0]),
+        hz(b.formants[1]),
+        hz(b.formants[2]),
+        hz(b.centroid_hz),
+        b.tilt_db_oct.filter(|t| t.is_finite()),
     ];
-    let mut sumsq = 0.0f32;
-    for i in 0..5 {
-        let (_, std) = VP_STATS[i];
-        let dz = (a_scalars[i] - b_scalars[i]) / std;
-        sumsq += dz * dz;
-    }
-    let rms_z = (sumsq / 5.0).sqrt();
-    let scalar_sim = (-0.5 * rms_z * rms_z).exp();
 
-    // Timbre part: cosine of the (non-negative) harmonic profiles.
+    // Scalar part: RMS distance over the z-scored features measured on BOTH
+    // sides, renormalized to however many that is.
+    let mut sumsq = 0.0f32;
+    let mut compared = 0usize;
+    for i in 0..5 {
+        if let (Some(x), Some(y)) = (a_scalars[i], b_scalars[i]) {
+            let (_, std) = VP_STATS[i];
+            let dz = (x - y) / std;
+            sumsq += dz * dz;
+            compared += 1;
+        }
+    }
+    let scalar_sim = (compared > 0).then(|| {
+        let rms_z = (sumsq / compared as f32).sqrt();
+        (-0.5 * rms_z * rms_z).exp()
+    });
+
+    // Timbre part: cosine of the (non-negative) harmonic profiles; degenerate
+    // (silent/NaN) profiles are unmeasured, not "zero similarity".
     let dot: f32 = a.profile.iter().zip(&b.profile).map(|(x, y)| x * y).sum();
     let na: f32 = a.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let timbre_sim = if na > 1e-9 && nb > 1e-9 {
-        (dot / (na * nb)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    let timbre_sim =
+        (na > 1e-9 && nb > 1e-9 && dot.is_finite()).then(|| (dot / (na * nb)).clamp(0.0, 1.0));
 
-    ((0.6 * scalar_sim + 0.4 * timbre_sim) * 100.0).clamp(0.0, 100.0)
+    // Weighted blend of whichever parts exist (0.6/0.4 when both do).
+    let sim = match (scalar_sim, timbre_sim) {
+        (Some(s), Some(t)) => 0.6 * s + 0.4 * t,
+        (Some(s), None) => s,
+        (None, Some(t)) => t,
+        (None, None) => return None,
+    };
+    Some((sim * 100.0).clamp(0.0, 100.0))
 }
 
 #[cfg(test)]
@@ -1738,25 +1774,83 @@ mod tests {
     }
 
     #[test]
+    fn lpc_pipeline_recovers_synthesized_vowel_formants() {
+        // End-to-end regression for the levinson_durbin sign-convention bug:
+        // run the exact analysis.rs recipe (decimate → pre-emphasized LPC →
+        // Aberth roots) on a synthetic two-resonator "vowel" and require real
+        // formants out. Under the flipped-sign bug this finds NO formants, so
+        // the assertions below fail loudly rather than drifting.
+        let sr = 44_100.0;
+        // Noise-excited resonators at 700/1800 Hz (~120 Hz bandwidths).
+        let bw = |b: f32| (-std::f32::consts::PI * b / sr).exp();
+        let a_true = conv(
+            &pole_pair(bw(120.0) as f64, 700.0, sr as f64),
+            &pole_pair(bw(140.0) as f64, 1800.0, sr as f64),
+        );
+        let n = 4096; // warmup + the 2048-sample analysis frame
+        let mut x = vec![0.0f32; n];
+        let mut seed: u32 = 0xDEAD_BEEF;
+        for i in 0..n {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let mut acc = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+            for k in 1..a_true.len() {
+                if i >= k {
+                    acc -= a_true[k] * x[i - k];
+                }
+            }
+            x[i] = acc;
+        }
+        let frame = &x[n - 2048..];
+
+        // Mirror analysis.rs: decimate to ~11 kHz, order from the decimated rate.
+        let m = ((sr / 11_025.0).round() as usize).max(1);
+        let fs_dec = sr / m as f32;
+        let order = (2 + (fs_dec / 1000.0) as usize).clamp(8, 20);
+        let decimated = decimate(frame, m);
+        let lpc = lpc_coefficients(&decimated, order, 0.97);
+        let formants = formants_from_lpc(&lpc, fs_dec);
+
+        // LPC may resolve an extra spurious resonance between the true ones,
+        // shifting slot positions — require both true resonances to appear
+        // *somewhere* in the resolved set (under the sign-flip bug the set is
+        // empty, which is what this guards against).
+        let resolved: Vec<f32> = formants
+            .iter()
+            .map(|f| f.frequency)
+            .filter(|&f| f > 0.0)
+            .collect();
+        assert!(
+            !resolved.is_empty(),
+            "pipeline resolved no formants: {formants:?}"
+        );
+        for (target, tol) in [(700.0f32, 100.0f32), (1800.0, 150.0)] {
+            assert!(
+                resolved.iter().any(|f| (f - target).abs() < tol),
+                "no resolved formant near {target} Hz: {resolved:?}"
+            );
+        }
+    }
+
+    #[test]
     fn voiceprint_identical_scores_100() {
         let profile: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let vp = build_voiceprint(fmt3(520.0, 1480.0, 2610.0), &profile, 1750.0);
-        let s = voiceprint_similarity(&vp, &vp);
+        let vp = build_voiceprint(Some(fmt3(520.0, 1480.0, 2610.0)), &profile, Some(1750.0));
+        let s = voiceprint_similarity(&vp, &vp).expect("fully measured prints are scorable");
         assert!((s - 100.0).abs() < 0.01, "identical should be 100, got {s}");
     }
 
     #[test]
     fn voiceprint_different_voice_scores_lower() {
         let prof_a: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let a = build_voiceprint(fmt3(500.0, 1500.0, 2600.0), &prof_a, 1700.0);
+        let a = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof_a, Some(1700.0));
 
         // A clearly different voice: formants shifted ~2σ, brighter centroid,
         // shallower tilt (via a flatter profile).
         let prof_b: Vec<f32> = (1..=16).map(|k| 1.0 / (k as f32).sqrt()).collect();
-        let b = build_voiceprint(fmt3(760.0, 2150.0, 3300.0), &prof_b, 3200.0);
+        let b = build_voiceprint(Some(fmt3(760.0, 2150.0, 3300.0)), &prof_b, Some(3200.0));
 
-        let self_score = voiceprint_similarity(&a, &a);
-        let cross = voiceprint_similarity(&a, &b);
+        let self_score = voiceprint_similarity(&a, &a).expect("scorable");
+        let cross = voiceprint_similarity(&a, &b).expect("scorable");
         assert!(
             cross < self_score - 25.0,
             "different voice {cross} should be well below self {self_score}"
@@ -1770,16 +1864,60 @@ mod tests {
     #[test]
     fn voiceprint_closer_voice_scores_higher() {
         let prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let ref_vp = build_voiceprint(fmt3(500.0, 1500.0, 2600.0), &prof, 1800.0);
+        let ref_vp = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0));
         // Near neighbor (small formant drift) vs far (large drift).
-        let near = build_voiceprint(fmt3(515.0, 1530.0, 2630.0), &prof, 1850.0);
-        let far = build_voiceprint(fmt3(650.0, 1900.0, 3050.0), &prof, 2600.0);
-        let s_near = voiceprint_similarity(&ref_vp, &near);
-        let s_far = voiceprint_similarity(&ref_vp, &far);
+        let near = build_voiceprint(Some(fmt3(515.0, 1530.0, 2630.0)), &prof, Some(1850.0));
+        let far = build_voiceprint(Some(fmt3(650.0, 1900.0, 3050.0)), &prof, Some(2600.0));
+        let s_near = voiceprint_similarity(&ref_vp, &near).expect("scorable");
+        let s_far = voiceprint_similarity(&ref_vp, &far).expect("scorable");
         assert!(
             s_near > s_far,
             "nearer voice {s_near} should score above farther {s_far}"
         );
+    }
+
+    #[test]
+    fn voiceprint_unmeasured_features_skip_not_match() {
+        let prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        // Two captures whose formant extraction failed entirely: previously the
+        // 0.0 sentinels z-scored as identical (dz = 0) and inflated the match.
+        // Now they must score on the remaining features only.
+        let no_formants_a = build_voiceprint(None, &prof, Some(1800.0));
+        let no_formants_b = build_voiceprint(None, &prof, Some(2600.0));
+        let with = voiceprint_similarity(&no_formants_a, &no_formants_b).expect("scorable");
+        // The same centroid gap on otherwise-identical fully-measured prints:
+        // adding three *matching* formants can only raise the score, so the
+        // formantless pair must not out-score it (no free perfect features).
+        let full_a = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0));
+        let full_b = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(2600.0));
+        let full = voiceprint_similarity(&full_a, &full_b).expect("scorable");
+        assert!(
+            with <= full + 0.01,
+            "skipped formants ({with}) must not score above matching formants ({full})"
+        );
+
+        // A capture missing everything scalar still scores via timbre alone.
+        let timbre_only = build_voiceprint(None, &prof, None);
+        let s = voiceprint_similarity(&timbre_only, &full_a).expect("timbre is comparable");
+        assert!((0.0..=100.0).contains(&s));
+    }
+
+    #[test]
+    fn voiceprint_unscorable_and_nan_safety() {
+        // Nothing measured on one side at all: unscorable, not NaN, not 100.
+        let empty = build_voiceprint(None, &[0.0; 16], None);
+        let real_prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
+        let real = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &real_prof, Some(1800.0));
+        assert_eq!(voiceprint_similarity(&empty, &empty), None);
+        assert_eq!(voiceprint_similarity(&empty, &real), None);
+
+        // NaN smuggled into a stored print (e.g. a hand-edited archive) is
+        // treated as unmeasured — the result stays finite, never NaN.
+        let mut poisoned = real;
+        poisoned.centroid_hz = f32::NAN;
+        poisoned.tilt_db_oct = Some(f32::NAN);
+        let s = voiceprint_similarity(&poisoned, &real).expect("still scorable");
+        assert!(s.is_finite(), "NaN leaked into the match score: {s}");
     }
 
     #[test]

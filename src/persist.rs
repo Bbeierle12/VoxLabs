@@ -116,7 +116,7 @@ mod tests {
         let vp = Voiceprint {
             formants: [520.0, 1490.0, 2610.0],
             centroid_hz: 1830.0,
-            tilt_db_oct: -9.4,
+            tilt_db_oct: Some(-9.4),
             profile: std::array::from_fn(|i| (i as f32 + 1.0) / 16.0),
         };
         let state = ArchiveState {
@@ -131,6 +131,40 @@ mod tests {
         assert_eq!(back.enrolled, Some(vp));
         assert_eq!(back.enrolled_id.as_deref(), Some("V-F576"));
         assert_eq!(back.next_session_num, 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_option_archives_still_load() {
+        // Archives written before `tilt_db_oct`/`match_pct` became Option
+        // stored plain numbers; they must load as `Some`, not reset the user.
+        let json = r#"{
+            "enrolled": {
+                "formants": [520.0, 1490.0, 2610.0],
+                "centroid_hz": 1830.0,
+                "tilt_db_oct": -9.4,
+                "profile": [1.0,0.5,0.33,0.25,0.2,0.17,0.14,0.13,0.11,0.1,0.09,0.08,0.08,0.07,0.07,0.06]
+            },
+            "enrolled_id": "V-F576",
+            "next_session_num": 2,
+            "sessions": [{
+                "id": "VS-001", "subj": "V-F576", "date": "2026-07-01",
+                "f0": 118.2, "match_pct": 100.0,
+                "hnr_db": 18.1, "h1_h2_db": null, "vibrato": null,
+                "steadiness_cents": null, "jitter_pct": null, "shimmer_db": null,
+                "cpp_db": null, "centroid_hz": 1830.0,
+                "profile": [1.0,0.5,0.33,0.25,0.2,0.17,0.14,0.13,0.11,0.1,0.09,0.08,0.08,0.07,0.07,0.06],
+                "formants": null
+            }]
+        }"#;
+        let path = std::env::temp_dir().join("voxlabs-persist-pre-option.json");
+        std::fs::write(&path, json).unwrap();
+        let state = load(&path);
+        assert_eq!(
+            state.enrolled.expect("old reference must load").tilt_db_oct,
+            Some(-9.4)
+        );
+        assert_eq!(state.sessions.len(), 1, "old session must deserialize");
         let _ = std::fs::remove_file(&path);
     }
 

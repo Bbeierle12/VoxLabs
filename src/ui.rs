@@ -195,7 +195,10 @@ pub(crate) struct Session {
     subj: String,
     date: String,
     f0: f32,
-    match_pct: f32,
+    /// Similarity vs the enrolled reference; `None` = unscorable (the capture
+    /// and reference shared no comparable feature). Older archives stored a
+    /// plain number, which loads as `Some`.
+    match_pct: Option<f32>,
     /// Measured over the capture (means / stop-time snapshot); `None` = not
     /// measured (e.g. too little voiced signal).
     hnr_db: Option<f32>,
@@ -216,7 +219,7 @@ pub(crate) struct Session {
 }
 
 struct CaptureResult {
-    match_pct: f32,
+    match_pct: Option<f32>,
     f0: f32,
     hnr_db: Option<f32>,
     h1_h2_db: Option<f32>,
@@ -453,20 +456,31 @@ impl DashboardApp {
         (self.rng >> 40) as f32 / (1u64 << 24) as f32
     }
 
-    fn verified(match_pct: f32) -> bool {
-        match_pct >= MATCH_THRESHOLD
+    fn verified(match_pct: Option<f32>) -> bool {
+        match_pct.is_some_and(|m| m >= MATCH_THRESHOLD)
     }
 
-    fn badge_style(match_pct: f32) -> (&'static str, Color32, Color32) {
-        if Self::verified(match_pct) {
-            ("Verified", teal_a(31), TEAL_DARK)
-        } else {
-            (
+    fn badge_style(match_pct: Option<f32>) -> (&'static str, Color32, Color32) {
+        match match_pct {
+            Some(_) if Self::verified(match_pct) => ("Verified", teal_a(31), TEAL_DARK),
+            Some(_) => (
                 "Flagged",
                 Color32::from_rgba_unmultiplied(217, 119, 6, 36),
                 AMBER_TEXT,
-            )
+            ),
+            // No comparable features between capture and reference: neither
+            // verified nor flagged — there is simply no score.
+            None => (
+                "Unscored",
+                Color32::from_rgba_unmultiplied(107, 114, 128, 36),
+                ink(150),
+            ),
         }
+    }
+
+    /// Match score for display: one decimal, or an em-dash when unscorable.
+    fn match_text(match_pct: Option<f32>) -> String {
+        match_pct.map_or_else(|| "—".into(), |m| format!("{m:.1}"))
     }
 
     fn input_rms(&self) -> f32 {
@@ -503,22 +517,16 @@ impl DashboardApp {
             // reference candidate (match shown as "Reference"); once enrolled,
             // the match is a real similarity in 0..100.
             let voiceprint = crate::math::build_voiceprint(
-                self.rec_formants.unwrap_or(
-                    [Formant {
-                        frequency: 0.0,
-                        bandwidth: 0.0,
-                    }; 3],
-                ),
+                self.rec_formants,
                 &profile,
-                mean(&self.rec_centroid_acc).unwrap_or(0.0),
+                mean(&self.rec_centroid_acc),
             );
             let is_reference = self.enrolled.is_none();
             let match_pct = match &self.enrolled {
-                Some(reference) => {
-                    (crate::math::voiceprint_similarity(&voiceprint, reference) * 10.0).round()
-                        / 10.0
-                }
-                None => 100.0,
+                Some(reference) => crate::math::voiceprint_similarity(&voiceprint, reference)
+                    .map(|s| (s * 10.0).round() / 10.0),
+                // First capture: it *becomes* the reference; self-match is 100.
+                None => Some(100.0),
             };
 
             self.result = Some(CaptureResult {
@@ -997,10 +1005,10 @@ impl DashboardApp {
             ui.set_min_width(ui.available_width());
             ui.horizontal(|ui| {
                 let (rect, _) = ui.allocate_exact_size(vec2(96.0, 96.0), Sense::hover());
-                let ring_pct = latest.as_ref().map(|s| s.match_pct).unwrap_or(0.0);
+                let ring_pct = latest.as_ref().and_then(|s| s.match_pct).unwrap_or(0.0);
                 let ring_val = latest
                     .as_ref()
-                    .map(|s| format!("{:.1}", s.match_pct))
+                    .map(|s| Self::match_text(s.match_pct))
                     .unwrap_or_else(|| "—".into());
                 ring_gauge(
                     ui.painter(),
@@ -1235,7 +1243,7 @@ impl DashboardApp {
                     );
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let text = format!("{:.1}", s.match_pct);
+                    let text = Self::match_text(s.match_pct);
                     let font = FontId::monospace(12.0);
                     let galley = ui
                         .painter()
@@ -1435,7 +1443,7 @@ impl DashboardApp {
             } else {
                 Self::badge_style(res.match_pct)
             };
-            let match_str = format!("{:.1}", res.match_pct);
+            let match_str = Self::match_text(res.match_pct);
             let heading = match (&self.enrolled_id, is_ref) {
                 (_, true) => "First capture — enrolls your reference voiceprint".to_string(),
                 (Some(id), false) => format!("Similarity vs voiceprint {id}"),
@@ -2179,7 +2187,7 @@ impl DashboardApp {
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let text = format!("{:.1}", s.match_pct);
+                        let text = Self::match_text(s.match_pct);
                         let font = FontId::monospace(11.5);
                         let galley =
                             ui.painter()
@@ -2272,9 +2280,9 @@ impl DashboardApp {
                 ring_gauge(
                     ui.painter(),
                     rect,
-                    sel.match_pct,
+                    sel.match_pct.unwrap_or(0.0),
                     ring_color,
-                    &format!("{:.1}", sel.match_pct),
+                    &Self::match_text(sel.match_pct),
                     None,
                 );
                 ui.add_space(14.0);

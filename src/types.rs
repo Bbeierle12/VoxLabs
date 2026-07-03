@@ -22,12 +22,16 @@ pub struct Vibrato {
 /// tracking a singer's own consistency — not a forensic biometric identity.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Voiceprint {
-    /// F1, F2, F3 in Hz (0.0 = unresolved).
+    /// F1, F2, F3 in Hz. `0.0` = unresolved — kept as the on-disk encoding so
+    /// archives saved before tilt became optional still load; scoring treats
+    /// non-positive/non-finite entries as unmeasured, never as data.
     pub formants: [f32; 3],
-    /// Spectral centroid (Hz).
+    /// Spectral centroid (Hz); `0.0` = unmeasured (same convention as formants).
     pub centroid_hz: f32,
-    /// Spectral tilt (dB/octave).
-    pub tilt_db_oct: f32,
+    /// Spectral tilt (dB/octave); `None` = unmeasured. Older archives stored a
+    /// plain number here (including a fabricated `-9.0` default), which
+    /// deserializes as `Some` and is scored as-is.
+    pub tilt_db_oct: Option<f32>,
     /// Mean relative harmonic profile, H1..H16 (normalized to the strongest).
     pub profile: [f32; 16],
 }
