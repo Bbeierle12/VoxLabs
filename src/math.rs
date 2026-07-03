@@ -13,7 +13,9 @@ const YIN_F0_MAX: f32 = 1000.0;
 const YIN_THRESHOLD: f32 = 0.12;
 
 /// Solves the Yule-Walker equations using Levinson-Durbin recursion.
-/// Returns the LPC reflection coefficients.
+/// Returns the prediction-error polynomial `A(z) = [1, a1, .., ap]`, i.e. the
+/// residual is `e[n] = x[n] + Σ aⱼ x[n-j]`, so the roots of `A(z)` are the
+/// LPC poles — the form `formants_from_lpc` consumes directly.
 pub fn levinson_durbin(autocorr: &[f32], order: usize) -> Vec<f32> {
     let mut a = vec![0.0; order + 1];
     let mut e = autocorr[0];
@@ -26,16 +28,16 @@ pub fn levinson_durbin(autocorr: &[f32], order: usize) -> Vec<f32> {
             // is a valid lower-order polynomial rather than a NaN blow-up.
             break;
         }
-        let mut k = 0.0;
+        let mut acc = autocorr[i];
         for j in 1..i {
-            k += a[j] * autocorr[i - j];
+            acc += a[j] * autocorr[i - j];
         }
-        k = (autocorr[i] - k) / e;
+        let k = -acc / e;
 
         a[i] = k;
         let mut new_a = a.clone();
         for j in 1..i {
-            new_a[j] = a[j] - k * a[i - j];
+            new_a[j] = a[j] + k * a[i - j];
         }
         a = new_a;
         e *= 1.0 - k * k;
@@ -1072,6 +1074,44 @@ mod tests {
         );
         // The model should have captured *something* (not the trivial all-pass).
         assert!(a[1..].iter().any(|&c| c.abs() > 1e-3), "LPC fit is trivial");
+    }
+
+    #[test]
+    fn levinson_durbin_recovers_known_ar_polynomial() {
+        // Ground truth: two resonators, the same shape the formant pipeline
+        // models. Drive 1/A(z) with deterministic pseudo-noise and check the
+        // recursion recovers A(z) itself — sign convention included. (The
+        // original implementation returned the predictor coefficients, every
+        // sign after a[0] flipped, which this test would fail at ~2.5 vs -2.5.)
+        let fs = 10_000.0;
+        let a_true = conv(&pole_pair(0.95, 700.0, fs), &pole_pair(0.93, 1800.0, fs));
+
+        let n = 8192;
+        let mut x = vec![0.0f32; n];
+        let mut seed: u32 = 0x1234_5678;
+        for i in 0..n {
+            // Zero-mean deterministic white noise via an LCG (no rng dependency).
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let e = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+            let mut acc = e;
+            for k in 1..a_true.len() {
+                if i >= k {
+                    acc -= a_true[k] * x[i - k];
+                }
+            }
+            x[i] = acc;
+        }
+
+        let order = a_true.len() - 1;
+        let r = autocorrelation(&x, order);
+        let a = levinson_durbin(&r, order);
+
+        for (k, (&got, &want)) in a.iter().zip(&a_true).enumerate() {
+            assert!(
+                (got - want).abs() < 0.05,
+                "a[{k}] = {got}, want {want}"
+            );
+        }
     }
 
     #[test]
