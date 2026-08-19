@@ -82,7 +82,18 @@ winit = { version = "0.30.13", default-features = false, features = ["android-na
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["Document", "Element", "Window", "HtmlCanvasElement"] }
+# `HtmlElement`/`Node`/`console` are what `report_startup_failure` needs to put
+# a startup error on the page (body → create_element → set_text_content) instead
+# of panicking to a blank canvas.
+web-sys = { version = "0.3", features = [
+    "Document",
+    "Element",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "Node",
+    "Window",
+    "console",
+] }
 
 # --- Android APK packaging (cargo-apk / cargo apk) ------------------------------
 # Release signing is NOT configured here on purpose: cargo-apk reads the keystore

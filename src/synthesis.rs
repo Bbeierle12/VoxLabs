@@ -68,10 +68,23 @@ impl OscillatorBank {
         self.delta_f = delta_f;
     }
 
+    /// Adopts a measured profile as the new glide target.
+    ///
+    /// Non-finite values are refused rather than stored: `current_f0` and the
+    /// current formants converge toward their targets on *every* sample, so a
+    /// single NaN or infinity in a target poisons the oscillator state for the
+    /// rest of the stream — there is no frame boundary to recover at. The
+    /// upstream DSP already gates its outputs (see `math`'s finiteness
+    /// guards), but this is the real-time audio callback, so it does not
+    /// assume that.
     pub fn set_profile(&mut self, profile: &VocalProfile) {
-        if profile.valid && profile.f0 > 20.0 {
+        if profile.valid && profile.f0.is_finite() && profile.f0 > 20.0 {
             self.target_f0 = profile.f0;
-            self.target_formants = profile.formants;
+            for (target, measured) in self.target_formants.iter_mut().zip(&profile.formants) {
+                if measured.frequency.is_finite() && measured.bandwidth.is_finite() {
+                    *target = *measured;
+                }
+            }
         }
     }
 
@@ -153,5 +166,139 @@ impl OscillatorBank {
         }
 
         (out_l * 0.5, out_r * 0.5) // -6dB headroom
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::VoiceMetrics;
+
+    const SR: f32 = 48_000.0;
+    const GLIDE_MS: f32 = 20.0;
+
+    /// `process_sample` divides by the summed harmonic amplitudes and then
+    /// applies -6 dB headroom, so no sample may leave ±0.5. The tolerance
+    /// absorbs float rounding in that division, nothing more.
+    const PEAK_CEILING: f32 = 0.5;
+    const PEAK_TOLERANCE: f32 = 1e-5;
+
+    /// Enough samples for the 20 ms glide to fully converge on the target
+    /// (~960 samples at 48 kHz), so a target that poisons the state has time
+    /// to show up in the output.
+    const SETTLE_SAMPLES: usize = 4800;
+
+    fn formants(spec: [(f32, f32); 3]) -> [Formant; 3] {
+        spec.map(|(frequency, bandwidth)| Formant {
+            frequency,
+            bandwidth,
+        })
+    }
+
+    fn profile(f0: f32, formants: [Formant; 3]) -> VocalProfile {
+        VocalProfile {
+            f0,
+            formants,
+            partial_amplitudes: [0.0; MAX_PARTIALS],
+            metrics: VoiceMetrics::default(),
+            valid: true,
+        }
+    }
+
+    /// Runs the bank and asserts every sample is finite and inside the
+    /// headroom bound. This is the whole safety net: the oscillator feeds a
+    /// real-time output callback, where a NaN is an audible fault and an
+    /// out-of-range sample is a clip.
+    fn drive(bank: &mut OscillatorBank, samples: usize, case: &str) {
+        for i in 0..samples {
+            let (l, r) = bank.process_sample();
+            assert!(
+                l.is_finite() && r.is_finite(),
+                "{case}: sample {i} = ({l}, {r}) is not finite"
+            );
+            assert!(
+                l.abs() <= PEAK_CEILING + PEAK_TOLERANCE
+                    && r.abs() <= PEAK_CEILING + PEAK_TOLERANCE,
+                "{case}: sample {i} = ({l}, {r}) exceeds ±{PEAK_CEILING}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_bank_is_finite_and_bounded() {
+        let mut bank = OscillatorBank::new(SR, GLIDE_MS);
+        drive(&mut bank, SETTLE_SAMPLES, "default");
+    }
+
+    #[test]
+    fn all_zero_profile_is_finite_and_bounded() {
+        let mut bank = OscillatorBank::new(SR, GLIDE_MS);
+        // The unvoiced/pre-signal profile: nothing measured yet. The bank must
+        // keep its last good target rather than glide to silence-by-zero.
+        bank.set_profile(&VocalProfile::default());
+        drive(&mut bank, SETTLE_SAMPLES, "default profile");
+
+        // Same shape but flagged valid, with every field zeroed.
+        bank.set_profile(&profile(0.0, formants([(0.0, 0.0); 3])));
+        drive(&mut bank, SETTLE_SAMPLES, "all-zero profile");
+    }
+
+    #[test]
+    fn zero_formants_with_real_f0_is_finite_and_bounded() {
+        let mut bank = OscillatorBank::new(SR, GLIDE_MS);
+        // Voiced frame whose LPC root-solve resolved nothing: f0 is real, the
+        // spectral envelope is empty. `evaluate_formants` must fall through to
+        // the glottal rolloff instead of dividing by a zero-width resonance.
+        bank.set_profile(&profile(220.0, formants([(0.0, 0.0); 3])));
+        drive(&mut bank, SETTLE_SAMPLES, "zero formants");
+    }
+
+    #[test]
+    fn max_harmonic_count_is_finite_and_bounded() {
+        let mut bank = OscillatorBank::new(SR, GLIDE_MS);
+        // Above MAX_PARTIALS: must clamp, not index out of the phase arrays.
+        bank.set_harmonic_count(usize::MAX);
+        // Low f0 so all MAX_PARTIALS harmonics land in band and contribute.
+        bank.set_profile(&profile(
+            80.0,
+            formants([(500.0, 80.0), (1500.0, 120.0), (2500.0, 160.0)]),
+        ));
+        drive(&mut bank, SETTLE_SAMPLES, "max harmonics");
+    }
+
+    #[test]
+    fn non_finite_profiles_never_reach_the_oscillator() {
+        let good = profile(
+            220.0,
+            formants([(500.0, 80.0), (1500.0, 120.0), (2500.0, 160.0)]),
+        );
+        let poison = [
+            ("nan f0", profile(f32::NAN, good.formants)),
+            ("inf f0", profile(f32::INFINITY, good.formants)),
+            ("neg inf f0", profile(f32::NEG_INFINITY, good.formants)),
+            (
+                "nan formants",
+                profile(220.0, formants([(f32::NAN, f32::NAN); 3])),
+            ),
+            (
+                "inf formants",
+                profile(220.0, formants([(f32::INFINITY, f32::INFINITY); 3])),
+            ),
+            (
+                "mixed",
+                profile(
+                    220.0,
+                    formants([(500.0, 80.0), (f32::NAN, 120.0), (2500.0, f32::INFINITY)]),
+                ),
+            ),
+        ];
+
+        for (case, bad) in poison {
+            let mut bank = OscillatorBank::new(SR, GLIDE_MS);
+            bank.set_profile(&good);
+            drive(&mut bank, SETTLE_SAMPLES, case);
+            bank.set_profile(&bad);
+            drive(&mut bank, SETTLE_SAMPLES, case);
+        }
     }
 }

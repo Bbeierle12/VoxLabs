@@ -19,10 +19,11 @@
 //! open; we treat that as non-fatal so the UI still launches (it just shows
 //! "SEARCHING"). See docs/android-build.md.
 
-use crate::concurrency::ConcurrencyBridges;
+use crate::concurrency::{AnalysisState, ConcurrencyBridges, Telemetry};
 use crate::types::{Formant, VocalProfile};
 use crate::ui::DashboardApp;
 use rtrb::Consumer;
+use std::panic::AssertUnwindSafe;
 use std::thread;
 use triple_buffer::Input;
 use winit::platform::android::activity::AndroidApp;
@@ -74,16 +75,29 @@ fn android_main(app: AndroidApp) {
     let input_sample_rate = query_input_sample_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     log::info!("android input sample rate: {input_sample_rate} Hz");
 
-    // CPU YIN + LPC on the non-real-time analysis thread.
+    // CPU YIN + LPC on the non-real-time analysis thread. A panic in here used
+    // to unwind into nothing and leave the UI showing its last profile forever;
+    // now the death is caught, logged to logcat, and published as
+    // `AnalysisState::Stopped` so the UI can say analysis has stopped.
+    let analysis_telemetry = bridges.telemetry.clone();
     thread::spawn(move || {
-        cpu_analysis_loop(
-            profile_tx,
-            ui_profile_tx,
-            audio_rx,
-            spectrum_tx,
-            scope_tx,
-            input_sample_rate,
-        );
+        analysis_telemetry.set_analysis_state(AnalysisState::Running);
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            cpu_analysis_loop(
+                profile_tx,
+                ui_profile_tx,
+                audio_rx,
+                spectrum_tx,
+                scope_tx,
+                input_sample_rate,
+                &analysis_telemetry,
+            );
+        }));
+        match outcome {
+            Ok(()) => log::error!("analysis loop exited; live analysis has stopped"),
+            Err(_) => log::error!("analysis loop panicked; live analysis has stopped"),
+        }
+        analysis_telemetry.set_analysis_state(AnalysisState::Stopped);
     });
 
     // cpal AAudio engine. Non-fatal on failure: without RECORD_AUDIO the input
@@ -162,6 +176,7 @@ fn cpu_analysis_loop(
     mut spectrum_tx: Input<Vec<f32>>,
     mut scope_tx: Input<Vec<f32>>,
     sample_rate: f32,
+    telemetry: &Telemetry,
 ) {
     use crate::math;
 
@@ -257,6 +272,9 @@ fn cpu_analysis_loop(
             spectrogram.process_block(frame);
             spectrum_tx.write(spectrogram.magnitudes_db().to_vec());
             scope_tx.write(frame.to_vec());
+
+            // Heartbeat for the UI's staleness watch.
+            telemetry.note_analysis_frame();
 
             accumulator.drain(..ANALYSIS_FRAME);
         }

@@ -264,6 +264,10 @@ pub struct AnalysisEngine {
     spectrum_tx: Input<Vec<f32>>,
     /// Raw waveform publisher for the UI oscilloscope.
     scope_tx: Input<Vec<f32>>,
+    /// True while the GPU YIN dispatch is failing and the CPU path is covering
+    /// for it. Latches the log line to the transition: the loop runs ~22x a
+    /// second, so logging per frame would bury everything else.
+    gpu_fallback_active: bool,
 }
 
 impl AnalysisEngine {
@@ -283,6 +287,7 @@ impl AnalysisEngine {
             spectrogram: None,
             spectrum_tx,
             scope_tx,
+            gpu_fallback_active: false,
         })
     }
 
@@ -293,9 +298,20 @@ impl AnalysisEngine {
         // with the same code the CPU reference uses, so f0 agrees by construction.
         // Any GPU failure falls back to the pure-CPU YIN.
         let pitch = match self.gpu.analyze(audio_in) {
-            Ok((diff, cumsum)) => crate::math::yin_f0_from_diff_cumsum(&diff, &cumsum, sample_rate),
+            Ok((diff, cumsum)) => {
+                if self.gpu_fallback_active {
+                    log::info!("GPU YIN dispatch recovered; leaving CPU fallback");
+                    self.gpu_fallback_active = false;
+                }
+                crate::math::yin_f0_from_diff_cumsum(&diff, &cumsum, sample_rate)
+            }
             Err(e) => {
-                eprintln!("GPU YIN dispatch failed ({e:?}); using CPU fallback");
+                // Logged on the transition only — `eprintln!` here ran per
+                // frame and reached no one in a windowed launch anyway.
+                if !self.gpu_fallback_active {
+                    log::warn!("GPU YIN dispatch failed ({e:?}); using CPU fallback");
+                    self.gpu_fallback_active = true;
+                }
                 crate::math::yin_pitch(audio_in, sample_rate)
             }
         };

@@ -44,15 +44,27 @@ mod ui;
 pub use concurrency::ConcurrencyBridges;
 pub use ui::DashboardApp;
 
+/// Consecutive `process_frame` failures tolerated before the desktop analysis
+/// loop gives up and reports itself stopped. A single failure can be a
+/// transient GPU submit hiccup; three in a row means the device is gone.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+const MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 3;
+
+/// Idle sleep between ring-buffer drains on the analysis thread.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+const ANALYSIS_POLL_MS: u64 = 5;
+
 /// Desktop native entry point. Spawns the GPU-accelerated analysis thread,
 /// starts the cpal audio engine, and runs the egui dashboard. This is the
 /// former `fn main` body verbatim (now returning to `main.rs`), so desktop
 /// behaviour is unchanged.
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub fn run() -> anyhow::Result<()> {
-    use crate::analysis::{self, AnalysisEngine};
+    use crate::analysis::AnalysisEngine;
     use crate::audio::AudioEngine;
+    use crate::concurrency::AnalysisState;
     use cpal::traits::{DeviceTrait, HostTrait};
+    use std::panic::AssertUnwindSafe;
     use std::thread;
 
     env_logger::init();
@@ -81,35 +93,39 @@ pub fn run() -> anyhow::Result<()> {
     };
     println!("Microphone sample rate: {input_sample_rate} Hz");
 
-    // Start background analysis thread
+    // Start background analysis thread. Nothing on this thread may panic the
+    // process or die silently: initialization failure, a panic inside the loop
+    // and repeated frame errors each land in `Telemetry` so the UI can say
+    // which one happened instead of showing a frozen readout forever.
+    let analysis_telemetry = bridges.telemetry.clone();
     thread::spawn(move || {
-        let mut engine = pollster::block_on(AnalysisEngine::new(
+        let telemetry = analysis_telemetry;
+        let mut engine = match pollster::block_on(AnalysisEngine::new(
             profile_tx,
             ui_profile_tx,
             spectrum_tx,
             scope_tx,
-        ))
-        .expect("Failed to init AnalysisEngine");
-
-        // Persistent accumulator. Each tick we drain *everything* available from
-        // the ring buffer, then process as many whole frames as we have, carrying
-        // the leftover samples into the next tick. The previous loop reset its
-        // index every iteration and silently discarded any partial (<1024) read.
-        let mut accumulator: Vec<f32> = Vec::with_capacity(analysis::ANALYSIS_FRAME * 4);
-        loop {
-            while let Ok(sample) = audio_rx.pop() {
-                accumulator.push(sample);
+        )) {
+            Ok(engine) => engine,
+            Err(e) => {
+                // Almost always "no usable GPU adapter". Per the phase-F
+                // decision (gate G3) we report it rather than falling back to
+                // a desktop CPU analysis path.
+                log::error!("analysis engine failed to initialize: {e:?}");
+                telemetry.set_analysis_state(AnalysisState::Unavailable);
+                return;
             }
+        };
+        telemetry.set_analysis_state(AnalysisState::Running);
 
-            while accumulator.len() >= analysis::ANALYSIS_FRAME {
-                engine
-                    .process_frame(&accumulator[..analysis::ANALYSIS_FRAME], input_sample_rate)
-                    .expect("process_frame failed");
-                accumulator.drain(..analysis::ANALYSIS_FRAME);
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            analysis_loop(&mut engine, &mut audio_rx, input_sample_rate, &telemetry);
+        }));
+        match outcome {
+            Ok(()) => log::error!("analysis loop exited; live analysis has stopped"),
+            Err(_) => log::error!("analysis loop panicked; live analysis has stopped"),
         }
+        telemetry.set_analysis_state(AnalysisState::Stopped);
     });
 
     let _audio_engine = AudioEngine::start(
@@ -147,4 +163,50 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e))?;
 
     Ok(())
+}
+
+/// Desktop analysis loop body, split out of [`run`] so the spawning thread can
+/// wrap it in `catch_unwind` and report its death.
+///
+/// Returns only when analysis can no longer proceed: the caller then marks the
+/// engine `Stopped`. The accumulator is persistent — each tick drains
+/// *everything* available from the ring buffer, processes as many whole frames
+/// as it has, and carries the leftover samples into the next tick.
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+fn analysis_loop(
+    engine: &mut analysis::AnalysisEngine,
+    audio_rx: &mut rtrb::Consumer<f32>,
+    input_sample_rate: f32,
+    telemetry: &concurrency::Telemetry,
+) {
+    let mut accumulator: Vec<f32> = Vec::with_capacity(analysis::ANALYSIS_FRAME * 4);
+    let mut consecutive_errors = 0u32;
+
+    loop {
+        while let Ok(sample) = audio_rx.pop() {
+            accumulator.push(sample);
+        }
+
+        while accumulator.len() >= analysis::ANALYSIS_FRAME {
+            match engine.process_frame(&accumulator[..analysis::ANALYSIS_FRAME], input_sample_rate)
+            {
+                Ok(()) => {
+                    consecutive_errors = 0;
+                    telemetry.note_analysis_frame();
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    log::error!(
+                        "process_frame failed ({consecutive_errors}/{MAX_CONSECUTIVE_FRAME_ERRORS}): {e:?}"
+                    );
+                    if consecutive_errors >= MAX_CONSECUTIVE_FRAME_ERRORS {
+                        return;
+                    }
+                }
+            }
+            accumulator.drain(..analysis::ANALYSIS_FRAME);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(ANALYSIS_POLL_MS));
+    }
 }

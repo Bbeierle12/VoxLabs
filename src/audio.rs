@@ -39,6 +39,12 @@ impl AudioEngine {
 
         // Input callback needs its own handle; the output closure moves `telemetry`.
         let telemetry_in = telemetry.clone();
+        // cpal delivers stream errors to a separate callback that owns no UI
+        // handle, so each one counts into telemetry (and logs). The UI turns a
+        // change in these counters into a banner — `eprintln!` reached nobody
+        // on Android or in a windowed desktop launch.
+        let telemetry_in_err = telemetry.clone();
+        let telemetry_out_err = telemetry.clone();
 
         // Output stream (Synthesis)
         let _output_stream = output_device.build_output_stream(
@@ -78,7 +84,10 @@ impl AudioEngine {
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             move |err| {
-                eprintln!("Output stream error: {}", err);
+                log::error!("cpal output stream error: {err}");
+                telemetry_out_err
+                    .output_stream_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             None, // Timeout
         )?;
@@ -115,7 +124,10 @@ impl AudioEngine {
                 }
             },
             move |err| {
-                eprintln!("Input stream error: {}", err);
+                log::error!("cpal input stream error: {err}");
+                telemetry_in_err
+                    .input_stream_errors
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             },
             None,
         )?;

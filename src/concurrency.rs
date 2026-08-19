@@ -2,8 +2,44 @@ use crate::types::VocalProfile;
 use crossbeam_utils::CachePadded;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use triple_buffer::{Input, Output, TripleBuffer};
+
+/// Liveness of the analysis thread, as seen by the UI.
+///
+/// The analysis path runs on its own thread and publishes through lock-free
+/// buffers, so its death is otherwise indistinguishable from a silent
+/// microphone: the last profile just stops changing. This enum is stored as a
+/// single atomic byte in [`Telemetry`] so every entry point can report which
+/// of the three "no data" cases it is in, and the UI can say so instead of
+/// freezing on a stale readout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum AnalysisState {
+    /// Thread spawned; the engine has not finished initializing yet.
+    Starting = 0,
+    /// Initialized and producing frames.
+    Running = 1,
+    /// Never started — initialization failed (on desktop: no usable GPU
+    /// adapter). No frames will ever arrive.
+    Unavailable = 2,
+    /// Ran, then stopped: the loop panicked or hit unrecoverable frame errors.
+    /// No further frames will arrive until the app is restarted.
+    Stopped = 3,
+}
+
+impl AnalysisState {
+    /// Decodes the atomic representation. Unknown bytes read as `Starting`
+    /// rather than panicking — this is a status flag, not a data channel.
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Running,
+            2 => Self::Unavailable,
+            3 => Self::Stopped,
+            _ => Self::Starting,
+        }
+    }
+}
 
 pub struct Telemetry {
     pub xruns: CachePadded<AtomicU32>,
@@ -11,9 +47,18 @@ pub struct Telemetry {
     /// Latest microphone input RMS as `f32::to_bits`, written once per input
     /// callback. Drives the Capture screen's LEVEL readout and waveform.
     pub input_rms: CachePadded<AtomicU32>,
-    /// Reserved: engine liveness flag for a future UI status indicator.
-    #[allow(dead_code)]
-    pub alive: CachePadded<AtomicBool>,
+    /// [`AnalysisState`] discriminant. Written by the analysis thread, read by
+    /// the UI; use [`Telemetry::analysis_state`] / [`Telemetry::set_analysis_state`].
+    analysis_state: CachePadded<AtomicU8>,
+    /// Monotonic count of analysis frames published. Wrapping is harmless: the
+    /// UI only compares it with the previous value it saw, to detect a loop
+    /// that is alive but no longer producing (see `DashboardApp::watch_engine`).
+    pub analysis_frames: CachePadded<AtomicU32>,
+    /// cpal stream errors reported to the input/output error callbacks. The
+    /// callbacks cannot render anything themselves, so they count here and the
+    /// UI turns a change into a banner.
+    pub input_stream_errors: CachePadded<AtomicU32>,
+    pub output_stream_errors: CachePadded<AtomicU32>,
 }
 
 impl Telemetry {
@@ -22,8 +67,28 @@ impl Telemetry {
             xruns: CachePadded::new(AtomicU32::new(0)),
             consumed_frames: CachePadded::new(AtomicU32::new(0)),
             input_rms: CachePadded::new(AtomicU32::new(0)),
-            alive: CachePadded::new(AtomicBool::new(true)),
+            analysis_state: CachePadded::new(AtomicU8::new(AnalysisState::Starting as u8)),
+            analysis_frames: CachePadded::new(AtomicU32::new(0)),
+            input_stream_errors: CachePadded::new(AtomicU32::new(0)),
+            output_stream_errors: CachePadded::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Current analysis-thread liveness. `Relaxed` throughout: these flags
+    /// order nothing else — the profile itself travels through the triple
+    /// buffer, which does its own synchronization.
+    pub fn analysis_state(&self) -> AnalysisState {
+        AnalysisState::from_u8(self.analysis_state.load(Ordering::Relaxed))
+    }
+
+    pub fn set_analysis_state(&self, state: AnalysisState) {
+        self.analysis_state.store(state as u8, Ordering::Relaxed);
+    }
+
+    /// Called by an analysis loop once per published profile — the heartbeat
+    /// the UI's staleness watch counts.
+    pub fn note_analysis_frame(&self) {
+        self.analysis_frames.fetch_add(1, Ordering::Relaxed);
     }
 }
 

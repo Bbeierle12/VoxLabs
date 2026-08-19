@@ -14,7 +14,7 @@
 //! voiceprint_similarity`) — a voice-consistency measure, not a forensic
 //! biometric. The archive persists to disk via the `persist` module.
 
-use crate::concurrency::{EngineEvent, Telemetry};
+use crate::concurrency::{AnalysisState, EngineEvent, Telemetry};
 use crate::types::{Formant, MAX_PARTIALS, Vibrato, VocalProfile, Voiceprint};
 use eframe::egui::{
     self, Align, Align2, Color32, ColorImage, FontId, Layout, Pos2, Rect, RichText, Sense, Shape,
@@ -50,6 +50,22 @@ const MIN_ENROLL_VOICED_FRACTION: f32 = 0.5;
 /// Recording auto-stops here so a capture left running off-screen can't grow
 /// its accumulators unbounded.
 const MAX_REC_SECS: f64 = 60.0;
+
+/// How long the analysis thread may go without publishing a frame — while the
+/// microphone is demonstrably live — before the UI calls it stalled. One
+/// analysis frame is ~46 ms, so 2 s is ~40 missed frames: far past scheduling
+/// jitter, well short of a length a user would sit through wondering.
+const ANALYSIS_STALL_SECS: f64 = 2.0;
+
+/// Input RMS above which the microphone counts as delivering signal, for the
+/// staleness check above. A silent room reads well below this; a stalled
+/// analysis thread with a live mic reads well above it.
+const ANALYSIS_STALL_RMS_FLOOR: f32 = 0.002;
+
+/// How long a cpal stream error keeps its banner up after the last occurrence.
+/// Stream errors are often transient, so the notice expires on its own rather
+/// than pinning a warning for the rest of the session.
+const AUDIO_ERROR_NOTICE_SECS: f64 = 10.0;
 
 /// Content column width — the prototype is a 428 px phone layout.
 const COL_WIDTH: f32 = 430.0;
@@ -330,6 +346,18 @@ pub struct DashboardApp {
     /// User-facing persistence problem (unreadable archive at startup, failed
     /// save). Shown as a dismissible banner above every screen.
     persist_notice: Option<String>,
+    /// Analysis-thread staleness watch: the `analysis_frames` count last seen
+    /// and when (`None` until the first observation, so a slow start isn't
+    /// mistaken for a stall). `analysis_stalled` is the derived verdict.
+    last_analysis_frames: u32,
+    last_analysis_change: Option<f64>,
+    analysis_stalled: bool,
+    /// Latest cpal stream error as (message, time seen); expires after
+    /// [`AUDIO_ERROR_NOTICE_SECS`]. The counters behind it only ever rise, so
+    /// the UI watches for *changes* rather than for a nonzero value.
+    audio_notice: Option<(&'static str, f64)>,
+    last_input_errors: u32,
+    last_output_errors: u32,
     /// Real per-frame metrics collected while recording (means stored).
     rec_hnr_acc: Vec<f32>,
     rec_h1h2_acc: Vec<f32>,
@@ -433,6 +461,12 @@ impl DashboardApp {
             rec_frames_total: 0,
             reenroll_armed: false,
             persist_notice,
+            last_analysis_frames: 0,
+            last_analysis_change: None,
+            analysis_stalled: false,
+            audio_notice: None,
+            last_input_errors: 0,
+            last_output_errors: 0,
             rec_hnr_acc: Vec::new(),
             rec_h1h2_acc: Vec::new(),
             rec_jitter_acc: Vec::new(),
@@ -526,6 +560,85 @@ impl DashboardApp {
 
     fn input_rms(&self) -> f32 {
         f32::from_bits(self.telemetry.input_rms.load(Ordering::Relaxed))
+    }
+
+    // ── engine health ────────────────────────────────────────────────────────
+
+    /// Polls the engine's telemetry once per frame and updates the two derived
+    /// conditions the UI can't read directly from a flag: an analysis thread
+    /// that is alive but no longer producing, and a cpal stream error recent
+    /// enough to still be worth showing.
+    fn watch_engine(&mut self, now: f64) {
+        let frames = self.telemetry.analysis_frames.load(Ordering::Relaxed);
+        match self.last_analysis_change {
+            // First observation: start the clock, never accuse on frame one.
+            None => {
+                self.last_analysis_frames = frames;
+                self.last_analysis_change = Some(now);
+                self.analysis_stalled = false;
+            }
+            Some(_) if frames != self.last_analysis_frames => {
+                self.last_analysis_frames = frames;
+                self.last_analysis_change = Some(now);
+                self.analysis_stalled = false;
+            }
+            Some(since) => {
+                // Only a live microphone makes silence suspicious: with no
+                // input there is legitimately nothing to analyze.
+                self.analysis_stalled = self.input_rms() > ANALYSIS_STALL_RMS_FLOOR
+                    && now - since >= ANALYSIS_STALL_SECS;
+            }
+        }
+
+        let input_errors = self.telemetry.input_stream_errors.load(Ordering::Relaxed);
+        let output_errors = self.telemetry.output_stream_errors.load(Ordering::Relaxed);
+        if input_errors != self.last_input_errors {
+            self.last_input_errors = input_errors;
+            self.audio_notice = Some((
+                "Microphone stream error — input may be interrupted. Check the input device.",
+                now,
+            ));
+        } else if output_errors != self.last_output_errors {
+            self.last_output_errors = output_errors;
+            self.audio_notice = Some((
+                "Audio output stream error — monitoring may be interrupted.",
+                now,
+            ));
+        }
+        if let Some((_, seen)) = self.audio_notice
+            && now - seen >= AUDIO_ERROR_NOTICE_SECS
+        {
+            self.audio_notice = None;
+        }
+    }
+
+    /// The engine's worst current problem, as one line for the status banner,
+    /// or `None` when everything is running. Ordered by how much it costs the
+    /// user: no analysis at all, then stopped, then stalled, then audio I/O.
+    fn engine_notice(&self) -> Option<&'static str> {
+        match self.telemetry.analysis_state() {
+            AnalysisState::Unavailable => Some(
+                "Analysis unavailable — no compatible GPU adapter was found. \
+                 Live readouts and capture are off.",
+            ),
+            AnalysisState::Stopped => Some(
+                "Analysis stopped — the analysis thread exited. \
+                 Restart the app to resume live readouts.",
+            ),
+            // A slow start is not a stall: `Starting` means the engine has not
+            // claimed to be producing yet, so the absence of frames is expected.
+            AnalysisState::Starting => self.audio_notice.map(|(msg, _)| msg),
+            AnalysisState::Running => {
+                if self.analysis_stalled {
+                    Some(
+                        "Analysis stalled — the microphone is live but no frames have \
+                         arrived recently. Readouts below may be out of date.",
+                    )
+                } else {
+                    self.audio_notice.map(|(msg, _)| msg)
+                }
+            }
+        }
     }
 
     // ── state machine ────────────────────────────────────────────────────────
@@ -732,6 +845,7 @@ impl eframe::App for DashboardApp {
         ui.ctx().request_repaint();
         let now = ui.input(|i| i.time);
 
+        self.watch_engine(now);
         self.advance(now);
 
         if self.ui_profile_rx.updated() {
@@ -837,38 +951,19 @@ impl eframe::App for DashboardApp {
                     // Android renders edge-to-edge under the system bars and
                     // eframe exposes no safe-area insets, so pad past them.
                     ui.add_space(TOP_INSET);
+                    // Engine health (analysis unavailable/stopped/stalled, cpal
+                    // stream errors) is live state, so this banner is not
+                    // dismissible — it clears itself when the condition does.
+                    if let Some(notice) = self.engine_notice() {
+                        notice_banner(ui, notice, false);
+                        ui.add_space(10.0);
+                    }
                     // Persistence problems (unreadable archive, failed save)
                     // stay visible on every screen until dismissed.
                     if let Some(notice) = self.persist_notice.clone() {
-                        glass(16.0).show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                let close_w = 26.0;
-                                ui.allocate_ui_with_layout(
-                                    vec2(ui.available_width() - close_w, 0.0),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| {
-                                        ui.label(
-                                            RichText::new(notice.as_str())
-                                                .size(12.0)
-                                                .color(AMBER_TEXT),
-                                        );
-                                    },
-                                );
-                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                    let resp = ui
-                                        .add(
-                                            egui::Label::new(
-                                                RichText::new("✕").size(13.0).color(ink(140)),
-                                            )
-                                            .sense(Sense::click()),
-                                        )
-                                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                                    if resp.clicked() {
-                                        self.persist_notice = None;
-                                    }
-                                });
-                            });
-                        });
+                        if notice_banner(ui, &notice, true) {
+                            self.persist_notice = None;
+                        }
                         ui.add_space(10.0);
                     }
                     match self.screen {
@@ -884,6 +979,38 @@ impl eframe::App for DashboardApp {
 
         self.tab_bar(ui.ctx().clone(), now);
     }
+}
+
+/// One amber status line in a glass card, shown above whichever screen is up.
+/// Returns true when a dismissible banner's ✕ was clicked this frame.
+fn notice_banner(ui: &mut egui::Ui, text: &str, dismissible: bool) -> bool {
+    let mut dismissed = false;
+    glass(16.0).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let close_w = if dismissible { 26.0 } else { 0.0 };
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width() - close_w, 0.0),
+                Layout::left_to_right(Align::Center),
+                |ui| {
+                    ui.add(
+                        egui::Label::new(RichText::new(text).size(12.0).color(AMBER_TEXT)).wrap(),
+                    );
+                },
+            );
+            if dismissible {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let resp = ui
+                        .add(
+                            egui::Label::new(RichText::new("✕").size(13.0).color(ink(140)))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    dismissed = resp.clicked();
+                });
+            }
+        });
+    });
+    dismissed
 }
 
 // ── background ───────────────────────────────────────────────────────────────
