@@ -39,6 +39,36 @@ triple_buffer = "9.0.0"
 # wayland/x11, web screen reader). eframe's own default also enables `winit/default`
 # — which can't be named from a consumer's feature list — so the desktop winit dep
 # below re-adds it directly.
+#
+# --- Accepted advisories (review phase H, gate G4) ------------------------------
+# `cargo audit` reports two high-severity quick-xml DoS advisories against the
+# 0.39.4 in our lockfile:
+#   RUSTSEC-2026-0194  quadratic run time on duplicate start-tag attribute names
+#   RUSTSEC-2026-0195  unbounded namespace-declaration allocation in NsReader
+# Both are fixed in quick-xml >= 0.41, which nothing in this tree can reach:
+# `wayland-scanner 0.31` and `zbus_xml 5.1` both require `^0.39`, so a `--precise`
+# bump is refused by the resolver, not merely inconvenient.
+#
+# G4 asked whether to drop `accesskit` here to shed the advisory. Re-checked
+# 2026-08-19: that no longer works. quick-xml now enters through TWO paths —
+# accesskit -> atspi -> zbus_xml, and (independently) wayland -> sctk-adwaita ->
+# wayland-scanner. Dropping accesskit would cost screen-reader support and still
+# leave quick-xml in the tree. Accept and track stands, for a stronger reason
+# than when it was first recorded.
+#
+# Exposure: both advisories are denial-of-service on hostile XML input. The
+# wayland path parses protocol XML that ships with the build; the zbus path
+# parses D-Bus introspection from the local session bus. Neither reads anything
+# a remote party controls.
+#
+# Also tracked (warning tier, no fix in range): RUSTSEC-2026-0192, `ttf-parser`
+# 0.25 unmaintained, pinned via winit -> sctk-adwaita -> ab_glyph. It resolves
+# with the eframe/winit upgrade, which is the same upgrade that would unblock
+# real `MainEvent::Destroy` handling on Android (see src/android.rs).
+#
+# Re-run `cargo audit` each phase. Fixed by targeted update on 2026-08-19:
+# RUSTSEC-2026-0257 (webbrowser 1.2.1 -> 1.2.4) and RUSTSEC-2026-0221
+# (event-listener 5.4.1 -> 5.4.2).
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { version = "0.34.3", default-features = false, features = [
     "accesskit",
