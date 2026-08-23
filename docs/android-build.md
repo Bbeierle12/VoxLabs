@@ -89,7 +89,22 @@ export CARGO_APK_RELEASE_KEYSTORE="$HOME/.android-keystores/voice_harmonic_engin
 export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat "$HOME/.android-keystores/voice_harmonic_engine-release.password")"
 export TMPDIR="$HOME/tmp"
 
+# REQUIRED for Pixel 8+ / Android 15+, which use 16 KB memory pages. NDK 26.3
+# links 4 KB-aligned by default, and a 4 KB-aligned .so cannot be mapped on a
+# 16 KB-page device — the app installs and then dies on launch with no error.
+# cargo-apk overrides the equivalent setting in .cargo/config.toml, so it has
+# to be passed as an env var here. Verify after building (see below).
+export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"
+
 cargo apk build --lib --release
+```
+
+Confirm the alignment — every LOAD segment must read `0x4000`, not `0x1000`:
+
+```bash
+unzip -o target/release/apk/voice_harmonic_engine.apk 'lib/*' -d /tmp/apkchk
+"$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -l \
+  /tmp/apkchk/lib/arm64-v8a/libvoice_harmonic_engine.so | grep LOAD
 ```
 
 Output (already produced here):

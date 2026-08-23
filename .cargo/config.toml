@@ -1,0 +1,17 @@
+# 16 KB page-size support for Android.
+#
+# Pixel 8 and later (Android 15+) run with 16 KB memory pages. A shared library
+# whose ELF LOAD segments are aligned to 4 KB cannot be mapped there: dlopen
+# fails, and since this app is a NativeActivity whose entire body is
+# libvoice_harmonic_engine.so, the failure looks like a clean install that dies
+# the moment it is launched — no install error, no visible crash reason.
+#
+# NDK r27+ links 16 KB-aligned by default; r26.3 (pinned in
+# docs/android-build.md) still defaults to 4 KB, so ask for it. Harmless on
+# 4 KB devices: max-page-size sets the maximum, so the .so still maps there.
+#
+# NOTE: cargo-apk overrides target-specific rustflags from this file, so the
+# APK build ALSO needs the RUSTFLAGS env var — see docs/android-build.md §3.
+# This entry covers plain `cargo build --target aarch64-linux-android`.
+[target.aarch64-linux-android]
+rustflags = ["-C", "link-arg=-Wl,-z,max-page-size=16384"]
