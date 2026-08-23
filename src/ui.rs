@@ -640,6 +640,15 @@ impl DashboardApp {
     /// or `None` when everything is running. Ordered by how much it costs the
     /// user: no analysis at all, then stopped, then stalled, then audio I/O.
     fn engine_notice(&self) -> Option<&'static str> {
+        // No microphone outranks everything else: with no input stream the
+        // analysis path is idle by definition, so any staleness or GPU notice
+        // below would only describe a consequence of this.
+        if self.telemetry.audio_unavailable() {
+            return Some(
+                "Microphone unavailable — the audio engine could not open the mic. \
+                 Grant the Microphone permission in Settings, then reopen the app.",
+            );
+        }
         match self.telemetry.analysis_state() {
             AnalysisState::Unavailable => Some(
                 "Analysis unavailable — no compatible GPU adapter was found. \

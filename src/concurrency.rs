@@ -2,7 +2,7 @@ use crate::types::VocalProfile;
 use crossbeam_utils::CachePadded;
 use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use triple_buffer::{Input, Output, TripleBuffer};
 
 /// Liveness of the analysis thread, as seen by the UI.
@@ -59,6 +59,11 @@ pub struct Telemetry {
     /// UI turns a change into a banner.
     pub input_stream_errors: CachePadded<AtomicU32>,
     pub output_stream_errors: CachePadded<AtomicU32>,
+    /// Set when the audio engine could not be started at all — on Android,
+    /// almost always a missing `RECORD_AUDIO` grant. Distinct from a stream
+    /// *error*: there is no stream. Without this the UI sits in SEARCHING
+    /// forever and the only explanation is a logcat line the user cannot see.
+    audio_unavailable: CachePadded<AtomicBool>,
 }
 
 impl Telemetry {
@@ -71,7 +76,18 @@ impl Telemetry {
             analysis_frames: CachePadded::new(AtomicU32::new(0)),
             input_stream_errors: CachePadded::new(AtomicU32::new(0)),
             output_stream_errors: CachePadded::new(AtomicU32::new(0)),
+            audio_unavailable: CachePadded::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether the audio engine failed to start. Set once at startup by
+    /// whichever entry point owns the engine.
+    pub fn audio_unavailable(&self) -> bool {
+        self.audio_unavailable.load(Ordering::Relaxed)
+    }
+
+    pub fn set_audio_unavailable(&self, unavailable: bool) {
+        self.audio_unavailable.store(unavailable, Ordering::Relaxed);
     }
 
     /// Current analysis-thread liveness. `Relaxed` throughout: these flags

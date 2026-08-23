@@ -216,6 +216,11 @@ fn android_main(app: AndroidApp) {
             log::error!(
                 "audio engine failed to start (is RECORD_AUDIO granted?): {e:?}; UI will run without audio"
             );
+            // The UI must say this. A NativeActivity cannot raise the runtime
+            // permission dialog itself, so without a banner the app looks
+            // merely broken rather than un-permitted, and the only diagnosis
+            // is a logcat line most users will never read.
+            bridges.telemetry.set_audio_unavailable(true);
             None
         }
     };
