@@ -70,6 +70,30 @@ const AUDIO_ERROR_NOTICE_SECS: f64 = 10.0;
 /// Content column width — the prototype is a 428 px phone layout.
 const COL_WIDTH: f32 = 430.0;
 
+/// Content inset of a `glass` card: its 1 px stroke plus 14 px inner margin.
+/// The Sessions header row is *not* inside a card, so it pads by this much on
+/// each side to sit on the same grid as the rows below it.
+const GLASS_INSET: f32 = 15.0;
+
+/// Sessions-table column grid. The header and the data rows are laid out by
+/// separate code — the header on the panel, each row inside a `glass` card —
+/// so the widths live here instead of as literals in both places, where they
+/// had drifted 4 px apart and left the SUBJECT column visibly misaligned with
+/// its own header.
+const SESSIONS_ID_W: f32 = 78.0;
+const SESSIONS_F0_W: f32 = 58.0;
+/// Space reserved at the right for the match badge, which sizes itself to its
+/// text; this is the room the flexible SUBJECT column must leave it.
+const SESSIONS_MATCH_W: f32 = 68.0;
+
+/// Width of the flexible SUBJECT column from the width available at that point
+/// in the layout. `inset_right` is the card inset the header must give back and
+/// the rows must not — the card already supplies it. Both call sites use this
+/// so the grid has exactly one definition.
+fn sessions_subject_w(available: f32, inset_right: f32) -> f32 {
+    available - SESSIONS_F0_W - SESSIONS_MATCH_W - inset_right
+}
+
 /// Safe-area padding for Android's edge-to-edge rendering (status bar /
 /// gesture bar). Zero elsewhere: desktop and web windows are not overlaid.
 const TOP_INSET: f32 = if cfg!(target_os = "android") {
@@ -2382,15 +2406,22 @@ impl DashboardApp {
         // Column headers.
         let header_font = FontId::monospace(9.5);
         ui.horizontal(|ui| {
-            ui.add_space(15.0);
-            for (w, label) in [(82.0, "ID"), (0.0, "SUBJECT"), (62.0, "F0 HZ")] {
+            ui.add_space(GLASS_INSET);
+            for (w, label) in [
+                (SESSIONS_ID_W, "ID"),
+                (0.0, "SUBJECT"),
+                (SESSIONS_F0_W, "F0 HZ"),
+            ] {
                 let text = RichText::new(label)
                     .font(header_font.clone())
                     .color(ink(115));
                 let w = if w > 0.0 {
                     w
                 } else {
-                    ui.available_width() - 62.0 - 68.0 - 31.0
+                    // The rows are inset by the card on BOTH sides; the header
+                    // only pads its left above, so it gives back the right-hand
+                    // inset here to land on the same grid.
+                    sessions_subject_w(ui.available_width(), GLASS_INSET)
                 };
                 ui.allocate_ui_with_layout(
                     vec2(w, 14.0),
@@ -2402,7 +2433,7 @@ impl DashboardApp {
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.add_space(15.0);
+                ui.add_space(GLASS_INSET);
                 ui.label(
                     RichText::new("MATCH")
                         .font(header_font.clone())
@@ -2445,10 +2476,10 @@ impl DashboardApp {
             let ir = glass(18.0).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.allocate_ui_with_layout(
-                        vec2(78.0, 34.0),
+                        vec2(SESSIONS_ID_W, 34.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_width(78.0);
+                            ui.set_width(SESSIONS_ID_W);
                             ui.label(
                                 RichText::new(&s.id)
                                     .font(FontId::monospace(12.5))
@@ -2457,7 +2488,7 @@ impl DashboardApp {
                             );
                         },
                     );
-                    let subj_w = ui.available_width() - 62.0 - 68.0 - 16.0;
+                    let subj_w = sessions_subject_w(ui.available_width(), 0.0);
                     ui.allocate_ui_with_layout(
                         vec2(subj_w, 34.0),
                         Layout::top_down(Align::Min),
@@ -2468,10 +2499,10 @@ impl DashboardApp {
                         },
                     );
                     ui.allocate_ui_with_layout(
-                        vec2(58.0, 34.0),
+                        vec2(SESSIONS_F0_W, 34.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.set_width(58.0);
+                            ui.set_width(SESSIONS_F0_W);
                             ui.label(
                                 RichText::new(format!("{:.0}", s.f0))
                                     .font(FontId::monospace(12.5))
@@ -3211,5 +3242,63 @@ fn radial_view(ui: &mut egui::Ui, harm_ema: &[f32], valid: bool) {
             FontId::monospace(8.5),
             ink(120),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pixel tolerance for a column edge: the header and the row reach the same
+    /// x by different arithmetic, so the last float bit may differ.
+    const ALIGN_EPS: f32 = 0.01;
+
+    fn assert_aligned(label: &str, header: f32, row: f32, col: f32) {
+        assert!(
+            (header - row).abs() < ALIGN_EPS,
+            "{label} misaligned at column width {col}: header {header}, row {row}"
+        );
+    }
+
+    /// The Sessions header sits on the panel; each row sits inside a `glass`
+    /// card that insets it on both sides. Two different expressions therefore
+    /// compute what has to be one grid — this pins the invariant they exist to
+    /// satisfy. Before the shared constants the SUBJECT column was 4 px out,
+    /// and nothing said so.
+    #[test]
+    fn sessions_header_and_rows_share_one_column_grid() {
+        for col in [320.0f32, COL_WIDTH, 900.0] {
+            // Header: spans the full content column, padding itself by the
+            // card inset at each end.
+            let head_id_x = GLASS_INSET;
+            let head_subj_x = head_id_x + SESSIONS_ID_W;
+            let head_subj_w = sessions_subject_w(col - head_subj_x, GLASS_INSET);
+            let head_f0_x = head_subj_x + head_subj_w;
+            let head_right = col - GLASS_INSET;
+
+            // Row: the card supplies the inset, so its content box is narrower
+            // and its subject column subtracts one fewer term.
+            let row_w = col - 2.0 * GLASS_INSET;
+            let row_id_x = GLASS_INSET;
+            let row_subj_x = row_id_x + SESSIONS_ID_W;
+            let row_subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
+            let row_f0_x = row_subj_x + row_subj_w;
+            let row_right = GLASS_INSET + row_w;
+
+            assert_aligned("ID left edge", head_id_x, row_id_x, col);
+            assert_aligned("SUBJECT left edge", head_subj_x, row_subj_x, col);
+            assert_aligned("SUBJECT width", head_subj_w, row_subj_w, col);
+            assert_aligned("F0 left edge", head_f0_x, row_f0_x, col);
+            assert_aligned("MATCH right edge", head_right, row_right, col);
+        }
+    }
+
+    /// The flexible column has to survive the narrowest layout the app can be
+    /// shown at; a negative width would invert the allocation.
+    #[test]
+    fn subject_column_stays_positive_at_the_narrowest_layout() {
+        let row_w = 320.0f32 - 2.0 * GLASS_INSET;
+        let subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
+        assert!(subj_w > 0.0, "SUBJECT column collapsed to {subj_w}");
     }
 }
