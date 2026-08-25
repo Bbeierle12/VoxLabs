@@ -1861,20 +1861,46 @@ impl DashboardApp {
                     );
                 }
                 probe::ProbeStatus::Done(r) => {
-                    let (text, color) = match r.unprocessed {
-                        Some(true) => (
-                            "UNPROCESSED: supported — the raw path exists".to_string(),
-                            TEAL_DARK,
-                        ),
-                        Some(false) => (
-                            "UNPROCESSED: not supported — capture is processed (sub-bass and \
-                             envelope cues degraded)"
-                                .to_string(),
-                            AMBER_TEXT,
-                        ),
-                        None => ("UNPROCESSED: query failed".to_string(), ink(150)),
-                    };
-                    ui.label(mono(text).color(color));
+                    // The raw-path answer is a device FACT, and the card
+                    // must read that way. The first phrasing here ("not
+                    // supported — capture is processed") looked like a
+                    // malfunction to fix; it isn't one. No app, permission,
+                    // or setting enables UNPROCESSED — the phone's firmware
+                    // either offers the tuning or it doesn't.
+                    match r.unprocessed {
+                        Some(true) => {
+                            ui.label(
+                                mono("UNPROCESSED: supported — the raw path exists".to_string())
+                                    .color(TEAL_DARK),
+                            );
+                        }
+                        Some(false) => {
+                            ui.label(
+                                mono(
+                                    "raw path (UNPROCESSED): not offered by this device"
+                                        .to_string(),
+                                )
+                                .color(INK),
+                            );
+                            ui.label(
+                                RichText::new(
+                                    "Firmware fact, not a failure — nothing in this app or in \
+                                     settings can enable it. Everything below runs on \
+                                     VOICE_RECOGNITION instead: noise suppression and \
+                                     auto-gain are off by platform default, but response \
+                                     below ~100 Hz is unguaranteed, so the sub-bass and \
+                                     envelope cues stay down-weighted, exactly as the \
+                                     research plan assumed. The spatial and high-band cues \
+                                     are unaffected.",
+                                )
+                                .size(10.5)
+                                .color(ink(140)),
+                            );
+                        }
+                        None => {
+                            ui.label(mono("UNPROCESSED: query failed".to_string()).color(ink(150)));
+                        }
+                    }
                     if r.record_permission == Some(false) {
                         ui.label(
                             mono("microphone permission not granted".to_string())
