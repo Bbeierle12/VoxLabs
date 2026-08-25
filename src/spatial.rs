@@ -619,7 +619,7 @@ fn set_status(s: SpatialStatus) {
 // ─── Android capture thread ─────────────────────────────────────────────────
 
 #[cfg(target_os = "android")]
-pub use capture::{request_shutdown, start_learning};
+pub use capture::{is_running, request_shutdown, start_learning};
 
 #[cfg(target_os = "android")]
 mod capture {
@@ -657,6 +657,14 @@ mod capture {
         SHUTDOWN.store(true, Ordering::Relaxed);
     }
 
+    /// Whether the continuous two-channel capture thread is up. The device
+    /// probe checks this before opening its own recorder: engine + spatial
+    /// + probe is three simultaneous capture streams, and the first field
+    /// failure ("unsupported") came from exactly that collision.
+    pub fn is_running() -> bool {
+        RUNNING.load(Ordering::Relaxed)
+    }
+
     /// User tapped a LEARN chip: start the capture thread if it isn't
     /// running, and queue the requested calibration either way. If a
     /// calibration is already running, the request waits its turn.
@@ -690,6 +698,35 @@ mod capture {
         if env.exception_check() {
             env.exception_clear();
         }
+    }
+
+    /// If a Java exception is pending, clear it and return its toString()
+    /// — "java.lang.UnsupportedOperationException: …" on the card beats a
+    /// bare "JavaException" when diagnosing from a phone screen.
+    fn take_exception_text(env: &mut Env, fallback: String) -> String {
+        let Some(t) = env.exception_occurred() else {
+            return fallback;
+        };
+        env.exception_clear();
+        let text = env
+            .call_method(
+                &t,
+                jni_str!("toString"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .ok()
+            .and_then(|v| v.l().ok())
+            .and_then(|o| {
+                if o.is_null() {
+                    None
+                } else {
+                    let js = unsafe { JString::from_raw(env, o.into_raw()) };
+                    js.try_to_string(env).ok()
+                }
+            });
+        clear_exception(env);
+        text.unwrap_or(fallback)
     }
 
     fn run_capture() -> Result<(), JErr> {
@@ -764,17 +801,28 @@ mod capture {
             false,
         ));
         let mut last = String::from("no configuration attempted");
-        for (source_name, source, mask_name, index_mask) in ladder {
-            match try_build(env, source, index_mask) {
-                Ok(rec) => return Ok((rec, source_name, mask_name)),
-                Err(JErr(e)) => {
-                    clear_exception(env);
-                    last = format!("{source_name} + {mask_name}: {e}");
+        // Two rounds: recorder-open failures are sometimes transient
+        // contention (another stream mid-teardown), and a 300 ms pause is
+        // cheaper than a user-visible failure.
+        for round in 0..2 {
+            for &(source_name, source, mask_name, index_mask) in &ladder {
+                match try_build(env, source, index_mask) {
+                    Ok(rec) => return Ok((rec, source_name, mask_name)),
+                    Err(JErr(e)) => {
+                        last = format!(
+                            "{source_name} + {mask_name}: {}",
+                            take_exception_text(env, e)
+                        );
+                    }
                 }
+            }
+            if round == 0 {
+                log::warn!("recorder ladder failed once ({last}); retrying in 300 ms");
+                std::thread::sleep(std::time::Duration::from_millis(300));
             }
         }
         Err(JErr(format!(
-            "all recorder configurations failed; last: {last}"
+            "all recorder configurations failed twice; last: {last}"
         )))
     }
 
@@ -866,6 +914,13 @@ mod capture {
     }
 
     fn capture_loop(env: &mut Env, activity: &JObject) -> Result<(), JErr> {
+        // If the device probe's one-shot recorder is mid-run, let it finish
+        // rather than fighting it for a capture stream (wait max ~3 s).
+        let mut waited = 0;
+        while crate::device_probe::is_running() && waited < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            waited += 1;
+        }
         let (rec, source, mask) = build_recorder(env, activity)?;
         env.call_method(&rec, jni_str!("startRecording"), jni_sig!("()V"), &[])?;
         let rec_state = env

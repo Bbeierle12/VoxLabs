@@ -168,6 +168,13 @@ fn set_status(s: ProbeStatus) {
     }
 }
 
+/// Whether a probe is currently capturing. The spatial capture thread
+/// waits on this before opening its own recorder — two one-shot streams
+/// colliding is exactly the "unsupported" failure seen in the field.
+pub fn is_running() -> bool {
+    matches!(status(), ProbeStatus::Running)
+}
+
 /// Kick off the probe on a background thread. No-op while one is running.
 /// Android-only: the questions it answers are questions about the Android
 /// capture stack, and the desktop UI never offers it.
@@ -411,6 +418,35 @@ mod android {
         }
     }
 
+    /// If a Java exception is pending, clear it and return its toString()
+    /// — "java.lang.UnsupportedOperationException: …" in a card note beats
+    /// a bare "JavaException" when diagnosing from a phone screen.
+    fn take_exception_text(env: &mut Env, fallback: String) -> String {
+        let Some(t) = env.exception_occurred() else {
+            return fallback;
+        };
+        env.exception_clear();
+        let text = env
+            .call_method(
+                &t,
+                jni_str!("toString"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )
+            .ok()
+            .and_then(|v| v.l().ok())
+            .and_then(|o| {
+                if o.is_null() {
+                    None
+                } else {
+                    let js = unsafe { JString::from_raw(env, o.into_raw()) };
+                    js.try_to_string(env).ok()
+                }
+            });
+        clear_exception(env);
+        text.unwrap_or(fallback)
+    }
+
     fn probe_in_env(env: &mut Env, activity: &JObject) -> ProbeReport {
         let mut notes = Vec::new();
 
@@ -521,31 +557,47 @@ mod android {
             false,
         ));
 
+        // The TV-path capture holds a continuous two-channel recorder. A
+        // third simultaneous stream (engine + spatial + probe) is what the
+        // first field failure came from — skip the test rather than fight,
+        // and say so in plain words. The property + mic inventory above
+        // need no recorder and stay fresh either way.
         let mut capture = None;
-        for (source_name, source, mask_name, index_mask) in attempts {
-            match try_capture(env, source, index_mask, api_level.unwrap_or(0)) {
-                Ok((interleaved, active_mics)) => {
-                    let frames = interleaved.len() / 2;
-                    let mut left = Vec::with_capacity(frames);
-                    let mut right = Vec::with_capacity(frames);
-                    for pair in interleaved.chunks_exact(2) {
-                        left.push(pair[0] as f32 / 32768.0);
-                        right.push(pair[1] as f32 / 32768.0);
+        if crate::spatial::is_running() {
+            capture = Some(CaptureOutcome::Failed(
+                "2-ch test skipped: the TV-path capture is already holding the two-channel \
+                 stream — that stream running IS the stack working, and its health line is \
+                 on the TV PATH card. For a fresh standalone test, restart the app and run \
+                 the probe before learning paths."
+                    .into(),
+            ));
+        }
+        if capture.is_none() {
+            for (source_name, source, mask_name, index_mask) in attempts {
+                match try_capture(env, source, index_mask, api_level.unwrap_or(0)) {
+                    Ok((interleaved, active_mics)) => {
+                        let frames = interleaved.len() / 2;
+                        let mut left = Vec::with_capacity(frames);
+                        let mut right = Vec::with_capacity(frames);
+                        for pair in interleaved.chunks_exact(2) {
+                            left.push(pair[0] as f32 / 32768.0);
+                            right.push(pair[1] as f32 / 32768.0);
+                        }
+                        let stats = analyze_pair(&left, &right, PROBE_SAMPLE_RATE as f32);
+                        capture = Some(CaptureOutcome::Ran(CaptureRun {
+                            source: source_name,
+                            mask: mask_name,
+                            sample_rate: PROBE_SAMPLE_RATE,
+                            frames,
+                            active_mics,
+                            stats,
+                        }));
+                        break;
                     }
-                    let stats = analyze_pair(&left, &right, PROBE_SAMPLE_RATE as f32);
-                    capture = Some(CaptureOutcome::Ran(CaptureRun {
-                        source: source_name,
-                        mask: mask_name,
-                        sample_rate: PROBE_SAMPLE_RATE,
-                        frames,
-                        active_mics,
-                        stats,
-                    }));
-                    break;
-                }
-                Err(JErr(e)) => {
-                    clear_exception(env);
-                    notes.push(format!("{source_name} + {mask_name}: {e}"));
+                    Err(JErr(e)) => {
+                        let detail = take_exception_text(env, e);
+                        notes.push(format!("{source_name} + {mask_name}: {detail}"));
+                    }
                 }
             }
         }
