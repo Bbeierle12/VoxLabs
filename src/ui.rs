@@ -1425,6 +1425,198 @@ impl DashboardApp {
         });
         ui.add_space(12.0);
         self.device_probe_card(ui);
+        ui.add_space(12.0);
+        self.tv_path_card(ui);
+    }
+
+    /// TV PATH card on the Room tab: learn the TV's spatial transfer path
+    /// (the thing about the TV that survives every program — see the room
+    /// calibration's scope note), then show a live 0–1 consistency score:
+    /// how much of the current sound arrives through that path. Copy keeps
+    /// the two-microphone honesty boundary explicit: this is evidence about
+    /// *where sound comes from*, never proof of who made it.
+    fn tv_path_card(&mut self, ui: &mut egui::Ui) {
+        use crate::spatial::{self, SCORE_NOT_TV, SCORE_TV, SpatialStatus};
+        let mono = |s: String| RichText::new(s).font(FontId::monospace(11.0));
+        glass(20.0).show(ui, |ui| {
+            ui.label(
+                RichText::new("TV PATH · SPATIAL")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.add_space(8.0);
+            match spatial::status() {
+                SpatialStatus::Off => {
+                    #[cfg(target_os = "android")]
+                    {
+                        ui.label(
+                            RichText::new(
+                                "Learn where the TV's sound physically comes from — the \
+                                 relative transfer path between the two microphones, which \
+                                 survives any program. Phone in its usual spot, TV PLAYING at \
+                                 normal volume, you silent (~11 s).",
+                            )
+                            .size(12.0)
+                            .color(ink(140)),
+                        );
+                        ui.add_space(8.0);
+                        if probe_chip(ui, "LEARN TV PATH") {
+                            spatial::start_learning();
+                        }
+                    }
+                    #[cfg(not(target_os = "android"))]
+                    ui.label(
+                        RichText::new(
+                            "Android feature — it rides the two-channel capture the device \
+                             probe validated. Learn the TV's spatial path in the phone build.",
+                        )
+                        .size(12.0)
+                        .color(ink(140)),
+                    );
+                }
+                SpatialStatus::Starting => {
+                    ui.label(
+                        RichText::new("starting two-channel capture…")
+                            .size(12.0)
+                            .color(TEAL_DARK),
+                    );
+                }
+                SpatialStatus::Calibrating {
+                    seconds_left,
+                    health,
+                } => {
+                    ui.label(
+                        RichText::new(format!(
+                            "learning — TV on, stay silent · {seconds_left:.0} s left"
+                        ))
+                        .size(12.0)
+                        .color(TEAL_DARK),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "2-ch {} · {} · {} Hz",
+                            health.source, health.mask, health.sample_rate
+                        ))
+                        .size(10.0)
+                        .color(ink(115)),
+                    );
+                }
+                SpatialStatus::Ready {
+                    quality,
+                    band_coverage,
+                    rank_ratio,
+                    two_source_warning,
+                    live,
+                    health,
+                } => {
+                    ui.label(
+                        mono(format!(
+                            "path learned · quality {:.0}% · band coverage {:.0}%",
+                            quality * 100.0,
+                            band_coverage * 100.0
+                        ))
+                        .color(INK),
+                    );
+                    if two_source_warning {
+                        ui.label(
+                            RichText::new(format!(
+                                "more than one source while learning (rank ratio {rank_ratio:.2}) \
+                                 — the path is blurred; RE-LEARN with only the TV audible"
+                            ))
+                            .size(10.5)
+                            .color(AMBER_TEXT),
+                        );
+                    }
+                    ui.add_space(8.0);
+
+                    // Live consistency bar, 0..1, thresholds drawn as ticks.
+                    let (rect, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+                    let track = Rect::from_min_size(
+                        pos2(rect.left(), rect.center().y - 4.0),
+                        vec2(rect.width(), 8.0),
+                    );
+                    ui.painter().rect_filled(track, 4.0, ink(10));
+                    if let Some(ema) = live.ema {
+                        let x = track.left() + ema.clamp(0.0, 1.0) * track.width();
+                        ui.painter().rect_filled(
+                            Rect::from_min_max(track.min, pos2(x, track.bottom())),
+                            4.0,
+                            Color32::from_rgba_unmultiplied(8, 145, 178, 110),
+                        );
+                    }
+                    for t in [SCORE_NOT_TV, SCORE_TV] {
+                        let x = track.left() + t * track.width();
+                        ui.painter().line_segment(
+                            [pos2(x, track.top() - 3.0), pos2(x, track.bottom() + 3.0)],
+                            Stroke::new(1.5, ink(60)),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    let (line, color) = match live.ema {
+                        _ if live.quiet && live.ema.is_none() => {
+                            ("quiet — nothing to score".to_string(), ink(125))
+                        }
+                        Some(v) if v >= SCORE_TV => (
+                            format!("consistency {v:.2} — energy arriving via the TV path"),
+                            CYAN_DEEP,
+                        ),
+                        Some(v) if v <= SCORE_NOT_TV => (
+                            format!("consistency {v:.2} — NOT the TV path (position unknown)"),
+                            TEAL_DARK,
+                        ),
+                        Some(v) => (
+                            format!("consistency {v:.2} — mixed or neither (thresholds {SCORE_NOT_TV} / {SCORE_TV})"),
+                            ink(150),
+                        ),
+                        None => ("no scored frames yet — make some sound".to_string(), ink(125)),
+                    };
+                    ui.label(RichText::new(line).font(FontId::monospace(11.0)).color(color));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "2-ch {} · {} Hz · {} scored frames",
+                            health.source, health.sample_rate, live.scored_frames
+                        ))
+                        .size(10.0)
+                        .color(ink(115)),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Two mics make this evidence, not proof: anything sounding from \
+                             the TV's position matches the path, a stereo soundbar is only \
+                             partly captured by one direction, and moving the phone \
+                             invalidates everything. Per-session — relearn after any move.",
+                        )
+                        .size(10.5)
+                        .color(ink(115)),
+                    );
+                    #[cfg(target_os = "android")]
+                    {
+                        ui.add_space(8.0);
+                        if probe_chip(ui, "RE-LEARN") {
+                            spatial::start_learning();
+                        }
+                    }
+                }
+                SpatialStatus::Failed(e) => {
+                    ui.label(
+                        RichText::new(format!("failed: {e}"))
+                            .size(11.5)
+                            .color(AMBER_TEXT),
+                    );
+                    #[cfg(target_os = "android")]
+                    {
+                        ui.add_space(8.0);
+                        if probe_chip(ui, "RETRY") {
+                            spatial::start_learning();
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// DEVICE card on the Room tab: the capture-stack capability probe.

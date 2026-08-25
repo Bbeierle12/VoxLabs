@@ -20,6 +20,12 @@ thread_local! {
         std::cell::RefCell::new(rustfft::FftPlanner::new());
 }
 
+/// Forward FFT plan from the shared per-thread planner (also used by the
+/// spatial module's two-channel STFT).
+pub(crate) fn fft_forward(n: usize) -> std::sync::Arc<dyn rustfft::Fft<f32>> {
+    FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(n))
+}
+
 /// Solves the Yule-Walker equations using Levinson-Durbin recursion.
 /// Returns the prediction-error polynomial `A(z) = [1, a1, .., ap]`, i.e. the
 /// residual is `e[n] = x[n] + Σ aⱼ x[n-j]`, so the roots of `A(z)` are the

@@ -109,6 +109,10 @@ fn retire_previous_generation() {
     previous.shutdown.store(true, Ordering::Relaxed);
     drop(previous.audio.take());
 
+    // The spatial (TV-path) capture thread holds its own AudioRecord; it
+    // checks this flag every 0.1 s chunk and releases the recorder itself.
+    crate::spatial::request_shutdown();
+
     if let Some(handle) = previous.analysis.take() {
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while !handle.is_finished() && Instant::now() < deadline {

@@ -33,6 +33,11 @@ mod concurrency;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod device_probe;
 mod math;
+// TV-path spatial calibration + live path-consistency scoring. The math is
+// cross-target and unit-tested; the continuous two-channel capture thread
+// is Android-only (same dead-code shape as device_probe on desktop).
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod spatial;
 // Disk persistence for the enrolled reference + session archive. Compiled on
 // all targets (ui uses it); each entry point supplies the store path (or None
 // on web, which has no disk).
