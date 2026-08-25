@@ -1055,12 +1055,16 @@ pub fn a2_a1_db(amps: &[f32]) -> Option<f32> {
 /// feature, used to z-score before comparison so heterogeneous units (Hz vs
 /// dB/oct) contribute on a common scale. Approximate — good enough to weight
 /// the features sensibly, not a calibrated model.
-const VP_STATS: [(f32, f32); 5] = [
+const VP_STATS: [(f32, f32); 6] = [
     (500.0, 150.0),  // F1
     (1500.0, 350.0), // F2
     (2600.0, 400.0), // F3
     (1800.0, 700.0), // centroid
     (-9.0, 4.0),     // tilt dB/oct
+    // VTL, cm. Population stats from Story et al. 2018's adult cohort:
+    // male mean 17.6 (sd 0.89), female 15.6 (sd 1.14) — pooled across the
+    // sexes the spread is dominated by the between-sex gap, hence ~1.4.
+    (16.6, 1.4), // vocal tract length
 ];
 
 /// Build a pitch-invariant voiceprint from a capture's averaged features.
@@ -1075,6 +1079,7 @@ pub fn build_voiceprint(
     formants: Option<[Formant; 3]>,
     profile: &[f32],
     centroid_hz: Option<f32>,
+    vtl_cm: Option<f32>,
 ) -> Voiceprint {
     let mut p = [0.0f32; 16];
     for (slot, &v) in p.iter_mut().zip(profile) {
@@ -1091,6 +1096,7 @@ pub fn build_voiceprint(
         centroid_hz: centroid_hz.unwrap_or(0.0),
         tilt_db_oct: spectral_tilt_db_per_octave(&p),
         profile: p,
+        vtl_cm: vtl_cm.unwrap_or(0.0),
     }
 }
 
@@ -1123,6 +1129,7 @@ pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
         hz(a.formants[2]),
         hz(a.centroid_hz),
         a.tilt_db_oct.filter(|t| t.is_finite()),
+        hz(a.vtl_cm),
     ];
     let b_scalars = [
         hz(b.formants[0]),
@@ -1130,13 +1137,14 @@ pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
         hz(b.formants[2]),
         hz(b.centroid_hz),
         b.tilt_db_oct.filter(|t| t.is_finite()),
+        hz(b.vtl_cm),
     ];
 
     // Scalar part: RMS distance over the z-scored features measured on BOTH
     // sides, renormalized to however many that is.
     let mut sumsq = 0.0f32;
     let mut compared = 0usize;
-    for i in 0..5 {
+    for i in 0..VP_STATS.len() {
         if let (Some(x), Some(y)) = (a_scalars[i], b_scalars[i]) {
             let (_, std) = VP_STATS[i];
             let dz = (x - y) / std;
@@ -1932,7 +1940,12 @@ mod tests {
     #[test]
     fn voiceprint_identical_scores_100() {
         let profile: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let vp = build_voiceprint(Some(fmt3(520.0, 1480.0, 2610.0)), &profile, Some(1750.0));
+        let vp = build_voiceprint(
+            Some(fmt3(520.0, 1480.0, 2610.0)),
+            &profile,
+            Some(1750.0),
+            None,
+        );
         let s = voiceprint_similarity(&vp, &vp).expect("fully measured prints are scorable");
         assert!((s - 100.0).abs() < 0.01, "identical should be 100, got {s}");
     }
@@ -1940,12 +1953,22 @@ mod tests {
     #[test]
     fn voiceprint_different_voice_scores_lower() {
         let prof_a: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let a = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof_a, Some(1700.0));
+        let a = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &prof_a,
+            Some(1700.0),
+            None,
+        );
 
         // A clearly different voice: formants shifted ~2σ, brighter centroid,
         // shallower tilt (via a flatter profile).
         let prof_b: Vec<f32> = (1..=16).map(|k| 1.0 / (k as f32).sqrt()).collect();
-        let b = build_voiceprint(Some(fmt3(760.0, 2150.0, 3300.0)), &prof_b, Some(3200.0));
+        let b = build_voiceprint(
+            Some(fmt3(760.0, 2150.0, 3300.0)),
+            &prof_b,
+            Some(3200.0),
+            None,
+        );
 
         let self_score = voiceprint_similarity(&a, &a).expect("scorable");
         let cross = voiceprint_similarity(&a, &b).expect("scorable");
@@ -1962,10 +1985,10 @@ mod tests {
     #[test]
     fn voiceprint_closer_voice_scores_higher() {
         let prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let ref_vp = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0));
+        let ref_vp = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0), None);
         // Near neighbor (small formant drift) vs far (large drift).
-        let near = build_voiceprint(Some(fmt3(515.0, 1530.0, 2630.0)), &prof, Some(1850.0));
-        let far = build_voiceprint(Some(fmt3(650.0, 1900.0, 3050.0)), &prof, Some(2600.0));
+        let near = build_voiceprint(Some(fmt3(515.0, 1530.0, 2630.0)), &prof, Some(1850.0), None);
+        let far = build_voiceprint(Some(fmt3(650.0, 1900.0, 3050.0)), &prof, Some(2600.0), None);
         let s_near = voiceprint_similarity(&ref_vp, &near).expect("scorable");
         let s_far = voiceprint_similarity(&ref_vp, &far).expect("scorable");
         assert!(
@@ -1980,14 +2003,14 @@ mod tests {
         // Two captures whose formant extraction failed entirely: previously the
         // 0.0 sentinels z-scored as identical (dz = 0) and inflated the match.
         // Now they must score on the remaining features only.
-        let no_formants_a = build_voiceprint(None, &prof, Some(1800.0));
-        let no_formants_b = build_voiceprint(None, &prof, Some(2600.0));
+        let no_formants_a = build_voiceprint(None, &prof, Some(1800.0), None);
+        let no_formants_b = build_voiceprint(None, &prof, Some(2600.0), None);
         let with = voiceprint_similarity(&no_formants_a, &no_formants_b).expect("scorable");
         // The same centroid gap on otherwise-identical fully-measured prints:
         // adding three *matching* formants can only raise the score, so the
         // formantless pair must not out-score it (no free perfect features).
-        let full_a = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0));
-        let full_b = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(2600.0));
+        let full_a = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0), None);
+        let full_b = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(2600.0), None);
         let full = voiceprint_similarity(&full_a, &full_b).expect("scorable");
         assert!(
             with <= full + 0.01,
@@ -1995,7 +2018,7 @@ mod tests {
         );
 
         // A capture missing everything scalar still scores via timbre alone.
-        let timbre_only = build_voiceprint(None, &prof, None);
+        let timbre_only = build_voiceprint(None, &prof, None, None);
         let s = voiceprint_similarity(&timbre_only, &full_a).expect("timbre is comparable");
         assert!((0.0..=100.0).contains(&s));
     }
@@ -2003,9 +2026,14 @@ mod tests {
     #[test]
     fn voiceprint_unscorable_and_nan_safety() {
         // Nothing measured on one side at all: unscorable, not NaN, not 100.
-        let empty = build_voiceprint(None, &[0.0; 16], None);
+        let empty = build_voiceprint(None, &[0.0; 16], None, None);
         let real_prof: Vec<f32> = (1..=16).map(|k| 1.0 / k as f32).collect();
-        let real = build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &real_prof, Some(1800.0));
+        let real = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &real_prof,
+            Some(1800.0),
+            None,
+        );
         assert_eq!(voiceprint_similarity(&empty, &empty), None);
         assert_eq!(voiceprint_similarity(&empty, &real), None);
 
@@ -2034,6 +2062,56 @@ mod tests {
             "F2 {} ~ 1800 Hz",
             formants[1].frequency
         );
+    }
+
+    // ── VTL as an identity feature ──────────────────────────────────────────
+
+    #[test]
+    fn voiceprint_vtl_difference_lowers_the_score() {
+        let prof: [f32; 16] = std::array::from_fn(|i| 1.0 / (i + 1) as f32);
+        let base = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &prof,
+            Some(1800.0),
+            Some(17.5),
+        );
+        let same_vtl = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &prof,
+            Some(1800.0),
+            Some(17.5),
+        );
+        let short_vtl = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &prof,
+            Some(1800.0),
+            Some(14.5),
+        );
+        let s_same = voiceprint_similarity(&base, &same_vtl).unwrap();
+        let s_diff = voiceprint_similarity(&base, &short_vtl).unwrap();
+        assert!((s_same - 100.0).abs() < 0.01, "identical prints: {s_same}");
+        assert!(
+            s_diff < s_same - 2.0,
+            "a 3 cm anatomy difference must cost score: {s_diff} vs {s_same}"
+        );
+    }
+
+    #[test]
+    fn voiceprint_unmeasured_vtl_is_skipped_not_scored() {
+        let prof: [f32; 16] = std::array::from_fn(|i| 1.0 / (i + 1) as f32);
+        let with = build_voiceprint(
+            Some(fmt3(500.0, 1500.0, 2600.0)),
+            &prof,
+            Some(1800.0),
+            Some(17.5),
+        );
+        let without =
+            build_voiceprint(Some(fmt3(500.0, 1500.0, 2600.0)), &prof, Some(1800.0), None);
+        // One side unmeasured: the feature is skipped, so two otherwise
+        // identical prints still score 100 — never penalized, never
+        // rewarded, for a value that does not exist.
+        let s = voiceprint_similarity(&with, &without).unwrap();
+        assert!((s - 100.0).abs() < 0.01, "got {s}");
     }
 
     // ── formant gating & A2/A1 ──────────────────────────────────────────────

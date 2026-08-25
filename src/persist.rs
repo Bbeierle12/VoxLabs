@@ -192,6 +192,7 @@ mod tests {
             centroid_hz: 1830.0,
             tilt_db_oct: Some(-9.4),
             profile: std::array::from_fn(|i| (i as f32 + 1.0) / 16.0),
+            vtl_cm: 17.2,
         };
         let state = ArchiveState {
             enrolled: Some(vp),

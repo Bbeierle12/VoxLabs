@@ -409,11 +409,18 @@ pub struct DashboardApp {
     /// f0 ≤ 350 Hz, off the harmonic suspect bands (`math::formant_grade`).
     /// These reach the session's Detail chips but never the voiceprint.
     rec_formants: Option<[Formant; 3]>,
-    /// Last identity-grade formants (measured at f0 ≤ 200 Hz): the only ones
-    /// the voiceprint may use. Above that, LPC's harmonic attraction makes
-    /// the estimate re-encode pitch, and a similarity score built on it
-    /// compares f0, not voices (Chen, Whalen & Shadle 2019).
-    rec_id_formants: Option<[Formant; 3]>,
+    /// Identity-grade formant frequencies accumulated over the capture, one
+    /// vec per slot (only frames measured at f0 ≤ 200 Hz, off the harmonic
+    /// suspect bands, contribute — above that, LPC's harmonic attraction
+    /// makes the estimate re-encode pitch, and a similarity score built on
+    /// it compares f0, not voices; Chen, Whalen & Shadle 2019). The
+    /// voiceprint takes each slot's *median*: a long-term-distribution-style
+    /// central tendency, robust to the odd stray fit, instead of whatever
+    /// frame happened to be last.
+    rec_id_f_acc: [Vec<f32>; 3],
+    /// Per-frame vocal-tract-length estimates over the capture, identity-
+    /// grade frames only; the voiceprint stores the median.
+    rec_vtl_acc: Vec<f32>,
     /// Display-smoothed live readouts (raw values update every ~46 ms and
     /// flicker as digits). `None` = unvoiced/unknown.
     hnr_disp: Option<f32>,
@@ -534,7 +541,8 @@ impl DashboardApp {
             rec_profile_sum: [0.0; 16],
             rec_profile_n: 0,
             rec_formants: None,
-            rec_id_formants: None,
+            rec_id_f_acc: [Vec::new(), Vec::new(), Vec::new()],
+            rec_vtl_acc: Vec::new(),
             hnr_disp: None,
             h1h2_disp: None,
             jitter_disp: None,
@@ -546,7 +554,13 @@ impl DashboardApp {
             viz_mode: VizMode::Spectrogram,
             tract_q: None,
             tract_live: false,
-            vtl_est_cm: None,
+            // Seed the tract-length estimate from the enrolled reference:
+            // anatomy carries across sessions, so the returning singer's
+            // model starts at their calibration instead of the default.
+            vtl_est_cm: saved
+                .enrolled
+                .map(|vp| vp.vtl_cm)
+                .filter(|&l| l > 0.0 && l.is_finite()),
             spectrum_rx,
             scope_rx,
             sample_rate,
@@ -733,6 +747,24 @@ impl DashboardApp {
                 .map(|f| (f * 10.0).round() / 10.0);
             let mean =
                 |acc: &[f32]| (!acc.is_empty()).then(|| acc.iter().sum::<f32>() / acc.len() as f32);
+            // Median: robust central tendency for the identity features —
+            // one harmonic-attracted stray fit shifts a mean, not a median.
+            let median = |acc: &[f32]| -> Option<f32> {
+                if acc.is_empty() {
+                    return None;
+                }
+                let mut v: Vec<f32> = acc.iter().copied().filter(|x| x.is_finite()).collect();
+                if v.is_empty() {
+                    return None;
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let mid = v.len() / 2;
+                Some(if v.len().is_multiple_of(2) {
+                    0.5 * (v[mid - 1] + v[mid])
+                } else {
+                    v[mid]
+                })
+            };
             // Vibrato/steadiness are contour-level: snapshot the stop-time
             // values rather than averaging per-frame reports.
             let m = self.current_profile.metrics;
@@ -748,11 +780,24 @@ impl DashboardApp {
             // Identity-grade formants only: a capture sung above ~200 Hz f0
             // gets a formant-less voiceprint and is scored on its remaining
             // features (or reads "Unscored") — phase C's skip-and-renormalize
-            // machinery — instead of on harmonic-attraction artifacts.
+            // machinery — instead of on harmonic-attraction artifacts. Each
+            // slot is the capture's *median* over identity-grade frames;
+            // slots with no accepted frames stay at the 0.0 unmeasured
+            // encoding and are skipped by the similarity scorer.
+            let id_formants = {
+                let med: Vec<Option<f32>> = self.rec_id_f_acc.iter().map(|v| median(v)).collect();
+                med.iter().any(Option::is_some).then(|| {
+                    std::array::from_fn(|i| Formant {
+                        frequency: med[i].unwrap_or(0.0),
+                        bandwidth: 0.0,
+                    })
+                })
+            };
             let voiceprint = crate::math::build_voiceprint(
-                self.rec_id_formants,
+                id_formants,
                 &profile,
                 mean(&self.rec_centroid_acc),
+                median(&self.rec_vtl_acc),
             );
 
             // Enrollment gate: only a long-enough, mostly-voiced capture may
@@ -819,7 +864,8 @@ impl DashboardApp {
         self.rec_profile_sum = [0.0; 16];
         self.rec_profile_n = 0;
         self.rec_formants = None;
-        self.rec_id_formants = None;
+        self.rec_id_f_acc = [Vec::new(), Vec::new(), Vec::new()];
+        self.rec_vtl_acc.clear();
         self.result = None;
     }
 
@@ -943,8 +989,17 @@ impl eframe::App for DashboardApp {
                 self.current_profile.formants_f0,
             ) {
                 crate::math::FormantGrade::Identity => {
-                    self.rec_formants = Some(self.current_profile.formants);
-                    self.rec_id_formants = Some(self.current_profile.formants);
+                    let f = self.current_profile.formants;
+                    self.rec_formants = Some(f);
+                    for (acc, fm) in self.rec_id_f_acc.iter_mut().zip(&f) {
+                        if fm.frequency > 0.0 && fm.frequency.is_finite() {
+                            acc.push(fm.frequency);
+                        }
+                    }
+                    if let Some(l) = crate::tract::vtl_from_formants(f[1].frequency, f[2].frequency)
+                    {
+                        self.rec_vtl_acc.push(l);
+                    }
                 }
                 crate::math::FormantGrade::DisplayOnly => {
                     self.rec_formants = Some(self.current_profile.formants);

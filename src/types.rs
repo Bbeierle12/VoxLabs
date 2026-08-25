@@ -34,6 +34,15 @@ pub struct Voiceprint {
     pub tilt_db_oct: Option<f32>,
     /// Mean relative harmonic profile, H1..H16 (normalized to the strongest).
     pub profile: [f32; 16],
+    /// Estimated vocal tract length (cm); `0.0` = unmeasured (same on-disk
+    /// convention as `formants`, and `serde(default)` so archives written
+    /// before this field existed still load). The one *anatomical* identity
+    /// feature: derived from F2/F3 spacing (see `tract::vtl_from_formants`),
+    /// so it survives the f0 gate better than the articulation-shaped
+    /// features around it, but it is still a ±1+ cm estimate, not a
+    /// measurement.
+    #[serde(default)]
+    pub vtl_cm: f32,
 }
 
 /// Per-frame voice-quality metrics. All `None` until the analysis has enough
