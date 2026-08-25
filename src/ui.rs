@@ -62,6 +62,16 @@ const ANALYSIS_STALL_SECS: f64 = 2.0;
 /// analysis thread with a live mic reads well above it.
 const ANALYSIS_STALL_RMS_FLOOR: f32 = 0.002;
 
+/// Tract-view geometry: section index where the 90° velar bend begins and
+/// ends (of 44, glottis to lips), display height, and the smoothing rates
+/// for the mode coefficients (fast enough to track a vowel change, slow
+/// enough not to jitter) and the VTL estimate (anatomy: accumulate slowly).
+const TRACT_BEND_START: usize = 14;
+const TRACT_BEND_END: usize = 30;
+const TRACT_VIEW_H: f32 = 190.0;
+const TRACT_Q_EMA_ALPHA: f32 = 0.2;
+const VTL_EMA_ALPHA: f32 = 0.05;
+
 /// How long a cpal stream error keeps its banner up after the last occurrence.
 /// Stream errors are often transient, so the notice expires on its own rather
 /// than pinning a warning for the rest of the session.
@@ -116,6 +126,8 @@ enum VizMode {
     Radial,
     Spectrogram,
     Scope,
+    /// Story two-mode tract model, inverted live from measured formants.
+    Tract,
 }
 
 /// Waterfall grid: time on X (newest at right), log-frequency on Y.
@@ -417,6 +429,20 @@ pub struct DashboardApp {
 
     /// Which visualization the analyzer card's switchable region shows.
     viz_mode: VizMode,
+    /// Displayed tract-model mode coefficients (q1, q2), display-smoothed.
+    /// `None` until the first successful inversion; the view then draws the
+    /// model's neutral shape, greyed, so the card has context without
+    /// claiming data.
+    tract_q: Option<(f32, f32)>,
+    /// Whether `tract_q` was updated from the current frame. False = the
+    /// shape on screen is HELD from the last frame whose formants passed the
+    /// reliability gate — drawn grey, never animated.
+    tract_live: bool,
+    /// Slow EMA of the per-frame vocal-tract-length estimate, cm. Fed only
+    /// by identity-grade frames (see `tract::vtl_from_formants`); scales the
+    /// model and captions the display. Expect ±1+ cm accuracy, never show
+    /// more than one decimal.
+    vtl_est_cm: Option<f32>,
     /// Spectrogram magnitudes (dB) from the analysis thread; raw waveform for
     /// the oscilloscope; and the mic sample rate for bin→Hz mapping.
     spectrum_rx: Output<Vec<f32>>,
@@ -518,6 +544,9 @@ impl DashboardApp {
             turnover_disp: None,
 
             viz_mode: VizMode::Spectrogram,
+            tract_q: None,
+            tract_live: false,
+            vtl_est_cm: None,
             spectrum_rx,
             scope_rx,
             sample_rate,
@@ -997,6 +1026,7 @@ impl eframe::App for DashboardApp {
             None
         };
         smooth(&mut self.turnover_disp, turnover_raw);
+        self.update_tract_model();
         self.push_wave_sample();
 
         let full = ui.max_rect();
@@ -1044,6 +1074,255 @@ impl eframe::App for DashboardApp {
             });
 
         self.tab_bar(ui.ctx().clone(), now);
+    }
+}
+
+impl DashboardApp {
+    /// Per-frame tract-model update: refresh the VTL estimate from
+    /// identity-grade frames, then invert the current display-grade formants
+    /// to (q1, q2). Anything that fails the reliability gate leaves the
+    /// shape HELD — visibly grey, never animating on unreliable data.
+    fn update_tract_model(&mut self) {
+        self.tract_live = false;
+        let p = &self.current_profile;
+        let grade = crate::math::formant_grade(&p.formants, p.formants_f0);
+        if !p.valid || grade == crate::math::FormantGrade::Reject {
+            return;
+        }
+
+        // VTL: anatomy accumulates slowly, and only from identity-grade
+        // frames — the same rule as the voiceprint, for the same reason.
+        if grade == crate::math::FormantGrade::Identity
+            && let Some(l) =
+                crate::tract::vtl_from_formants(p.formants[1].frequency, p.formants[2].frequency)
+        {
+            self.vtl_est_cm = Some(match self.vtl_est_cm {
+                Some(prev) => prev + VTL_EMA_ALPHA * (l - prev),
+                None => l,
+            });
+        }
+
+        let basis = crate::tract::basis_for_vtl(self.vtl_est_cm);
+        let Some(grid) = tract_grid_for(basis) else {
+            return; // still building, first frames only
+        };
+        // Formants scale ~1/L: map the measured pair into the basis's length
+        // reference before lookup (uniform-scaling approximation; the
+        // oral/pharyngeal cavities actually scale differently — Fant 1966 —
+        // which is part of why this is a model fit, not a measurement).
+        let scale = self.vtl_est_cm.map_or(1.0, |l| l / basis.vtl_cm);
+        let (f1, f2) = (
+            p.formants[0].frequency * scale,
+            p.formants[1].frequency * scale,
+        );
+        if let Some((q1, q2)) = grid.invert(f1, f2) {
+            let (dq1, dq2) = match self.tract_q {
+                Some((a, b)) => (
+                    a + TRACT_Q_EMA_ALPHA * (q1 - a),
+                    b + TRACT_Q_EMA_ALPHA * (q2 - b),
+                ),
+                None => (q1, q2),
+            };
+            self.tract_q = Some((dq1, dq2));
+            self.tract_live = true;
+        }
+    }
+
+    /// 2.5D pseudo-midsagittal tract profile: the model diameter function
+    /// D(i) drawn as a ribbon along a quarter-turn centerline (pharynx
+    /// vertical, glottis at bottom; oral cavity horizontal, lips at right) —
+    /// the same projection Story uses. Teal while LIVE, grey while HELD or
+    /// idle; labeled a model throughout, because that is what it is.
+    fn tract_view(&self, ui: &mut egui::Ui) {
+        let basis = crate::tract::basis_for_vtl(self.vtl_est_cm);
+        let grid_ready = tract_grid_for(basis).is_some();
+
+        let (state, accent) = if !grid_ready {
+            ("CALIBRATING", ink(115))
+        } else if self.tract_live {
+            ("LIVE", TEAL)
+        } else if self.tract_q.is_some() {
+            ("HELD", AMBER_TEXT)
+        } else {
+            ("—", ink(115))
+        };
+
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("TRACT MODEL")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(state)
+                        .font(FontId::monospace(10.5))
+                        .color(accent)
+                        .strong(),
+                );
+            });
+        });
+        ui.add_space(4.0);
+
+        let (rect, _) =
+            ui.allocate_exact_size(vec2(ui.available_width(), TRACT_VIEW_H), Sense::hover());
+        let painter = ui.painter();
+
+        // Neutral shape as idle context (the model's own rest posture — a
+        // labeled model state, not user data); live/held coefficients
+        // otherwise.
+        let (q1, q2) = self.tract_q.unwrap_or((0.0, 0.0));
+        let d = crate::tract::diameters(basis, q1, q2);
+        let n = crate::tract::N_SECTIONS;
+
+        // Quarter-turn centerline. Roughly Story's pseudo-midsagittal split:
+        // lower-pharynx run vertical, a 90° velar bend, oral run horizontal.
+        let margin = 26.0f32;
+        let usable_w = (rect.width() - 2.0 * margin).max(60.0);
+        let usable_h = (rect.height() - 2.0 * margin).max(60.0);
+        // Path budget: BEND_START straight + arc + rest straight. Fit step so
+        // the whole polyline spans the rect.
+        let arc_secs = (TRACT_BEND_END - TRACT_BEND_START) as f32;
+        let horiz_secs = (n - TRACT_BEND_END) as f32;
+        let vert_secs = TRACT_BEND_START as f32;
+        // Extents in step units: height = vert + arc radius contribution,
+        // width = horiz + radius. r = arc_len / (pi/2), arc_len = arc_secs.
+        let r_units = arc_secs / std::f32::consts::FRAC_PI_2;
+        let h_units = vert_secs + r_units;
+        let w_units = horiz_secs + r_units;
+        let step = (usable_h / h_units).min(usable_w / w_units);
+        let origin = pos2(rect.left() + margin, rect.bottom() - margin);
+
+        // Centerline points + unit normals.
+        let mut pts = Vec::with_capacity(n + 1);
+        let mut normals = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let s_units = i as f32;
+            let (x, y, tangent) = if s_units <= vert_secs {
+                (0.0, -s_units, (0.0f32, -1.0f32))
+            } else if s_units <= vert_secs + arc_secs {
+                let a = (s_units - vert_secs) / r_units; // 0..pi/2
+                (
+                    r_units - r_units * a.cos(),
+                    -(vert_secs + r_units * a.sin()),
+                    (a.sin(), -a.cos()),
+                )
+            } else {
+                (
+                    r_units + (s_units - vert_secs - arc_secs),
+                    -(vert_secs + r_units),
+                    (1.0, 0.0),
+                )
+            };
+            pts.push(pos2(origin.x + x * step, origin.y + y * step));
+            // Normal = tangent rotated 90°.
+            normals.push(vec2(-tangent.1, tangent.0));
+        }
+
+        let px_per_cm = step / (basis.vtl_cm / n as f32) * 0.5;
+        let fill = if self.tract_live { teal_a(56) } else { ink(26) };
+        let edge = if self.tract_live {
+            Stroke::new(1.5, TEAL_DARK)
+        } else {
+            Stroke::new(1.2, ink(90))
+        };
+
+        let mut upper = Vec::with_capacity(n + 1);
+        let mut lower = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let di = d[i.min(n - 1)];
+            let w = (di * px_per_cm * 0.5).clamp(1.0, step * 2.6);
+            upper.push(pts[i] + normals[i] * w);
+            lower.push(pts[i] - normals[i] * w);
+        }
+        for i in 0..n {
+            painter.add(Shape::convex_polygon(
+                vec![upper[i], upper[i + 1], lower[i + 1], lower[i]],
+                fill,
+                Stroke::NONE,
+            ));
+        }
+        painter.add(Shape::line(upper, edge));
+        painter.add(Shape::line(lower, edge));
+
+        // End labels.
+        painter.text(
+            pts[0] + vec2(0.0, 12.0),
+            Align2::CENTER_TOP,
+            "glottis",
+            FontId::monospace(8.5),
+            ink(115),
+        );
+        painter.text(
+            pts[n] + vec2(6.0, 0.0),
+            Align2::LEFT_CENTER,
+            "lips",
+            FontId::monospace(8.5),
+            ink(115),
+        );
+
+        // Caption: what this is, and what it is scaled to. Never "your
+        // vocal tract" — see tract_data's honesty boundary.
+        let caption = match self.vtl_est_cm {
+            Some(l) => format!("model tract · est. length ≈ {l:.1} cm"),
+            None => format!("model tract · assumed {:.1} cm", basis.vtl_cm),
+        };
+        painter.text(
+            pos2(rect.center().x, rect.bottom() - 4.0),
+            Align2::CENTER_BOTTOM,
+            caption,
+            FontId::monospace(8.5),
+            ink(115),
+        );
+    }
+}
+
+/// Lazily built inversion grids, one per basis, built off the UI thread on
+/// native (the UI shows CALIBRATING for the first moments of the first
+/// session). On wasm — which has no analysis thread and thus never measures
+/// formants — the build would run inline if ever requested.
+fn tract_grid_for(
+    basis: &'static crate::tract::TractBasis,
+) -> Option<&'static crate::tract::TractGrid> {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static GRID_M: OnceLock<crate::tract::TractGrid> = OnceLock::new();
+    static GRID_F: OnceLock<crate::tract::TractGrid> = OnceLock::new();
+    static BUILDING_M: AtomicBool = AtomicBool::new(false);
+    static BUILDING_F: AtomicBool = AtomicBool::new(false);
+
+    let female = (basis.vtl_cm - 15.53).abs() < 0.1;
+    let (cell, building) = if female {
+        (&GRID_F, &BUILDING_F)
+    } else {
+        (&GRID_M, &BUILDING_M)
+    };
+    if let Some(g) = cell.get() {
+        return Some(g);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if !building.swap(true, Ordering::Relaxed) {
+            std::thread::spawn(move || {
+                let g = crate::tract::TractGrid::build(
+                    basis,
+                    crate::tract::GRID_N,
+                    crate::tract::GRID_N,
+                );
+                let _ = cell.set(g);
+            });
+        }
+        None
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = building;
+        let _ = cell.set(crate::tract::TractGrid::build(
+            basis,
+            crate::tract::GRID_N,
+            crate::tract::GRID_N,
+        ));
+        cell.get()
     }
 }
 
@@ -2073,6 +2352,7 @@ impl DashboardApp {
             (VizMode::Radial, "Radial"),
             (VizMode::Spectrogram, "Spectro"),
             (VizMode::Scope, "Scope"),
+            (VizMode::Tract, "Tract"),
         ];
         let gap = 4.0;
         let seg_w = (ui.available_width() - gap * (modes.len() - 1) as f32) / modes.len() as f32;
@@ -2299,6 +2579,7 @@ impl DashboardApp {
                 VizMode::Radial => radial_view(ui, &self.harm_ema, valid),
                 VizMode::Spectrogram => self.spectrogram_view(ui),
                 VizMode::Scope => self.scope_view(ui, valid, f0),
+                VizMode::Tract => self.tract_view(ui),
             }
 
             // Metrics strip, same pattern as the F0/LEVEL/ELAPSED readouts.

@@ -38,6 +38,10 @@ mod metrics;
 // and Android analysis loops.
 mod spectrogram;
 mod synthesis;
+// Story two-mode vocal tract model: runtime (tract) + published basis data
+// (tract_data). Compiled on all targets — pure math, no threads or I/O.
+mod tract;
+mod tract_data;
 mod types;
 mod ui;
 
