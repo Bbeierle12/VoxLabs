@@ -273,6 +273,9 @@ pub(crate) struct Session {
     id: String,
     subj: String,
     date: String,
+    /// Identity coverage of this capture (see `CaptureResult::coverage_pct`);
+    /// `None` on sessions saved before the statistic existed.
+    coverage_pct: Option<f32>,
     f0: f32,
     /// Similarity vs the enrolled reference; `None` = unscorable (the capture
     /// and reference shared no comparable feature). Older archives stored a
@@ -313,6 +316,11 @@ struct CaptureResult {
     profile: [f32; 16],
     formants: Option<[Formant; 3]>,
     voiceprint: Voiceprint,
+    /// Identity coverage: % of the capture's voiced frames that survived
+    /// every identity gate (f0 ≤ 200 Hz, off harmonic suspect bands,
+    /// SNR ≥ 30 dB). The research-protocol "coverage" statistic: low error
+    /// on 10% of frames is a different claim from low error on 90%.
+    coverage_pct: Option<f32>,
     /// True when no reference was enrolled yet AND this capture passed the
     /// enrollment gate: saving it enrolls it as the reference (shown as
     /// "Reference" rather than a similarity score).
@@ -344,6 +352,10 @@ enum Screen {
     Capture,
     Sessions,
     Detail,
+    /// Room-noise measurement: ambient floor, calibration, persistent tones.
+    /// Everything DETERMINISTIC about the space lives here — fans, HVAC, the
+    /// TV's hardware hum. Program audio is out of scope by design.
+    Room,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -457,6 +469,17 @@ pub struct DashboardApp {
     /// shape on screen is HELD from the last frame whose formants passed the
     /// reliability gate — drawn grey, never animated.
     tract_live: bool,
+    /// Coverage counters, incremented once per FRESH analysis profile (not
+    /// per repaint): frames with any periodicity, frames surviving the
+    /// voicing gates (SNR + hum), and frames meeting every identity bar.
+    /// Session-lifetime; the Room screen reports the ratios.
+    cov_periodic: u32,
+    cov_voiced: u32,
+    cov_identity: u32,
+    /// Same pair scoped to the current recording, for the stored per-capture
+    /// coverage statistic.
+    rec_cov_voiced: u32,
+    rec_cov_identity: u32,
     /// Running articulatory log: (time, q1, q2) samples appended whenever a
     /// frame clears every gate, across the whole session (not only while
     /// recording). Capped ring; ~10 min of continuous fully-gated phonation
@@ -572,6 +595,11 @@ impl DashboardApp {
             viz_mode: VizMode::Spectrogram,
             tract_q: None,
             tract_live: false,
+            cov_periodic: 0,
+            cov_voiced: 0,
+            cov_identity: 0,
+            rec_cov_voiced: 0,
+            rec_cov_identity: 0,
             tract_log: std::collections::VecDeque::new(),
             tract_log_last_t: 0.0,
             // Seed the tract-length estimate from the enrolled reference:
@@ -850,6 +878,8 @@ impl DashboardApp {
                 None
             };
 
+            let coverage_pct = (self.rec_cov_voiced > 0)
+                .then(|| 100.0 * self.rec_cov_identity as f32 / self.rec_cov_voiced as f32);
             self.result = Some(CaptureResult {
                 match_pct,
                 f0,
@@ -864,6 +894,7 @@ impl DashboardApp {
                 profile,
                 formants: self.rec_formants,
                 voiceprint,
+                coverage_pct,
                 is_reference,
                 blocked,
             });
@@ -886,6 +917,8 @@ impl DashboardApp {
         self.rec_formants = None;
         self.rec_id_f_acc = [Vec::new(), Vec::new(), Vec::new()];
         self.rec_vtl_acc.clear();
+        self.rec_cov_voiced = 0;
+        self.rec_cov_identity = 0;
         self.result = None;
     }
 
@@ -933,6 +966,7 @@ impl DashboardApp {
                 centroid_hz: res.centroid_hz,
                 profile: res.profile,
                 formants: res.formants,
+                coverage_pct: res.coverage_pct,
             };
             self.next_session_num += 1;
             self.sessions.insert(0, session);
@@ -992,6 +1026,32 @@ impl eframe::App for DashboardApp {
 
         if self.ui_profile_rx.updated() {
             self.current_profile = *self.ui_profile_rx.read();
+
+            // Coverage accounting, once per analysis frame (repaints arrive
+            // ~3x more often than profiles; counting those would inflate
+            // denominators with duplicates).
+            let p = &self.current_profile;
+            let identity_ok = p.valid
+                && crate::math::formant_grade(&p.formants, p.formants_f0)
+                    == crate::math::FormantGrade::Identity
+                && p.metrics
+                    .snr_db
+                    .is_none_or(|snr| snr >= crate::math::IDENTITY_MIN_SNR_DB);
+            if p.valid || p.metrics.voiced_but_noisy {
+                self.cov_periodic += 1;
+            }
+            if p.valid {
+                self.cov_voiced += 1;
+                if identity_ok {
+                    self.cov_identity += 1;
+                }
+                if matches!(self.rec, RecState::Recording { .. }) {
+                    self.rec_cov_voiced += 1;
+                    if identity_ok {
+                        self.rec_cov_identity += 1;
+                    }
+                }
+            }
         }
         if matches!(self.rec, RecState::Recording { .. }) {
             // Count every recording tick (voiced or not) so the enrollment
@@ -1155,6 +1215,7 @@ impl eframe::App for DashboardApp {
                         Screen::Capture => self.screen_capture(ui, now),
                         Screen::Sessions => self.screen_sessions(ui),
                         Screen::Detail => self.screen_detail(ui),
+                        Screen::Room => self.screen_room(ui),
                     }
                     // Clearance for the floating tab bar.
                     ui.add_space(104.0 + BOTTOM_INSET);
@@ -1166,6 +1227,206 @@ impl eframe::App for DashboardApp {
 }
 
 impl DashboardApp {
+    /// The Room screen: everything DETERMINISTIC about the acoustic space.
+    /// Ambient floor, one-tap calibration, the fingerprinted persistent
+    /// tones (fans, HVAC, mains hum, the TV's *hardware* noise — measured
+    /// with the TV on and muted). Program audio is out of scope on purpose:
+    /// a show's soundtrack is non-stationary, so no profile taken now
+    /// predicts it later. That boundary is a finding, not a limitation to
+    /// apologize for.
+    fn screen_room(&mut self, ui: &mut egui::Ui) {
+        use crate::concurrency::CalibState;
+        self.screen_kicker(ui, "ACOUSTIC ENVIRONMENT", "Room");
+        ui.add_space(16.0);
+
+        // ── Levels: live input against the learned floor ──
+        glass(20.0).show(ui, |ui| {
+            ui.label(
+                RichText::new("LEVELS")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.add_space(8.0);
+
+            let live_rms = self.input_rms();
+            let live_db = 20.0 * live_rms.max(1e-6).log10();
+            let (ambient, _) = self.telemetry.calibration_summary();
+            let floor_db = (self.telemetry.calib_state() == CalibState::Done)
+                .then(|| 20.0 * ambient.max(1e-6).log10());
+            let snr = self.current_profile.metrics.snr_db;
+
+            // Bar from -70 dBFS to 0.
+            const LO: f32 = -70.0;
+            let (rect, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), 16.0), Sense::hover());
+            let track = Rect::from_min_size(
+                pos2(rect.left(), rect.center().y - 4.0),
+                vec2(rect.width(), 8.0),
+            );
+            let to_x = |db: f32| -> f32 {
+                let t = ((db - LO) / -LO).clamp(0.0, 1.0);
+                track.left() + t * track.width()
+            };
+            ui.painter().rect_filled(track, 4.0, ink(10));
+            let live_x = to_x(live_db);
+            ui.painter().rect_filled(
+                Rect::from_min_max(track.min, pos2(live_x, track.bottom())),
+                4.0,
+                teal_a(90),
+            );
+            if let Some(f) = floor_db {
+                let fx = to_x(f);
+                ui.painter().line_segment(
+                    [pos2(fx, track.top() - 3.0), pos2(fx, track.bottom() + 3.0)],
+                    Stroke::new(2.0, AMBER),
+                );
+            }
+            ui.add_space(6.0);
+            let mut line = format!("input {live_db:.0} dBFS");
+            match floor_db {
+                Some(f) => line.push_str(&format!(" · floor {f:.0} dBFS")),
+                None => line.push_str(" · floor: learning passively"),
+            }
+            if let Some(v) = snr {
+                line.push_str(&format!(" · SNR {v:.0} dB"));
+            }
+            ui.label(
+                RichText::new(line)
+                    .font(FontId::monospace(10.5))
+                    .color(ink(150)),
+            );
+        });
+        ui.add_space(12.0);
+
+        // ── Calibration (the interactive card lives here, not on Capture) ──
+        self.room_row(ui);
+        ui.add_space(12.0);
+
+        // ── Persistent tones ──
+        glass(20.0).show(ui, |ui| {
+            ui.label(
+                RichText::new("PERSISTENT TONES")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.add_space(8.0);
+            let (_, hum) = self.telemetry.calibration_summary();
+            match hum {
+                Some((f0, rms)) if self.telemetry.calib_state() == CalibState::Done => {
+                    let db = 20.0 * rms.max(1e-6).log10();
+                    ui.label(
+                        RichText::new(format!(
+                            "{f0:.0} Hz · {db:.0} dBFS — gated (a louder voice on this pitch \
+                             still passes)"
+                        ))
+                        .size(12.0)
+                        .color(INK),
+                    );
+                }
+                _ => {
+                    ui.label(
+                        RichText::new(
+                            "None fingerprinted. Calibrate with the steady sources running — \
+                             fans, HVAC, and the TV powered on but MUTED (that captures its \
+                             hardware hum, the part that persists).",
+                        )
+                        .size(12.0)
+                        .color(ink(140)),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Out of scope by design: TV shows, music, speech from speakers. Program \
+                     audio is non-stationary — no profile taken now predicts what plays \
+                     next. For singing over media, use headphones.",
+                )
+                .size(10.5)
+                .color(ink(115)),
+            );
+        });
+        ui.add_space(12.0);
+
+        // ── Coverage: what the gating costs, measured ──
+        glass(20.0).show(ui, |ui| {
+            ui.label(
+                RichText::new("COVERAGE · THIS SESSION")
+                    .font(FontId::monospace(9.5))
+                    .color(ink(115)),
+            );
+            ui.add_space(8.0);
+            if self.cov_periodic == 0 {
+                ui.label(
+                    RichText::new("No periodic frames yet — sing or speak to accumulate.")
+                        .size(12.0)
+                        .color(ink(140)),
+                );
+            } else {
+                let pct = |n: u32, d: u32| -> f32 {
+                    if d == 0 {
+                        0.0
+                    } else {
+                        100.0 * n as f32 / d as f32
+                    }
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "voiced (SNR + hum gates): {:.0}% of {} periodic frames",
+                        pct(self.cov_voiced, self.cov_periodic),
+                        self.cov_periodic
+                    ))
+                    .font(FontId::monospace(11.0))
+                    .color(INK),
+                );
+                ui.add_space(3.0);
+                ui.label(
+                    RichText::new(format!(
+                        "identity-grade (f0 ≤ 200 Hz · SNR ≥ 30 dB): {:.0}% of voiced",
+                        pct(self.cov_identity, self.cov_voiced)
+                    ))
+                    .font(FontId::monospace(11.0))
+                    .color(INK),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        "A measurement kept at 90% coverage and one kept at 10% are \
+                         different claims — this is the price of every gate, in the open.",
+                    )
+                    .size(10.5)
+                    .color(ink(115)),
+                );
+            }
+        });
+    }
+
+    /// One-line, read-only room status for the Capture screen; the
+    /// interactive calibration card lives on the Room tab.
+    fn room_status_line(&self, ui: &mut egui::Ui) {
+        use crate::concurrency::CalibState;
+        let text = match self.telemetry.calib_state() {
+            CalibState::Done => {
+                let (ambient, hum) = self.telemetry.calibration_summary();
+                let mut t = format!("ROOM · floor {:.0} dBFS", 20.0 * ambient.max(1e-6).log10());
+                if let Some((f0, _)) = hum {
+                    t.push_str(&format!(" · hum {f0:.0} Hz gated"));
+                }
+                if let Some(snr) = self.current_profile.metrics.snr_db {
+                    t.push_str(&format!(" · SNR {snr:.0} dB"));
+                }
+                t
+            }
+            CalibState::Running => "ROOM · calibrating — keep silent".to_string(),
+            _ => "ROOM · uncalibrated — see the Room tab".to_string(),
+        };
+        ui.label(
+            RichText::new(text)
+                .font(FontId::monospace(10.0))
+                .color(ink(125)),
+        );
+    }
+
     /// Room-status row on the Capture screen. Shows what the noise gating
     /// knows (ambient floor, fingerprinted hum, live SNR) and offers the
     /// calibration pass. Copy is deliberate about scope: a *steady* hum can
@@ -2183,9 +2444,9 @@ impl DashboardApp {
         });
         ui.add_space(16.0);
 
-        // Room-calibration row: the app's noise handling made visible and
-        // steerable — floor level, fingerprinted hum, one-tap calibration.
-        self.room_row(ui);
+        // Room status, read-only here — the interactive calibration card
+        // lives on the Room tab.
+        self.room_status_line(ui);
         ui.add_space(10.0);
 
         let recording = matches!(self.rec, RecState::Recording { .. });
@@ -3312,12 +3573,27 @@ impl DashboardApp {
         };
 
         glass(24.0).show(ui, |ui| {
-            ui.label(
-                RichText::new("Acoustic parameters")
-                    .size(14.0)
-                    .color(INK)
-                    .strong(),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Acoustic parameters")
+                        .size(14.0)
+                        .color(INK)
+                        .strong(),
+                );
+                // Identity coverage: how much of this capture's voiced signal
+                // met every identity gate. "—" on pre-statistic sessions.
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let text = match sel.coverage_pct {
+                        Some(c) => format!("id coverage {c:.0}%"),
+                        None => "id coverage —".to_string(),
+                    };
+                    ui.label(
+                        RichText::new(text)
+                            .font(FontId::monospace(9.5))
+                            .color(ink(115)),
+                    );
+                });
+            });
             ui.add_space(4.0);
             for (name, value, reference, dot_color) in &params {
                 ui.add_space(11.0);
@@ -3459,6 +3735,7 @@ impl DashboardApp {
                             for (screen, label) in [
                                 (Screen::Overview, "Overview"),
                                 (Screen::Capture, "Capture"),
+                                (Screen::Room, "Room"),
                                 (Screen::Sessions, "Sessions"),
                             ] {
                                 let active = self.screen == screen
@@ -3478,6 +3755,7 @@ impl DashboardApp {
                                 match screen {
                                     Screen::Overview => grid_glyph(ui.painter(), icon, fg),
                                     Screen::Capture => mic_glyph(ui.painter(), icon, fg, false),
+                                    Screen::Room => room_glyph(ui.painter(), icon, fg),
                                     _ => list_glyph(ui.painter(), icon, fg),
                                 }
                                 // Live-capture dot: recording must stay visible
@@ -3524,6 +3802,20 @@ fn grid_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
     for (x, y) in [(2.5, 2.5), (11.5, 2.5), (2.5, 11.5), (11.5, 11.5)] {
         let r = Rect::from_min_size(pos2(o.x + x * s, o.y + y * s), vec2(6.0 * s, 6.0 * s));
         painter.rect(r, 2.0 * s, Color32::TRANSPARENT, stroke, StrokeKind::Middle);
+    }
+}
+
+/// Room tab glyph: a small level-meter — three bars of rising height.
+fn room_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let w = rect.width() / 5.0;
+    for (i, h_frac) in [0.45f32, 0.75, 1.0].iter().enumerate() {
+        let x = rect.left() + w * (0.5 + i as f32 * 1.6);
+        let h = rect.height() * h_frac;
+        painter.rect_filled(
+            Rect::from_min_size(pos2(x, rect.bottom() - h), vec2(w, h)),
+            1.5,
+            color,
+        );
     }
 }
 
