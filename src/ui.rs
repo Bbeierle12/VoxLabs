@@ -62,13 +62,6 @@ const ANALYSIS_STALL_SECS: f64 = 2.0;
 /// analysis thread with a live mic reads well above it.
 const ANALYSIS_STALL_RMS_FLOOR: f32 = 0.002;
 
-/// Tract-view geometry: section index where the 90° velar bend begins and
-/// ends (of 44, glottis to lips), display height, and the smoothing rates
-/// for the mode coefficients (fast enough to track a vowel change, slow
-/// enough not to jitter) and the VTL estimate (anatomy: accumulate slowly).
-const TRACT_BEND_START: usize = 14;
-const TRACT_BEND_END: usize = 30;
-const TRACT_VIEW_H: f32 = 190.0;
 const TRACT_Q_EMA_ALPHA: f32 = 0.2;
 const VTL_EMA_ALPHA: f32 = 0.05;
 
@@ -138,8 +131,6 @@ enum VizMode {
     Radial,
     Spectrogram,
     Scope,
-    /// Story two-mode tract model, inverted live from measured formants.
-    Tract,
 }
 
 /// Waterfall grid: time on X (newest at right), log-frequency on Y.
@@ -2188,153 +2179,31 @@ impl DashboardApp {
     /// vertical, glottis at bottom; oral cavity horizontal, lips at right) —
     /// the same projection Story uses. Teal while LIVE, grey while HELD or
     /// idle; labeled a model throughout, because that is what it is.
-    fn tract_view(&self, ui: &mut egui::Ui) {
+    /// The tract model's honest display state: what the hero card may
+    /// animate on and what it must admit to. Returns (label, accent, live).
+    fn tract_state(&self) -> (&'static str, Color32, bool) {
         let basis = crate::tract::basis_for_vtl(self.vtl_est_cm);
-        let grid_ready = tract_grid_for(basis).is_some();
-
-        let (state, accent) = if !grid_ready {
-            ("CALIBRATING", ink(115))
+        if tract_grid_for(basis).is_none() {
+            ("CALIBRATING", ink(115), false)
         } else if self.tract_live {
-            ("LIVE", TEAL)
+            ("LIVE", TEAL, true)
         } else if self.current_profile.metrics.voiced_but_noisy {
             // Periodicity present but the room is too loud to measure it
             // honestly: say so, instead of silently holding.
-            ("NOISY", AMBER_TEXT)
+            ("NOISY", AMBER_TEXT, false)
         } else if self.tract_q.is_some() {
-            ("HELD", AMBER_TEXT)
+            ("HELD", AMBER_TEXT, false)
         } else {
-            ("—", ink(115))
-        };
-
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("TRACT MODEL")
-                    .font(FontId::monospace(9.5))
-                    .color(ink(115)),
-            );
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(state)
-                        .font(FontId::monospace(10.5))
-                        .color(accent)
-                        .strong(),
-                );
-            });
-        });
-        ui.add_space(4.0);
-
-        let (rect, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), TRACT_VIEW_H), Sense::hover());
-        let painter = ui.painter();
-
-        // Layout: profile ribbon on the left, the vowel-space log map as a
-        // square on the right, caption strip along the bottom.
-        let caption_h = 16.0;
-        let map_side = (rect.height() - caption_h).min(rect.width() * 0.42);
-        let map = Rect::from_min_size(
-            pos2(rect.right() - map_side, rect.top()),
-            vec2(map_side, map_side),
-        );
-        let rib = Rect::from_min_max(rect.min, pos2(map.left() - 10.0, rect.bottom() - caption_h));
-
-        // Neutral shape as idle context (the model's own rest posture — a
-        // labeled model state, not user data); live/held coefficients
-        // otherwise.
-        let (q1, q2) = self.tract_q.unwrap_or((0.0, 0.0));
-        let d = crate::tract::diameters(basis, q1, q2);
-        let n = crate::tract::N_SECTIONS;
-
-        // Quarter-turn centerline. Roughly Story's pseudo-midsagittal split:
-        // lower-pharynx run vertical, a 90° velar bend, oral run horizontal.
-        let margin = 26.0f32;
-        let usable_w = (rib.width() - 2.0 * margin).max(60.0);
-        let usable_h = (rib.height() - 2.0 * margin).max(60.0);
-        // Path budget: BEND_START straight + arc + rest straight. Fit step so
-        // the whole polyline spans the rect.
-        let arc_secs = (TRACT_BEND_END - TRACT_BEND_START) as f32;
-        let horiz_secs = (n - TRACT_BEND_END) as f32;
-        let vert_secs = TRACT_BEND_START as f32;
-        // Extents in step units: height = vert + arc radius contribution,
-        // width = horiz + radius. r = arc_len / (pi/2), arc_len = arc_secs.
-        let r_units = arc_secs / std::f32::consts::FRAC_PI_2;
-        let h_units = vert_secs + r_units;
-        let w_units = horiz_secs + r_units;
-        let step = (usable_h / h_units).min(usable_w / w_units);
-        let origin = pos2(rib.left() + margin, rib.bottom() - margin);
-
-        // Centerline points + unit normals.
-        let mut pts = Vec::with_capacity(n + 1);
-        let mut normals = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            let s_units = i as f32;
-            let (x, y, tangent) = if s_units <= vert_secs {
-                (0.0, -s_units, (0.0f32, -1.0f32))
-            } else if s_units <= vert_secs + arc_secs {
-                let a = (s_units - vert_secs) / r_units; // 0..pi/2
-                (
-                    r_units - r_units * a.cos(),
-                    -(vert_secs + r_units * a.sin()),
-                    (a.sin(), -a.cos()),
-                )
-            } else {
-                (
-                    r_units + (s_units - vert_secs - arc_secs),
-                    -(vert_secs + r_units),
-                    (1.0, 0.0),
-                )
-            };
-            pts.push(pos2(origin.x + x * step, origin.y + y * step));
-            // Normal = tangent rotated 90°.
-            normals.push(vec2(-tangent.1, tangent.0));
+            ("—", ink(115), false)
         }
+    }
 
-        let px_per_cm = step / (basis.vtl_cm / n as f32) * 0.5;
-        let fill = if self.tract_live { teal_a(56) } else { ink(26) };
-        let edge = if self.tract_live {
-            Stroke::new(1.5, TEAL_DARK)
-        } else {
-            Stroke::new(1.2, ink(90))
-        };
-
-        let mut upper = Vec::with_capacity(n + 1);
-        let mut lower = Vec::with_capacity(n + 1);
-        for i in 0..=n {
-            let di = d[i.min(n - 1)];
-            let w = (di * px_per_cm * 0.5).clamp(1.0, step * 2.6);
-            upper.push(pts[i] + normals[i] * w);
-            lower.push(pts[i] - normals[i] * w);
-        }
-        for i in 0..n {
-            painter.add(Shape::convex_polygon(
-                vec![upper[i], upper[i + 1], lower[i + 1], lower[i]],
-                fill,
-                Stroke::NONE,
-            ));
-        }
-        painter.add(Shape::line(upper, edge));
-        painter.add(Shape::line(lower, edge));
-
-        // End labels.
-        painter.text(
-            pts[0] + vec2(0.0, 12.0),
-            Align2::CENTER_TOP,
-            "glottis",
-            FontId::monospace(8.5),
-            ink(115),
-        );
-        painter.text(
-            pts[n] + vec2(6.0, 0.0),
-            Align2::LEFT_CENTER,
-            "lips",
-            FontId::monospace(8.5),
-            ink(115),
-        );
-
-        // ── Vowel-space log map: the session's articulatory history ──────
-        // Axes are the model's mode coefficients (q1 →, q2 ↑). Every dot is
-        // one fully-gated moment of the singer's session; the trail fades
-        // with age. Anchors are the published Table II vowels — the model's
-        // landmarks, not measurements of this singer.
+    /// Vowel-space log map: the session's articulatory history. Axes are
+    /// the model's mode coefficients (q1 →, q2 ↑). Every dot is one
+    /// fully-gated moment of the singer's session; the trail fades with
+    /// age. Anchors are the published Table II vowels — the model's
+    /// landmarks, not measurements of this singer.
+    fn vowel_map(&self, painter: &egui::Painter, map: Rect) {
         painter.rect(
             map,
             6.0,
@@ -2382,11 +2251,12 @@ impl DashboardApp {
             painter.circle_filled(c, 3.0, TEAL);
             painter.circle_stroke(c, 4.5, Stroke::new(1.0, teal_a(120)));
         }
+    }
 
-        // Caption: what this is, and what it is scaled to. Never "your
-        // vocal tract" — see tract_data's honesty boundary. Log size shows
-        // the data-log nature of the card: it only ever counts fully-gated
-        // moments.
+    /// Caption for the hero card: what the shape is, what it is scaled to,
+    /// and how much history the log holds. Never "your vocal tract" — see
+    /// tract_data's honesty boundary.
+    fn tract_caption(&self, basis: &'static crate::tract::TractBasis) -> String {
         let log_txt = if self.tract_log.is_empty() {
             String::new()
         } else {
@@ -2398,17 +2268,16 @@ impl DashboardApp {
                 (span_s / 60.0).max(0.0)
             )
         };
-        let caption = match self.vtl_est_cm {
-            Some(l) => format!("model tract · est. length ≈ {l:.1} cm{log_txt}"),
-            None => format!("model tract · assumed {:.1} cm{log_txt}", basis.vtl_cm),
-        };
-        painter.text(
-            pos2(rect.center().x, rect.bottom() - 4.0),
-            Align2::CENTER_BOTTOM,
-            caption,
-            FontId::monospace(8.5),
-            ink(115),
-        );
+        match self.vtl_est_cm {
+            Some(l) => format!(
+                "model tract fitted to your formants — not an image of your anatomy · \
+                 est. length ≈ {l:.1} cm{log_txt}"
+            ),
+            None => format!(
+                "model tract at neutral posture · assumed {:.1} cm{log_txt}",
+                basis.vtl_cm
+            ),
+        }
     }
 }
 
@@ -3061,8 +2930,19 @@ impl DashboardApp {
 
         let recording = matches!(self.rec, RecState::Recording { .. });
 
-        // Vocal tract card.
+        // Vocal tract card — THE articulatory model, live. The mesh is the
+        // measured Story area function: the 44 ring diameters are
+        // diameters(basis, q1, q2) from the current formant inversion,
+        // VTL-scaled, and they move only when the frame passed every gate
+        // (the same LIVE/NOISY/HELD/CALIBRATING states as everywhere else).
+        // Before the first measurement the model rests at its neutral
+        // posture — a labeled model state, never fabricated motion.
         glass(24.0).show(ui, |ui| {
+            let basis = crate::tract::basis_for_vtl(self.vtl_est_cm);
+            let (state, accent, live) = self.tract_state();
+            let (q1, q2) = self.tract_q.unwrap_or((0.0, 0.0));
+            let d = crate::tract::diameters(basis, q1, q2);
+
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Vocal tract · articulatory model")
@@ -3070,26 +2950,27 @@ impl DashboardApp {
                         .color(INK)
                         .strong(),
                 );
-                if recording {
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let blink = if (now * 1.0).fract() < 0.5 { 255 } else { 64 };
-                        ui.label(
-                            RichText::new("LIVE")
-                                .font(FontId::monospace(10.0))
-                                .color(CYAN_DEEP),
-                        );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(state)
+                            .font(FontId::monospace(10.0))
+                            .color(accent)
+                            .strong(),
+                    );
+                    if live {
+                        let blink = if now.fract() < 0.5 { 255 } else { 64 };
                         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                         ui.painter().circle_filled(
                             dot.center(),
                             3.0,
                             Color32::from_rgba_unmultiplied(6, 182, 212, blink),
                         );
-                    });
-                }
+                    }
+                });
             });
             let (rect, _) =
                 ui.allocate_exact_size(vec2(ui.available_width(), 236.0), Sense::hover());
-            paint_tract(ui.painter(), rect, (now * 1000.0) as f32, recording);
+            paint_tract(ui.painter(), rect, (now * 1000.0) as f32, live, &d);
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("SAGITTAL MESH · 44 SECTIONS")
@@ -3097,13 +2978,51 @@ impl DashboardApp {
                         .color(ink(107)),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let right = if self.tract_q.is_some() {
+                        "AREA FN · STORY FIT"
+                    } else {
+                        "AREA FN · NEUTRAL"
+                    };
                     ui.label(
-                        RichText::new("AREA FN · MRI FIT")
+                        RichText::new(right)
                             .font(FontId::monospace(9.5))
                             .color(ink(107)),
                     );
                 });
             });
+
+            // The data-log half: vowel-space trail beside the caption. Same
+            // card, not another mode or tab — the model IS the instrument.
+            ui.add_space(8.0);
+            let sep = ui.available_rect_before_wrap();
+            ui.painter().line_segment(
+                [pos2(sep.left(), sep.top()), pos2(sep.right(), sep.top())],
+                Stroke::new(1.0, ink(18)),
+            );
+            ui.add_space(8.0);
+            let map_side = 96.0f32;
+            let (row, _) =
+                ui.allocate_exact_size(vec2(ui.available_width(), map_side), Sense::hover());
+            let map = Rect::from_min_size(row.min, vec2(map_side, map_side));
+            self.vowel_map(ui.painter(), map);
+            let text_left = map.right() + 12.0;
+            ui.painter().text(
+                pos2(text_left, row.top() + 2.0),
+                Align2::LEFT_TOP,
+                "VOWEL SPACE · SESSION LOG",
+                FontId::monospace(9.5),
+                ink(115),
+            );
+            // Caption wrapped into the remaining width.
+            let caption = self.tract_caption(basis);
+            let galley = ui.painter().layout(
+                caption,
+                FontId::monospace(9.0),
+                ink(125),
+                (row.right() - text_left).max(60.0),
+            );
+            ui.painter()
+                .galley(pos2(text_left, row.top() + 20.0), galley, ink(125));
         });
         ui.add_space(12.0);
 
@@ -3492,7 +3411,6 @@ impl DashboardApp {
             (VizMode::Radial, "Radial"),
             (VizMode::Spectrogram, "Spectro"),
             (VizMode::Scope, "Scope"),
-            (VizMode::Tract, "Tract"),
         ];
         let gap = 4.0;
         let seg_w = (ui.available_width() - gap * (modes.len() - 1) as f32) / modes.len() as f32;
@@ -3719,7 +3637,6 @@ impl DashboardApp {
                 VizMode::Radial => radial_view(ui, &self.harm_ema, valid),
                 VizMode::Spectrogram => self.spectrogram_view(ui),
                 VizMode::Scope => self.scope_view(ui, valid, f0),
-                VizMode::Tract => self.tract_view(ui),
             }
 
             // Metrics strip, same pattern as the F0/LEVEL/ELAPSED readouts.
@@ -4450,9 +4367,17 @@ fn list_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// bent centerline (pharynx up, bend at the velum, oral cavity forward),
 /// rotated around Y and projected with a simple perspective divide. While
 /// recording, the area function ripples. Direct port of the JS `drawTract`.
-fn paint_tract(painter: &egui::Painter, rect: Rect, time_ms: f32, rec: bool) {
-    const N: usize = 44;
+/// The hero mesh: the measured Story area function as a rotating sagittal
+/// wireframe. `d` is the 44-section diameter profile (cm) from the live
+/// (q1, q2) inversion — the rings ARE the data; the only animation is the
+/// slow view rotation. `live` picks the ink: teal when the current frame
+/// passed every gate, grey when the shape is held.
+fn paint_tract(painter: &egui::Painter, rect: Rect, time_ms: f32, live: bool, d: &[f32]) {
+    const N: usize = crate::tract::N_SECTIONS;
     const M: usize = 18;
+    /// Ring radius scale: Story diameters run ~0.3–4.5 cm; 8.5 px/cm keeps
+    /// the widest section near the footprint the card was designed around.
+    const PX_PER_CM: f32 = 8.5;
     let ang = 0.55 + time_ms * 0.000_32;
     let (cos_a, sin_a) = (ang.cos(), ang.sin());
     let (w, h) = (rect.width(), rect.height());
@@ -4491,18 +4416,10 @@ fn paint_tract(painter: &egui::Painter, rect: Rect, time_ms: f32, rec: bool) {
             ty = 0.0;
         }
 
-        // Area-function radius, rippling while recording.
-        let mut r = 10.5 + 7.0 * (s * std::f32::consts::PI).sin() + 3.0 * (s * 6.3 + 1.7).sin();
-        if s > 0.9 {
-            r *= 1.0 - (s - 0.9) * 3.2;
-        }
-        if s < 0.06 {
-            r *= 0.55 + s * 7.0;
-        }
-        if rec {
-            r += 2.2 * (time_ms * 0.012 + s * 9.0).sin() + 1.2 * (time_ms * 0.027 + s * 17.0).sin();
-        }
-        r = r.max(4.0);
+        // Measured area-function radius: section i's diameter, in pixels.
+        // No synthetic ripple — when the model is LIVE the motion comes
+        // from the data itself (the q EMA refreshes every gated frame).
+        let r = (d[i.min(d.len().saturating_sub(1))] * 0.5 * PX_PER_CM).max(2.0);
 
         let (nx, ny) = (-ty, tx);
         let (mx, my) = (px - 40.0, py - 46.0);
@@ -4526,12 +4443,27 @@ fn paint_tract(painter: &egui::Painter, rect: Rect, time_ms: f32, rec: bool) {
         });
     }
 
+    // State ink: teal/cyan when the shape is measured-live, neutral grey
+    // when held — the same convention as every other gated readout.
+    let (long_rgb, ring_rgb, emph_rgb) = if live {
+        (
+            (8u8, 145u8, 178u8),
+            (8u8, 145u8, 178u8),
+            (13u8, 148u8, 136u8),
+        )
+    } else {
+        ((11u8, 43u8, 49u8), (11u8, 43u8, 49u8), (11u8, 43u8, 49u8))
+    };
+
     // Longitudinal lines (every 3rd meridian).
     for j in (0..M).step_by(3) {
         let points: Vec<Pos2> = rings.iter().map(|r| pos2(r.pts[j].0, r.pts[j].1)).collect();
         painter.add(Shape::line(
             points,
-            Stroke::new(1.0, Color32::from_rgba_unmultiplied(8, 145, 178, 46)),
+            Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(long_rgb.0, long_rgb.1, long_rgb.2, 46),
+            ),
         ));
     }
 
@@ -4552,16 +4484,21 @@ fn paint_tract(painter: &egui::Painter, rect: Rect, time_ms: f32, rec: bool) {
         let (color, width) = if emph {
             (
                 Color32::from_rgba_unmultiplied(
-                    13,
-                    148,
-                    136,
+                    emph_rgb.0,
+                    emph_rgb.1,
+                    emph_rgb.2,
                     (((alpha + 0.22).min(1.0)) * 255.0) as u8,
                 ),
                 1.5,
             )
         } else {
             (
-                Color32::from_rgba_unmultiplied(8, 145, 178, (alpha * 255.0) as u8),
+                Color32::from_rgba_unmultiplied(
+                    ring_rgb.0,
+                    ring_rgb.1,
+                    ring_rgb.2,
+                    (alpha * 255.0) as u8,
+                ),
                 1.0,
             )
         };
