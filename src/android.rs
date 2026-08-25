@@ -310,6 +310,8 @@ fn cpu_analysis_loop(
     let mut contour = crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32);
     // Scrolling-spectrogram STFT, mirroring the desktop path.
     let mut spectrogram = crate::spectrogram::Spectrogram::new();
+    // Ambient-floor tracker for the SNR voicing gate (see math::NoiseFloor).
+    let mut noise_floor = math::NoiseFloor::new();
     let mut timer = FrameTimer::new(sample_rate);
 
     loop {
@@ -332,10 +334,25 @@ fn cpu_analysis_loop(
 
             // --- Pitch (f0): pure-CPU YIN ---
             let pitch = math::yin_pitch(frame, sample_rate);
-            let (f0, voiced) = match pitch {
+            let (f0, yin_voiced) = match pitch {
                 Some(p) if p.confidence > 0.4 && (50.0..=1000.0).contains(&p.f0) => (p.f0, true),
                 _ => (0.0, false),
             };
+
+            // SNR voicing gate, mirroring the desktop path: periodicity
+            // alone is not voice — a YIN-voiced frame must also clear the
+            // learned ambient floor by VOICED_MIN_SNR_DB or it is demoted
+            // to unvoiced here, protecting every downstream consumer at one
+            // point. The floor learns from unvoiced frames only.
+            let rms = math::frame_rms(frame);
+            let snr_db = noise_floor.snr_db(rms);
+            let snr_ok = snr_db.is_none_or(|s| s >= math::VOICED_MIN_SNR_DB);
+            let voiced = yin_voiced && snr_ok;
+            let voiced_but_noisy = yin_voiced && !snr_ok;
+            if !yin_voiced {
+                noise_floor.push_unvoiced(rms);
+            }
+            let f0 = if voiced { f0 } else { 0.0 };
 
             // --- Formants via LPC on a decimated signal (voiced frames only) ---
             if voiced {
@@ -392,6 +409,8 @@ fn cpu_analysis_loop(
                 } else {
                     None
                 },
+                snr_db,
+                voiced_but_noisy,
             };
 
             let profile = VocalProfile {

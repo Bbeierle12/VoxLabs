@@ -257,6 +257,9 @@ pub struct AnalysisEngine {
     last_formants: [Formant; 3],
     /// f0 of the frame `last_formants` was measured on (0.0 = never).
     last_formants_f0: f32,
+    /// Ambient-floor tracker for the SNR voicing gate; learns from unvoiced
+    /// frames only (see `math::NoiseFloor` for why).
+    noise_floor: crate::math::NoiseFloor,
     /// f0-contour tracker for vibrato/steadiness. Lazily built on the first
     /// frame because the contour rate depends on the mic sample rate.
     contour: Option<crate::metrics::F0Contour>,
@@ -286,6 +289,7 @@ impl AnalysisEngine {
             ui_profile_tx,
             last_formants: DEFAULT_FORMANTS,
             last_formants_f0: 0.0,
+            noise_floor: crate::math::NoiseFloor::new(),
             contour: None,
             spectrogram: None,
             spectrum_tx,
@@ -318,10 +322,27 @@ impl AnalysisEngine {
                 crate::math::yin_pitch(audio_in, sample_rate)
             }
         };
-        let (f0, voiced) = match pitch {
+        let (f0, yin_voiced) = match pitch {
             Some(p) if p.confidence > 0.4 && (50.0..=1000.0).contains(&p.f0) => (p.f0, true),
             _ => (0.0, false),
         };
+
+        // SNR voicing gate: periodicity alone is not voice. A YIN-voiced
+        // frame that fails to clear the learned ambient floor by
+        // VOICED_MIN_SNR_DB is demoted to unvoiced — every downstream
+        // measure (harmonics, metrics, formants, identity accumulation)
+        // inherits the protection at this single point. The floor learns
+        // only from unvoiced frames, so sustained singing can never teach
+        // the tracker that the voice is "ambience".
+        let rms = crate::math::frame_rms(audio_in);
+        let snr_db = self.noise_floor.snr_db(rms);
+        let snr_ok = snr_db.is_none_or(|s| s >= crate::math::VOICED_MIN_SNR_DB);
+        let voiced = yin_voiced && snr_ok;
+        let voiced_but_noisy = yin_voiced && !snr_ok;
+        if !yin_voiced {
+            self.noise_floor.push_unvoiced(rms);
+        }
+        let (f0, _) = if voiced { (f0, true) } else { (0.0, false) };
 
         // --- Formants via LPC on a formant-band-decimated signal ---
         // Only analyzed on voiced frames; the last good set is held otherwise
@@ -393,6 +414,8 @@ impl AnalysisEngine {
             } else {
                 None
             },
+            snr_db,
+            voiced_but_noisy,
         };
 
         let profile = VocalProfile {

@@ -67,6 +67,15 @@ pub struct VoiceMetrics {
     /// Spectral centroid (Hz): full-spectrum power-weighted mean frequency,
     /// driving the Dark..Brilliant brightness classification.
     pub centroid_hz: Option<f32>,
+    /// Frame SNR against the learned ambient floor (dB); `None` while the
+    /// floor tracker warms up. A frame property, present on unvoiced frames
+    /// too — it describes the room as much as the voice.
+    pub snr_db: Option<f32>,
+    /// True when YIN found periodicity but the frame failed the SNR gate
+    /// (`math::VOICED_MIN_SNR_DB`) and was demoted to unvoiced: there IS a
+    /// periodic source, but the ambience is too loud to measure it honestly.
+    /// Lets the UI say NOISY instead of showing nothing.
+    pub voiced_but_noisy: bool,
 }
 
 pub const MAX_PARTIALS: usize = 32;

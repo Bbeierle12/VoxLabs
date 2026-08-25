@@ -72,6 +72,14 @@ const TRACT_VIEW_H: f32 = 190.0;
 const TRACT_Q_EMA_ALPHA: f32 = 0.2;
 const VTL_EMA_ALPHA: f32 = 0.05;
 
+/// Articulatory-log ring: capacity and decimation. 4096 samples at one per
+/// 150 ms is ~10 minutes of continuous fully-gated phonation; a fixed cap
+/// keeps a day-long session's memory bounded.
+const TRACT_LOG_CAP: usize = 4096;
+const TRACT_LOG_MIN_DT: f64 = 0.15;
+/// Trail dots drawn in the vowel map (newest of the log; older ones fade).
+const TRACT_MAP_TRAIL: usize = 240;
+
 /// How long a cpal stream error keeps its banner up after the last occurrence.
 /// Stream errors are often transient, so the notice expires on its own rather
 /// than pinning a warning for the rest of the session.
@@ -445,6 +453,12 @@ pub struct DashboardApp {
     /// shape on screen is HELD from the last frame whose formants passed the
     /// reliability gate — drawn grey, never animated.
     tract_live: bool,
+    /// Running articulatory log: (time, q1, q2) samples appended whenever a
+    /// frame clears every gate, across the whole session (not only while
+    /// recording). Capped ring; ~10 min of continuous fully-gated phonation
+    /// at the decimated rate. In-memory only for now.
+    tract_log: std::collections::VecDeque<(f64, f32, f32)>,
+    tract_log_last_t: f64,
     /// Slow EMA of the per-frame vocal-tract-length estimate, cm. Fed only
     /// by identity-grade frames (see `tract::vtl_from_formants`); scales the
     /// model and captions the display. Expect ±1+ cm accuracy, never show
@@ -554,6 +568,8 @@ impl DashboardApp {
             viz_mode: VizMode::Spectrogram,
             tract_q: None,
             tract_live: false,
+            tract_log: std::collections::VecDeque::new(),
+            tract_log_last_t: 0.0,
             // Seed the tract-length estimate from the enrolled reference:
             // anatomy carries across sessions, so the returning singer's
             // model starts at their calibration instead of the default.
@@ -991,14 +1007,27 @@ impl eframe::App for DashboardApp {
                 crate::math::FormantGrade::Identity => {
                     let f = self.current_profile.formants;
                     self.rec_formants = Some(f);
-                    for (acc, fm) in self.rec_id_f_acc.iter_mut().zip(&f) {
-                        if fm.frequency > 0.0 && fm.frequency.is_finite() {
-                            acc.push(fm.frequency);
+                    // Identity data additionally demands measurement-grade
+                    // SNR (ASHA's ≥30 dB; math::IDENTITY_MIN_SNR_DB): a
+                    // frame can be clean enough to show and still too
+                    // noise-contaminated to become part of who the app
+                    // thinks this singer is.
+                    let id_snr_ok = self
+                        .current_profile
+                        .metrics
+                        .snr_db
+                        .is_none_or(|snr| snr >= crate::math::IDENTITY_MIN_SNR_DB);
+                    if id_snr_ok {
+                        for (acc, fm) in self.rec_id_f_acc.iter_mut().zip(&f) {
+                            if fm.frequency > 0.0 && fm.frequency.is_finite() {
+                                acc.push(fm.frequency);
+                            }
                         }
-                    }
-                    if let Some(l) = crate::tract::vtl_from_formants(f[1].frequency, f[2].frequency)
-                    {
-                        self.rec_vtl_acc.push(l);
+                        if let Some(l) =
+                            crate::tract::vtl_from_formants(f[1].frequency, f[2].frequency)
+                        {
+                            self.rec_vtl_acc.push(l);
+                        }
                     }
                 }
                 crate::math::FormantGrade::DisplayOnly => {
@@ -1081,7 +1110,7 @@ impl eframe::App for DashboardApp {
             None
         };
         smooth(&mut self.turnover_disp, turnover_raw);
-        self.update_tract_model();
+        self.update_tract_model(now);
         self.push_wave_sample();
 
         let full = ui.max_rect();
@@ -1137,7 +1166,7 @@ impl DashboardApp {
     /// identity-grade frames, then invert the current display-grade formants
     /// to (q1, q2). Anything that fails the reliability gate leaves the
     /// shape HELD — visibly grey, never animating on unreliable data.
-    fn update_tract_model(&mut self) {
+    fn update_tract_model(&mut self, now: f64) {
         self.tract_live = false;
         let p = &self.current_profile;
         let grade = crate::math::formant_grade(&p.formants, p.formants_f0);
@@ -1180,6 +1209,18 @@ impl DashboardApp {
             };
             self.tract_q = Some((dq1, dq2));
             self.tract_live = true;
+
+            // The articulatory log: one sample whenever a frame clears every
+            // gate (voiced, SNR over floor, formant grade, in vowel space),
+            // decimated so a session-length log stays small. Nothing that
+            // failed a gate is ever logged — the log's value IS the gating.
+            if now - self.tract_log_last_t >= TRACT_LOG_MIN_DT {
+                self.tract_log_last_t = now;
+                if self.tract_log.len() == TRACT_LOG_CAP {
+                    self.tract_log.pop_front();
+                }
+                self.tract_log.push_back((now, dq1, dq2));
+            }
         }
     }
 
@@ -1196,6 +1237,10 @@ impl DashboardApp {
             ("CALIBRATING", ink(115))
         } else if self.tract_live {
             ("LIVE", TEAL)
+        } else if self.current_profile.metrics.voiced_but_noisy {
+            // Periodicity present but the room is too loud to measure it
+            // honestly: say so, instead of silently holding.
+            ("NOISY", AMBER_TEXT)
         } else if self.tract_q.is_some() {
             ("HELD", AMBER_TEXT)
         } else {
@@ -1223,6 +1268,16 @@ impl DashboardApp {
             ui.allocate_exact_size(vec2(ui.available_width(), TRACT_VIEW_H), Sense::hover());
         let painter = ui.painter();
 
+        // Layout: profile ribbon on the left, the vowel-space log map as a
+        // square on the right, caption strip along the bottom.
+        let caption_h = 16.0;
+        let map_side = (rect.height() - caption_h).min(rect.width() * 0.42);
+        let map = Rect::from_min_size(
+            pos2(rect.right() - map_side, rect.top()),
+            vec2(map_side, map_side),
+        );
+        let rib = Rect::from_min_max(rect.min, pos2(map.left() - 10.0, rect.bottom() - caption_h));
+
         // Neutral shape as idle context (the model's own rest posture — a
         // labeled model state, not user data); live/held coefficients
         // otherwise.
@@ -1233,8 +1288,8 @@ impl DashboardApp {
         // Quarter-turn centerline. Roughly Story's pseudo-midsagittal split:
         // lower-pharynx run vertical, a 90° velar bend, oral run horizontal.
         let margin = 26.0f32;
-        let usable_w = (rect.width() - 2.0 * margin).max(60.0);
-        let usable_h = (rect.height() - 2.0 * margin).max(60.0);
+        let usable_w = (rib.width() - 2.0 * margin).max(60.0);
+        let usable_h = (rib.height() - 2.0 * margin).max(60.0);
         // Path budget: BEND_START straight + arc + rest straight. Fit step so
         // the whole polyline spans the rect.
         let arc_secs = (TRACT_BEND_END - TRACT_BEND_START) as f32;
@@ -1246,7 +1301,7 @@ impl DashboardApp {
         let h_units = vert_secs + r_units;
         let w_units = horiz_secs + r_units;
         let step = (usable_h / h_units).min(usable_w / w_units);
-        let origin = pos2(rect.left() + margin, rect.bottom() - margin);
+        let origin = pos2(rib.left() + margin, rib.bottom() - margin);
 
         // Centerline points + unit normals.
         let mut pts = Vec::with_capacity(n + 1);
@@ -1316,11 +1371,77 @@ impl DashboardApp {
             ink(115),
         );
 
+        // ── Vowel-space log map: the session's articulatory history ──────
+        // Axes are the model's mode coefficients (q1 →, q2 ↑). Every dot is
+        // one fully-gated moment of the singer's session; the trail fades
+        // with age. Anchors are the published Table II vowels — the model's
+        // landmarks, not measurements of this singer.
+        painter.rect(
+            map,
+            6.0,
+            white(120),
+            Stroke::new(1.0, ink(28)),
+            StrokeKind::Inside,
+        );
+        let to_map = |q1: f32, q2: f32| -> Pos2 {
+            let tx = (q1 - crate::tract::Q1_MIN) / (crate::tract::Q1_MAX - crate::tract::Q1_MIN);
+            let ty = (q2 - crate::tract::Q2_MIN) / (crate::tract::Q2_MAX - crate::tract::Q2_MIN);
+            pos2(
+                map.left() + tx.clamp(0.0, 1.0) * map.width(),
+                map.bottom() - ty.clamp(0.0, 1.0) * map.height(),
+            )
+        };
+        // Zero-axes, faint.
+        let z = to_map(0.0, 0.0);
+        painter.line_segment(
+            [pos2(map.left(), z.y), pos2(map.right(), z.y)],
+            Stroke::new(0.5, ink(18)),
+        );
+        painter.line_segment(
+            [pos2(z.x, map.top()), pos2(z.x, map.bottom())],
+            Stroke::new(0.5, ink(18)),
+        );
+        for (name, vq1, vq2) in crate::tract::VOWEL_ANCHORS {
+            painter.text(
+                to_map(vq1, vq2),
+                Align2::CENTER_CENTER,
+                name,
+                FontId::monospace(9.0),
+                ink(96),
+            );
+        }
+        let trail_n = self.tract_log.len().min(TRACT_MAP_TRAIL);
+        for (age, &(_, lq1, lq2)) in self.tract_log.iter().rev().take(trail_n).enumerate() {
+            // Newest opaque, oldest nearly gone.
+            let a = (200.0 * (1.0 - age as f32 / trail_n as f32)).max(14.0) as u8;
+            painter.circle_filled(to_map(lq1, lq2), 1.6, teal_a(a));
+        }
+        if self.tract_live
+            && let Some((cq1, cq2)) = self.tract_q
+        {
+            let c = to_map(cq1, cq2);
+            painter.circle_filled(c, 3.0, TEAL);
+            painter.circle_stroke(c, 4.5, Stroke::new(1.0, teal_a(120)));
+        }
+
         // Caption: what this is, and what it is scaled to. Never "your
-        // vocal tract" — see tract_data's honesty boundary.
+        // vocal tract" — see tract_data's honesty boundary. Log size shows
+        // the data-log nature of the card: it only ever counts fully-gated
+        // moments.
+        let log_txt = if self.tract_log.is_empty() {
+            String::new()
+        } else {
+            let span_s = self.tract_log.back().map(|b| b.0).unwrap_or(0.0)
+                - self.tract_log.front().map(|f| f.0).unwrap_or(0.0);
+            format!(
+                " · log {} pts / {:.0} min",
+                self.tract_log.len(),
+                (span_s / 60.0).max(0.0)
+            )
+        };
         let caption = match self.vtl_est_cm {
-            Some(l) => format!("model tract · est. length ≈ {l:.1} cm"),
-            None => format!("model tract · assumed {:.1} cm", basis.vtl_cm),
+            Some(l) => format!("model tract · est. length ≈ {l:.1} cm{log_txt}"),
+            None => format!("model tract · assumed {:.1} cm{log_txt}", basis.vtl_cm),
         };
         painter.text(
             pos2(rect.center().x, rect.bottom() - 4.0),

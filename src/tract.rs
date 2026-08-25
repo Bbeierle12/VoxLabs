@@ -11,6 +11,17 @@ use crate::tract_data::{
     SPEED_OF_SOUND_CM_S,
 };
 
+/// Corner-vowel anchors for display, from Story 2018 Table II — the model's
+/// own landmarks (one speaker's vowels), drawn as context in the log map,
+/// never as targets for this singer.
+pub const VOWEL_ANCHORS: [(&str, f32, f32); 5] = [
+    ("i", -5.10, 0.88),
+    ("æ", 0.66, 2.22),
+    ("ɑ", 3.86, 1.35),
+    ("o", 0.00, -2.69),
+    ("u", -3.48, -1.70),
+];
+
 /// Published (q1, q2) span (Story 2018, Table II: q1 in [-5.10, 3.86], q2 in
 /// [-2.69, 2.22]) plus margin, so the grid covers the whole vowel space
 /// without extrapolating far beyond what the PCA saw.

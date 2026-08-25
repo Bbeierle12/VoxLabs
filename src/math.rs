@@ -956,6 +956,113 @@ pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'stati
     }
 }
 
+// ── Ambient noise floor & SNR gating ─────────────────────────────────────────
+
+/// Minimum frame-over-floor SNR (dB) for a YIN-voiced frame to count as
+/// voice at all. Below this, whatever periodicity YIN found is riding on
+/// ambience loud enough to corrupt every harmonic measure taken from the
+/// frame, so the frame is demoted to unvoiced. Engineering floor; the
+/// measurement-grade threshold below is the cited one.
+pub const VOICED_MIN_SNR_DB: f32 = 15.0;
+
+/// Minimum SNR (dB) for a frame to contribute *identity* data (voiceprint
+/// formants, VTL). The ASHA instrumental-assessment protocol (Patel et al.
+/// 2018, AJSLP 27:887) specifies at least 30 dB signal-to-noise for
+/// measurement-grade voice recording; frames below it may still display,
+/// but must not become part of who the app thinks the singer is.
+pub const IDENTITY_MIN_SNR_DB: f32 = 30.0;
+
+/// Ring capacity for ambient-floor tracking, in unvoiced frames (~6 s of
+/// non-phonation time at the ~21.5 Hz frame rate).
+const NOISE_RING_LEN: usize = 128;
+
+/// Minimum unvoiced frames observed before the floor is trusted (~1.5 s).
+/// Until then `snr_db` reports `None` and nothing is gated — a quiet room
+/// must not lock the app out while the tracker warms up.
+const NOISE_RING_MIN: usize = 32;
+
+/// Percentile of the ring taken as the floor. Low, so breaths, consonants
+/// and other loud-but-unvoiced moments of real speech do not drag the
+/// "ambient" estimate up toward the voice itself.
+const NOISE_FLOOR_PERCENTILE: f32 = 0.10;
+
+/// Ambient-noise floor tracker.
+///
+/// Learns the room from frames the pitch detector calls *unvoiced* — never
+/// from voiced frames, so a long sustained note cannot teach the tracker
+/// that singing is "ambience" and then gate the singer off mid-phrase. The
+/// floor is a low percentile of recent unvoiced frame RMS, which rides out
+/// the loud unvoiced moments (breaths, fricatives) that are part of real
+/// phonation.
+///
+/// Honest limitation, stated once here for every consumer: this separates
+/// voice from *aperiodic* ambience (fans, HVAC, traffic). A loud periodic
+/// source — music, a TV voice — passes YIN and IS the analyzed signal; no
+/// floor tracker can tell the app which periodic source is the user. The
+/// app analyzes the dominant periodic source at the microphone, and its UI
+/// copy must never claim otherwise.
+pub struct NoiseFloor {
+    ring: [f32; NOISE_RING_LEN],
+    len: usize,
+    head: usize,
+}
+
+impl Default for NoiseFloor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NoiseFloor {
+    pub fn new() -> Self {
+        Self {
+            ring: [0.0; NOISE_RING_LEN],
+            len: 0,
+            head: 0,
+        }
+    }
+
+    /// Feed one unvoiced frame's RMS. Voiced frames must NOT be pushed.
+    pub fn push_unvoiced(&mut self, rms: f32) {
+        if !(rms.is_finite() && rms >= 0.0) {
+            return;
+        }
+        self.ring[self.head] = rms;
+        self.head = (self.head + 1) % NOISE_RING_LEN;
+        self.len = (self.len + 1).min(NOISE_RING_LEN);
+    }
+
+    /// Current floor estimate (linear RMS), once enough ambience is seen.
+    pub fn floor(&self) -> Option<f32> {
+        if self.len < NOISE_RING_MIN {
+            return None;
+        }
+        let mut v: Vec<f32> = self.ring[..self.len].to_vec();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((self.len as f32 * NOISE_FLOOR_PERCENTILE) as usize).min(self.len - 1);
+        Some(v[idx])
+    }
+
+    /// SNR of a frame against the learned floor, dB. `None` while warming
+    /// up. A silent floor (true digital silence) reports a large finite SNR
+    /// rather than infinity.
+    pub fn snr_db(&self, frame_rms: f32) -> Option<f32> {
+        let floor = self.floor()?;
+        if !(frame_rms.is_finite() && frame_rms > 0.0) {
+            return Some(0.0);
+        }
+        Some(20.0 * (frame_rms / floor.max(1e-7)).log10())
+    }
+}
+
+/// RMS of one analysis frame.
+pub fn frame_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|x| x * x).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
 // ── Formant reliability gating ───────────────────────────────────────────────
 
 /// Above this f0, formant estimates are excluded from identity features (the
@@ -2061,6 +2168,67 @@ mod tests {
             (formants[1].frequency - 1800.0).abs() < 30.0,
             "F2 {} ~ 1800 Hz",
             formants[1].frequency
+        );
+    }
+
+    // ── noise floor & SNR gating ────────────────────────────────────────────
+
+    #[test]
+    fn noise_floor_warms_up_before_reporting() {
+        let mut nf = NoiseFloor::new();
+        assert!(nf.snr_db(0.1).is_none(), "must not gate before warmup");
+        for _ in 0..31 {
+            nf.push_unvoiced(0.001);
+        }
+        assert!(nf.snr_db(0.1).is_none());
+        nf.push_unvoiced(0.001);
+        let snr = nf.snr_db(0.1).expect("warmed up");
+        assert!(
+            (snr - 40.0).abs() < 1.0,
+            "0.1 over 0.001 floor = 40 dB, got {snr}"
+        );
+    }
+
+    #[test]
+    fn noise_floor_ignores_loud_unvoiced_outliers() {
+        // Real speech's breaths and fricatives are loud but unvoiced; the
+        // low percentile must keep them out of the ambient estimate.
+        let mut nf = NoiseFloor::new();
+        for i in 0..128 {
+            // 1 in 4 frames is a "breath" 20x the ambience.
+            nf.push_unvoiced(if i % 4 == 0 { 0.02 } else { 0.001 });
+        }
+        let floor = nf.floor().unwrap();
+        assert!(floor < 0.002, "floor {floor} dragged up by outliers");
+    }
+
+    #[test]
+    fn noise_floor_tracks_a_step_up_in_ambience() {
+        let mut nf = NoiseFloor::new();
+        for _ in 0..128 {
+            nf.push_unvoiced(0.001);
+        }
+        // Air conditioner switches on: ambience jumps 10x.
+        for _ in 0..128 {
+            nf.push_unvoiced(0.01);
+        }
+        let floor = nf.floor().unwrap();
+        assert!(floor > 0.008, "floor {floor} failed to track the new room");
+        // A frame that cleared the old room by 40 dB now clears by ~20.
+        let snr = nf.snr_db(0.1).unwrap();
+        assert!((snr - 20.0).abs() < 1.5, "got {snr}");
+    }
+
+    #[test]
+    fn frame_rms_basics() {
+        assert_eq!(frame_rms(&[]), 0.0);
+        let s: Vec<f32> = (0..1000)
+            .map(|i| (2.0 * PI * 100.0 * i as f32 / 8000.0).sin())
+            .collect();
+        let r = frame_rms(&s);
+        assert!(
+            (r - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.01,
+            "sine RMS {r}"
         );
     }
 
