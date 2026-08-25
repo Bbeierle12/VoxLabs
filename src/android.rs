@@ -312,6 +312,9 @@ fn cpu_analysis_loop(
     let mut spectrogram = crate::spectrogram::Spectrogram::new();
     // Ambient-floor tracker for the SNR voicing gate (see math::NoiseFloor).
     let mut noise_floor = math::NoiseFloor::new();
+    // Room calibration state, mirroring the desktop engine.
+    let mut calibrator = math::RoomCalibrator::new();
+    let mut room_interferer: Option<math::Interferer> = None;
     let mut timer = FrameTimer::new(sample_rate);
 
     loop {
@@ -345,10 +348,41 @@ fn cpu_analysis_loop(
             // to unvoiced here, protecting every downstream consumer at one
             // point. The floor learns from unvoiced frames only.
             let rms = math::frame_rms(frame);
+
+            // Room calibration pass, mirroring the desktop engine.
+            let (calibrating, calib_done) = telemetry.take_calibration_frame();
+            if calibrating {
+                calibrator.push(rms, yin_voiced.then_some(f0));
+                if calib_done {
+                    match calibrator.finish() {
+                        Ok(cal) => {
+                            noise_floor.seed(cal.ambient_rms);
+                            room_interferer = cal.interferer;
+                            telemetry.set_calibration_result(Some((
+                                cal.ambient_rms,
+                                cal.interferer.map(|i| (i.f0_hz, i.rms)),
+                            )));
+                            log::info!(
+                                "room calibrated: ambient rms {:.5}, interferer {:?}",
+                                cal.ambient_rms,
+                                cal.interferer
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("room calibration failed: {e:?}");
+                            telemetry.set_calibration_result(None);
+                        }
+                    }
+                    calibrator = math::RoomCalibrator::new();
+                }
+            }
+
             let snr_db = noise_floor.snr_db(rms);
             let snr_ok = snr_db.is_none_or(|s| s >= math::VOICED_MIN_SNR_DB);
-            let voiced = yin_voiced && snr_ok;
-            let voiced_but_noisy = yin_voiced && !snr_ok;
+            // Calibrated-interferer gate (see the desktop engine's comment).
+            let hum = room_interferer.is_some_and(|i| math::interferer_match(f0, rms, &i));
+            let voiced = yin_voiced && snr_ok && !hum;
+            let voiced_but_noisy = yin_voiced && (!snr_ok || hum);
             if !yin_voiced {
                 noise_floor.push_unvoiced(rms);
             }

@@ -260,6 +260,13 @@ pub struct AnalysisEngine {
     /// Ambient-floor tracker for the SNR voicing gate; learns from unvoiced
     /// frames only (see `math::NoiseFloor` for why).
     noise_floor: crate::math::NoiseFloor,
+    /// Accumulates an armed room-calibration pass (see `math::RoomCalibrator`).
+    calibrator: crate::math::RoomCalibrator,
+    /// Stationary periodic interferer fingerprinted by the last calibration
+    /// (mains hum, fan) — detections matching it are demoted to unvoiced.
+    room_interferer: Option<crate::math::Interferer>,
+    /// Calibration control plane + heartbeat.
+    telemetry: std::sync::Arc<crate::concurrency::Telemetry>,
     /// f0-contour tracker for vibrato/steadiness. Lazily built on the first
     /// frame because the contour rate depends on the mic sample rate.
     contour: Option<crate::metrics::F0Contour>,
@@ -281,6 +288,7 @@ impl AnalysisEngine {
         ui_profile_tx: Input<VocalProfile>,
         spectrum_tx: Input<Vec<f32>>,
         scope_tx: Input<Vec<f32>>,
+        telemetry: std::sync::Arc<crate::concurrency::Telemetry>,
     ) -> anyhow::Result<Self> {
         let gpu = GpuYin::new().await?;
         Ok(Self {
@@ -290,6 +298,9 @@ impl AnalysisEngine {
             last_formants: DEFAULT_FORMANTS,
             last_formants_f0: 0.0,
             noise_floor: crate::math::NoiseFloor::new(),
+            calibrator: crate::math::RoomCalibrator::new(),
+            room_interferer: None,
+            telemetry,
             contour: None,
             spectrogram: None,
             spectrum_tx,
@@ -335,10 +346,45 @@ impl AnalysisEngine {
         // only from unvoiced frames, so sustained singing can never teach
         // the tracker that the voice is "ambience".
         let rms = crate::math::frame_rms(audio_in);
+
+        // Room calibration: while a pass is armed, this frame is a sample of
+        // "the room" — RMS plus whatever periodicity YIN saw, pre-gating.
+        let (calibrating, calib_done) = self.telemetry.take_calibration_frame();
+        if calibrating {
+            self.calibrator.push(rms, yin_voiced.then_some(f0));
+            if calib_done {
+                match self.calibrator.finish() {
+                    Ok(cal) => {
+                        self.noise_floor.seed(cal.ambient_rms);
+                        self.room_interferer = cal.interferer;
+                        self.telemetry.set_calibration_result(Some((
+                            cal.ambient_rms,
+                            cal.interferer.map(|i| (i.f0_hz, i.rms)),
+                        )));
+                        log::info!(
+                            "room calibrated: ambient rms {:.5}, interferer {:?}",
+                            cal.ambient_rms,
+                            cal.interferer
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("room calibration failed: {e:?}");
+                        self.telemetry.set_calibration_result(None);
+                    }
+                }
+                self.calibrator = crate::math::RoomCalibrator::new();
+            }
+        }
+
         let snr_db = self.noise_floor.snr_db(rms);
         let snr_ok = snr_db.is_none_or(|s| s >= crate::math::VOICED_MIN_SNR_DB);
-        let voiced = yin_voiced && snr_ok;
-        let voiced_but_noisy = yin_voiced && !snr_ok;
+        // Calibrated-interferer gate: a detection at the fingerprinted hum's
+        // pitch, at a level the hum accounts for, is the hum — not voice.
+        let hum = self
+            .room_interferer
+            .is_some_and(|i| crate::math::interferer_match(f0, rms, &i));
+        let voiced = yin_voiced && snr_ok && !hum;
+        let voiced_but_noisy = yin_voiced && (!snr_ok || hum);
         if !yin_voiced {
             self.noise_floor.push_unvoiced(rms);
         }

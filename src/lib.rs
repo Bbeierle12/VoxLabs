@@ -109,6 +109,7 @@ pub fn run() -> anyhow::Result<()> {
             ui_profile_tx,
             spectrum_tx,
             scope_tx,
+            telemetry.clone(),
         )) {
             Ok(engine) => engine,
             Err(e) => {

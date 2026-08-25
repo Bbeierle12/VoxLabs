@@ -72,6 +72,10 @@ const TRACT_VIEW_H: f32 = 190.0;
 const TRACT_Q_EMA_ALPHA: f32 = 0.2;
 const VTL_EMA_ALPHA: f32 = 0.05;
 
+/// Approximate seconds per analysis frame (2048 samples at ~44.1–48 kHz),
+/// for the calibration progress readout only — cosmetic, not used in DSP.
+const ANALYSIS_FRAME_SECS_APPROX: f32 = 0.046;
+
 /// Articulatory-log ring: capacity and decimation. 4096 samples at one per
 /// 150 ms is ~10 minutes of continuous fully-gated phonation; a fixed cap
 /// keeps a day-long session's memory bounded.
@@ -1162,6 +1166,90 @@ impl eframe::App for DashboardApp {
 }
 
 impl DashboardApp {
+    /// Room-status row on the Capture screen. Shows what the noise gating
+    /// knows (ambient floor, fingerprinted hum, live SNR) and offers the
+    /// calibration pass. Copy is deliberate about scope: a *steady* hum can
+    /// be fingerprinted; a TV or music cannot (non-stationary), and the row
+    /// never claims otherwise.
+    fn room_row(&mut self, ui: &mut egui::Ui) {
+        use crate::concurrency::CalibState;
+        let state = self.telemetry.calib_state();
+        let live_snr = self.current_profile.metrics.snr_db;
+
+        glass(16.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("ROOM")
+                        .font(FontId::monospace(9.5))
+                        .color(ink(115)),
+                );
+                ui.add_space(8.0);
+
+                let status = match state {
+                    CalibState::Idle => "uncalibrated · floor learns passively".to_string(),
+                    CalibState::Running => {
+                        let secs =
+                            self.telemetry.calib_frames_left() as f32 * ANALYSIS_FRAME_SECS_APPROX;
+                        format!("listening — keep silent · {secs:.1} s")
+                    }
+                    CalibState::Done => {
+                        let (ambient, hum) = self.telemetry.calibration_summary();
+                        let floor_db = 20.0 * ambient.max(1e-7).log10();
+                        let mut t = format!("floor {floor_db:.0} dBFS");
+                        if let Some((f0, _)) = hum {
+                            t.push_str(&format!(" · hum @ {f0:.0} Hz gated"));
+                        }
+                        if let Some(snr) = live_snr {
+                            t.push_str(&format!(" · SNR {snr:.0} dB"));
+                        }
+                        t
+                    }
+                    CalibState::FailedVoice => "heard a voice — retry in silence".to_string(),
+                };
+                let status_color = match state {
+                    CalibState::FailedVoice => AMBER_TEXT,
+                    CalibState::Running => TEAL_DARK,
+                    _ => ink(150),
+                };
+                ui.label(RichText::new(status).size(11.5).color(status_color));
+
+                if state != CalibState::Running {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let label = if state == CalibState::Done {
+                            "RECALIBRATE"
+                        } else {
+                            "CALIBRATE"
+                        };
+                        let font = FontId::monospace(9.5);
+                        let galley =
+                            ui.painter()
+                                .layout_no_wrap(label.into(), font.clone(), TEAL_DARK);
+                        let size = vec2(galley.size().x + 20.0, 24.0);
+                        let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        ui.painter().rect(
+                            rect,
+                            12.0,
+                            teal_a(26),
+                            Stroke::new(1.0, teal_a(64)),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            rect.center(),
+                            Align2::CENTER_CENTER,
+                            label,
+                            font,
+                            TEAL_DARK,
+                        );
+                        if resp.clicked() {
+                            self.telemetry.start_calibration(crate::math::CALIB_FRAMES);
+                        }
+                    });
+                }
+            });
+        });
+    }
+
     /// Per-frame tract-model update: refresh the VTL estimate from
     /// identity-grade frames, then invert the current display-grade formants
     /// to (q1, q2). Anything that fails the reliability gate leaves the
@@ -2094,6 +2182,11 @@ impl DashboardApp {
             });
         });
         ui.add_space(16.0);
+
+        // Room-calibration row: the app's noise handling made visible and
+        // steerable — floor level, fingerprinted hum, one-tap calibration.
+        self.room_row(ui);
+        ui.add_space(10.0);
 
         let recording = matches!(self.rec, RecState::Recording { .. });
 

@@ -5,6 +5,29 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use triple_buffer::{Input, Output, TripleBuffer};
 
+/// Room-calibration lifecycle, one atomic byte in [`Telemetry`]. The UI
+/// requests a pass; the analysis thread runs it and reports back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum CalibState {
+    Idle = 0,
+    Running = 1,
+    Done = 2,
+    /// A voice (or TV) talked during the pass — discarded, retry in silence.
+    FailedVoice = 3,
+}
+
+impl CalibState {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::Running,
+            2 => Self::Done,
+            3 => Self::FailedVoice,
+            _ => Self::Idle,
+        }
+    }
+}
+
 /// Liveness of the analysis thread, as seen by the UI.
 ///
 /// The analysis path runs on its own thread and publishes through lock-free
@@ -64,6 +87,15 @@ pub struct Telemetry {
     /// *error*: there is no stream. Without this the UI sits in SEARCHING
     /// forever and the only explanation is a logcat line the user cannot see.
     audio_unavailable: CachePadded<AtomicBool>,
+    /// Room-calibration control plane: frames still to collect (UI arms it,
+    /// the analysis loop drains it), lifecycle state, and the result summary
+    /// (RMS values as f32 bits; interferer f0 in Hz, 0 = none). Relaxed
+    /// throughout — control flags, nothing ordered behind them.
+    calib_frames_left: CachePadded<AtomicU32>,
+    calib_state: CachePadded<AtomicU8>,
+    calib_ambient_rms: CachePadded<AtomicU32>,
+    calib_interferer_f0: CachePadded<AtomicU32>,
+    calib_interferer_rms: CachePadded<AtomicU32>,
 }
 
 impl Telemetry {
@@ -77,7 +109,70 @@ impl Telemetry {
             input_stream_errors: CachePadded::new(AtomicU32::new(0)),
             output_stream_errors: CachePadded::new(AtomicU32::new(0)),
             audio_unavailable: CachePadded::new(AtomicBool::new(false)),
+            calib_frames_left: CachePadded::new(AtomicU32::new(0)),
+            calib_state: CachePadded::new(AtomicU8::new(CalibState::Idle as u8)),
+            calib_ambient_rms: CachePadded::new(AtomicU32::new(0)),
+            calib_interferer_f0: CachePadded::new(AtomicU32::new(0)),
+            calib_interferer_rms: CachePadded::new(AtomicU32::new(0)),
         }
+    }
+
+    /// UI: arm a calibration pass of `frames` analysis frames.
+    pub fn start_calibration(&self, frames: u32) {
+        self.calib_frames_left.store(frames, Ordering::Relaxed);
+        self.calib_state
+            .store(CalibState::Running as u8, Ordering::Relaxed);
+    }
+
+    /// Analysis loop: claim the next frame of an armed pass. Returns true
+    /// while calibration frames remain (this frame is part of the pass) and
+    /// whether it was the final one.
+    pub fn take_calibration_frame(&self) -> (bool, bool) {
+        let prev = self
+            .calib_frames_left
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1))
+            .unwrap_or(0);
+        (prev > 0, prev == 1)
+    }
+
+    pub fn calib_state(&self) -> CalibState {
+        CalibState::from_u8(self.calib_state.load(Ordering::Relaxed))
+    }
+
+    pub fn calib_frames_left(&self) -> u32 {
+        self.calib_frames_left.load(Ordering::Relaxed)
+    }
+
+    /// Analysis loop: publish a finished pass (or its failure).
+    pub fn set_calibration_result(
+        &self,
+        result: Option<(f32, Option<(f32, f32)>)>, // (ambient_rms, (f0, rms))
+    ) {
+        match result {
+            Some((ambient, interferer)) => {
+                self.calib_ambient_rms
+                    .store(ambient.to_bits(), Ordering::Relaxed);
+                let (f0, irms) = interferer.unwrap_or((0.0, 0.0));
+                self.calib_interferer_f0
+                    .store(f0.to_bits(), Ordering::Relaxed);
+                self.calib_interferer_rms
+                    .store(irms.to_bits(), Ordering::Relaxed);
+                self.calib_state
+                    .store(CalibState::Done as u8, Ordering::Relaxed);
+            }
+            None => {
+                self.calib_state
+                    .store(CalibState::FailedVoice as u8, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// UI: the published summary — (ambient RMS, interferer (f0 Hz, RMS)).
+    pub fn calibration_summary(&self) -> (f32, Option<(f32, f32)>) {
+        let ambient = f32::from_bits(self.calib_ambient_rms.load(Ordering::Relaxed));
+        let f0 = f32::from_bits(self.calib_interferer_f0.load(Ordering::Relaxed));
+        let irms = f32::from_bits(self.calib_interferer_rms.load(Ordering::Relaxed));
+        (ambient, (f0 > 0.0).then_some((f0, irms)))
     }
 
     /// Whether the audio engine failed to start. Set once at startup by

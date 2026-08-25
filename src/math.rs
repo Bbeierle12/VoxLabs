@@ -1022,6 +1022,18 @@ impl NoiseFloor {
         }
     }
 
+    /// Seed the tracker from a calibration pass: the whole ring takes the
+    /// measured ambient level, so SNR gating is available immediately with
+    /// no passive warmup, and later unvoiced frames adapt it as usual.
+    pub fn seed(&mut self, ambient_rms: f32) {
+        if !(ambient_rms.is_finite() && ambient_rms >= 0.0) {
+            return;
+        }
+        self.ring = [ambient_rms; NOISE_RING_LEN];
+        self.len = NOISE_RING_LEN;
+        self.head = 0;
+    }
+
     /// Feed one unvoiced frame's RMS. Voiced frames must NOT be pushed.
     pub fn push_unvoiced(&mut self, rms: f32) {
         if !(rms.is_finite() && rms >= 0.0) {
@@ -1053,6 +1065,159 @@ impl NoiseFloor {
         }
         Some(20.0 * (frame_rms / floor.max(1e-7)).log10())
     }
+}
+
+/// Frames in one room-calibration pass (~4.6 s at the ~21.5 Hz frame rate):
+/// long enough for a stable spectrum-level and hum-pitch estimate, short
+/// enough that "keep quiet for five seconds" is a reasonable ask. The
+/// clinical practice this mirrors — record the room before the voice — is
+/// part of the same ASHA protocol as the 30 dB SNR requirement.
+pub const CALIB_FRAMES: u32 = 100;
+
+/// Fractional f0 tolerance for matching a live detection against the
+/// calibrated interferer (±4%, roughly ±:two thirds of a semitone — wide
+/// enough for hum drift, far narrower than typical vibrato excursions).
+const INTERFERER_F0_TOL: f32 = 0.04;
+
+/// A frame whose RMS exceeds the calibrated interferer's level by this many
+/// dB is treated as the singer, even at the interferer's pitch: the gate
+/// must never forbid singing a note the refrigerator also hums.
+const INTERFERER_LEVEL_MARGIN_DB: f32 = 10.0;
+
+/// Voiced fraction of the calibration window above which an *unstable*
+/// pitch means a voice (or TV) was talking during calibration — fail rather
+/// than fingerprint speech as "the room".
+const CALIB_VOICED_FAIL_FRACTION: f32 = 0.3;
+/// Voiced fraction above which a *stable* pitch is a real periodic
+/// interferer worth fingerprinting (mains hum, fan blade-pass).
+const CALIB_INTERFERER_MIN_FRACTION: f32 = 0.15;
+/// Relative f0 standard deviation separating machine hum (very stable)
+/// from anything vocal (wanders far more, even when trying not to).
+const CALIB_STABLE_REL_STD: f32 = 0.02;
+
+/// A stationary periodic interferer fingerprinted during calibration: the
+/// pitch YIN keeps finding in the "silent" room, and how loud it is.
+#[derive(Clone, Copy, Debug)]
+pub struct Interferer {
+    pub f0_hz: f32,
+    pub rms: f32,
+}
+
+/// One room-calibration result: the ambient floor, and the periodic
+/// interferer if the room has one.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomCalibration {
+    /// Median frame RMS over the calibration window — the room's level with
+    /// everything in it (fan, hum, HVAC) running.
+    pub ambient_rms: f32,
+    pub interferer: Option<Interferer>,
+}
+
+/// Why a calibration pass was rejected.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CalibrationFailure {
+    /// Periodicity with a wandering pitch — someone was talking or singing.
+    /// Fingerprinting that as "the room" would teach the app to reject the
+    /// user, so the pass is discarded instead.
+    VoiceDetected,
+    /// Not enough frames accumulated (engine restarted mid-pass).
+    TooShort,
+}
+
+/// Accumulates one calibration pass frame by frame on the analysis thread.
+///
+/// What this can and cannot learn, stated once for every consumer: a
+/// *stationary* source — fan, mains hum, HVAC — has a spectrum and pitch
+/// now that predict its spectrum and pitch later, so fingerprinting works.
+/// A *non-stationary* periodic source (TV, music) does not; calibrating
+/// with one playing still raises the floor honestly, but no fingerprint
+/// taken now can identify what it plays next. UI copy must not promise TV
+/// rejection.
+#[derive(Default)]
+pub struct RoomCalibrator {
+    rms: Vec<f32>,
+    voiced_f0: Vec<f32>,
+    frames: u32,
+}
+
+impl RoomCalibrator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one frame: its RMS, and its YIN pitch if YIN called it periodic
+    /// (pre-SNR-gate — calibration wants to see exactly what YIN sees).
+    pub fn push(&mut self, rms: f32, yin_f0: Option<f32>) {
+        if rms.is_finite() && rms >= 0.0 {
+            self.rms.push(rms);
+        }
+        if let Some(f0) = yin_f0
+            && f0.is_finite()
+            && f0 > 0.0
+        {
+            self.voiced_f0.push(f0);
+        }
+        self.frames += 1;
+    }
+
+    /// Finalizes the pass. Stable periodicity becomes a fingerprinted
+    /// interferer; unstable periodicity fails the pass as a voice.
+    pub fn finish(&self) -> Result<RoomCalibration, CalibrationFailure> {
+        if self.frames < CALIB_FRAMES / 2 || self.rms.is_empty() {
+            return Err(CalibrationFailure::TooShort);
+        }
+        let mut sorted = self.rms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let ambient_rms = sorted[sorted.len() / 2];
+
+        let voiced_frac = self.voiced_f0.len() as f32 / self.frames as f32;
+        let interferer = if self.voiced_f0.is_empty() {
+            None
+        } else {
+            let n = self.voiced_f0.len() as f32;
+            let mean = self.voiced_f0.iter().sum::<f32>() / n;
+            let var = self
+                .voiced_f0
+                .iter()
+                .map(|f| (f - mean) * (f - mean))
+                .sum::<f32>()
+                / n;
+            let rel_std = var.sqrt() / mean.max(1.0);
+            if rel_std < CALIB_STABLE_REL_STD {
+                // Machine-stable pitch: a fingerprintable hum, if present
+                // often enough to matter.
+                (voiced_frac >= CALIB_INTERFERER_MIN_FRACTION).then_some(Interferer {
+                    f0_hz: mean,
+                    rms: ambient_rms,
+                })
+            } else if voiced_frac > CALIB_VOICED_FAIL_FRACTION {
+                return Err(CalibrationFailure::VoiceDetected);
+            } else {
+                None
+            }
+        };
+
+        Ok(RoomCalibration {
+            ambient_rms,
+            interferer,
+        })
+    }
+}
+
+/// Whether a live YIN detection matches the calibrated interferer: pitch
+/// within tolerance of the fingerprinted hum, at a level the hum accounts
+/// for. A frame much louder than the calibrated hum is the singer — even on
+/// the hum's exact pitch.
+pub fn interferer_match(f0_hz: f32, frame_rms: f32, interferer: &Interferer) -> bool {
+    if !(f0_hz.is_finite() && f0_hz > 0.0) {
+        return false;
+    }
+    let pitch_close = (f0_hz - interferer.f0_hz).abs() <= INTERFERER_F0_TOL * interferer.f0_hz;
+    if !pitch_close {
+        return false;
+    }
+    let margin = 10f32.powf(INTERFERER_LEVEL_MARGIN_DB / 20.0);
+    frame_rms <= interferer.rms.max(1e-7) * margin
 }
 
 /// RMS of one analysis frame.
@@ -2169,6 +2334,80 @@ mod tests {
             "F2 {} ~ 1800 Hz",
             formants[1].frequency
         );
+    }
+
+    // ── room calibration ────────────────────────────────────────────────────
+
+    #[test]
+    fn calibration_of_a_quiet_room_finds_floor_and_no_interferer() {
+        let mut c = RoomCalibrator::new();
+        for _ in 0..CALIB_FRAMES {
+            c.push(0.001, None);
+        }
+        let cal = c.finish().expect("clean pass");
+        assert!((cal.ambient_rms - 0.001).abs() < 1e-6);
+        assert!(cal.interferer.is_none());
+    }
+
+    #[test]
+    fn calibration_fingerprints_a_stable_hum() {
+        // A fan/mains hum: YIN finds ~120 Hz on most frames, rock steady.
+        let mut c = RoomCalibrator::new();
+        for i in 0..CALIB_FRAMES {
+            let f0 = if i % 3 == 0 {
+                None
+            } else {
+                Some(120.0 + (i % 5) as f32 * 0.2)
+            };
+            c.push(0.004, f0);
+        }
+        let cal = c.finish().expect("hum is a valid room");
+        let hum = cal.interferer.expect("hum fingerprinted");
+        assert!((hum.f0_hz - 120.4).abs() < 1.0, "got {}", hum.f0_hz);
+    }
+
+    #[test]
+    fn calibration_rejects_speech_instead_of_fingerprinting_it() {
+        // Wandering pitch on many frames = someone talked during the pass.
+        let mut c = RoomCalibrator::new();
+        for i in 0..CALIB_FRAMES {
+            let f0 = (i % 2 == 0).then(|| 150.0 + 40.0 * ((i as f32) * 0.7).sin());
+            c.push(0.02, f0);
+        }
+        assert_eq!(c.finish().unwrap_err(), CalibrationFailure::VoiceDetected);
+    }
+
+    #[test]
+    fn calibration_too_short_is_rejected() {
+        let mut c = RoomCalibrator::new();
+        for _ in 0..10 {
+            c.push(0.001, None);
+        }
+        assert_eq!(c.finish().unwrap_err(), CalibrationFailure::TooShort);
+    }
+
+    #[test]
+    fn interferer_gate_blocks_the_hum_but_not_the_louder_singer() {
+        let hum = Interferer {
+            f0_hz: 120.0,
+            rms: 0.004,
+        };
+        // The hum itself, at its own level: blocked.
+        assert!(interferer_match(121.0, 0.004, &hum));
+        // The singer on the same pitch but 20 dB louder: allowed.
+        assert!(!interferer_match(121.0, 0.04, &hum));
+        // A different pitch at hum level: allowed (it is not the hum).
+        assert!(!interferer_match(150.0, 0.004, &hum));
+        assert!(!interferer_match(f32::NAN, 0.004, &hum));
+    }
+
+    #[test]
+    fn seeded_noise_floor_gates_immediately() {
+        let mut nf = NoiseFloor::new();
+        assert!(nf.snr_db(0.1).is_none(), "unseeded floor must warm up");
+        nf.seed(0.001);
+        let snr = nf.snr_db(0.1).expect("seeded floor reports at once");
+        assert!((snr - 40.0).abs() < 1.0, "got {snr}");
     }
 
     // ── noise floor & SNR gating ────────────────────────────────────────────
