@@ -24,6 +24,14 @@ mod analysis;
 mod android;
 
 mod concurrency;
+// Capture-stack capability probe (UNPROCESSED support, microphone inventory,
+// channel independence). Report/analysis types compile everywhere so the UI
+// and tests are cross-target; the JNI half is Android-only. The dead_code
+// allow is desktop-only: there the UI matches on these types but nothing
+// constructs them (only the Android probe does), which is exactly the shape
+// dead-code analysis flags.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+mod device_probe;
 mod math;
 // Disk persistence for the enrolled reference + session archive. Compiled on
 // all targets (ui uses it); each entry point supplies the store path (or None

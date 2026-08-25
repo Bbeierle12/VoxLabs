@@ -9,7 +9,9 @@
 //! element 1 just above the glottis and element 44 the lip termination; and
 //! Table II (per-vowel mode coefficients). The model is
 //!
-//!     V(i) = (pi/4) * [ Omega(i) + q1*phi1(i) + q2*phi2(i) ]^2
+//! ```text
+//! V(i) = (pi/4) * [ Omega(i) + q1*phi1(i) + q2*phi2(i) ]^2
+//! ```
 //!
 //! -- their Eq. (1): PCA runs on *diameters*, and the square converts to
 //! area. Story 2007b (JASA 121:3770) shows the (q1, q2) -> (fR1, fR2) map is
