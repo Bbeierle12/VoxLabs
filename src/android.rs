@@ -302,6 +302,9 @@ fn cpu_analysis_loop(
     use crate::math;
 
     let mut last_formants = DEFAULT_FORMANTS;
+    // f0 of the frame `last_formants` was measured on (0.0 = never), so the
+    // UI's formant-reliability gate judges by measurement conditions.
+    let mut last_formants_f0 = 0.0f32;
     let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
     // f0-contour tracker for vibrato/steadiness, mirroring the desktop path.
     let mut contour = crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32);
@@ -345,6 +348,7 @@ fn cpu_analysis_loop(
                 let measured = math::formants_from_lpc(&lpc, fs_dec);
                 if measured[0].frequency > 0.0 {
                     last_formants = measured;
+                    last_formants_f0 = f0;
                 }
             }
 
@@ -393,6 +397,7 @@ fn cpu_analysis_loop(
             let profile = VocalProfile {
                 f0,
                 formants: last_formants,
+                formants_f0: last_formants_f0,
                 partial_amplitudes,
                 metrics,
                 valid: voiced,

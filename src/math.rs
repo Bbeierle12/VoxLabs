@@ -951,6 +951,77 @@ pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'stati
     }
 }
 
+// ── Formant reliability gating ───────────────────────────────────────────────
+
+/// Above this f0, formant estimates are excluded from identity features (the
+/// voiceprint). Chen, Whalen & Shadle (2019, JASA-EL 145:EL360) synthesized
+/// 470,000 vowels with known formants: above ~200 Hz the LPC-measured F1's
+/// variability equals that of the nearest harmonic *regardless of the true
+/// F1* — the estimate re-encodes f0, and averaging over a capture does not
+/// remove the bias ("even a thousand tokens were not sufficient").
+pub const FORMANT_F0_IDENTITY_MAX_HZ: f32 = 200.0;
+
+/// Above this f0, formant estimates are not stored or displayed at all.
+/// Monsen & Engebretson (1983, JSHR 26:89): "the accuracy of both methods
+/// decreases greatly when fundamental frequency is 350 Hz or greater" — the
+/// threshold the singing-voice literature (Joliveau, Smith & Wolfe 2004,
+/// JASA 116:2434) adopts, en route to "essentially impossible" above 500 Hz.
+pub const FORMANT_F0_DISPLAY_MAX_HZ: f32 = 350.0;
+
+/// Half-width of the harmonic-proximity suspect band, as a fraction of the
+/// harmonic's frequency. Boë, Sawallis, Badin & Schwartz (2023, Int. J.
+/// Primatology 44:1046) flag F1 within ±15% of f0 (and F2 within ±15% of
+/// 2·f0) as likely harmonic/formant confusions; Grawunder et al. (2023,
+/// Phil. Trans. R. Soc. B 378:20230319) adopted the same exclusion in a
+/// formal correction.
+pub const FORMANT_HARMONIC_SUSPECT_FRAC: f32 = 0.15;
+
+/// How far a frame's formant estimates can be trusted, judged from the f0 at
+/// which they were measured. LPC fits an envelope to a line spectrum: as f0
+/// rises the harmonics thin out and the fit slides onto individual harmonics
+/// instead of the envelope between them ("harmonic attraction" — the errors
+/// are systematic, toward the strongest nearby harmonic, not noise).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormantGrade {
+    /// Measured at f0 ≤ [`FORMANT_F0_IDENTITY_MAX_HZ`], away from harmonics:
+    /// usable everywhere, including as voiceprint identity features.
+    Identity,
+    /// Measured at f0 ≤ [`FORMANT_F0_DISPLAY_MAX_HZ`]: displayable (expected
+    /// uncertainty ≈ ±f0/4 — Kent & Vorperian 2018), but excluded from the
+    /// voiceprint, where the harmonic-attraction bias would make the score
+    /// partly a pitch comparison.
+    DisplayOnly,
+    /// Measured at higher f0, at an unusable f0, or with F1/F2 sitting on a
+    /// harmonic (the Boë suspect band): not reported at all.
+    Reject,
+}
+
+/// Grades a frame's formant estimates by the f0 at which they were measured.
+///
+/// `measured_f0` must be the f0 of the frame the LPC ran on — not the current
+/// frame's f0, which may differ when formants are held across unvoiced gaps.
+pub fn formant_grade(formants: &[Formant; 3], measured_f0: f32) -> FormantGrade {
+    if !(measured_f0.is_finite() && measured_f0 > 0.0) {
+        return FormantGrade::Reject;
+    }
+    if measured_f0 > FORMANT_F0_DISPLAY_MAX_HZ {
+        return FormantGrade::Reject;
+    }
+    // Boë suspect band: F1 within ±15% of f0, or F2 within ±15% of 2·f0.
+    // These are the two published confusion signatures, not a generalization.
+    let near = |f: f32, harmonic: f32| -> bool {
+        f > 0.0 && (f - harmonic).abs() <= FORMANT_HARMONIC_SUSPECT_FRAC * harmonic
+    };
+    if near(formants[0].frequency, measured_f0) || near(formants[1].frequency, 2.0 * measured_f0) {
+        return FormantGrade::Reject;
+    }
+    if measured_f0 <= FORMANT_F0_IDENTITY_MAX_HZ {
+        FormantGrade::Identity
+    } else {
+        FormantGrade::DisplayOnly
+    }
+}
+
 // ── Classical voiceprint & similarity ────────────────────────────────────────
 
 /// Rough adult-voice population `(mean, std)` for each scalar voiceprint
@@ -1936,5 +2007,78 @@ mod tests {
             "F2 {} ~ 1800 Hz",
             formants[1].frequency
         );
+    }
+
+    // ── formant gating & A2/A1 ──────────────────────────────────────────────
+
+    fn f3(a: f32, b: f32, c: f32) -> [Formant; 3] {
+        [
+            Formant {
+                frequency: a,
+                bandwidth: 80.0,
+            },
+            Formant {
+                frequency: b,
+                bandwidth: 120.0,
+            },
+            Formant {
+                frequency: c,
+                bandwidth: 160.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn formant_grade_thresholds() {
+        // A clean male-vowel frame: f0 well below both thresholds, formants
+        // far from any harmonic of it.
+        let fmts = f3(700.0, 1500.0, 2500.0);
+        assert_eq!(formant_grade(&fmts, 110.0), FormantGrade::Identity);
+        assert_eq!(
+            formant_grade(&fmts, FORMANT_F0_IDENTITY_MAX_HZ),
+            FormantGrade::Identity
+        );
+        // Between the identity and display ceilings: display only. 260 Hz
+        // keeps 2·f0 = 520 comfortably outside F1's ±15% band.
+        assert_eq!(
+            formant_grade(&f3(700.0, 1600.0, 2500.0), 260.0),
+            FormantGrade::DisplayOnly
+        );
+        // Above the display ceiling: rejected outright.
+        assert_eq!(formant_grade(&fmts, 351.0), FormantGrade::Reject);
+        assert_eq!(formant_grade(&fmts, 600.0), FormantGrade::Reject);
+    }
+
+    #[test]
+    fn formant_grade_suspect_bands() {
+        // F1 within ±15% of f0 → harmonic/formant confusion (Boë et al.).
+        assert_eq!(
+            formant_grade(&f3(200.0, 1500.0, 2500.0), 190.0),
+            FormantGrade::Reject
+        );
+        // F2 within ±15% of 2·f0 — F1 clean.
+        assert_eq!(
+            formant_grade(&f3(700.0, 390.0 * 2.0 * 0.5, 2500.0), 195.0),
+            FormantGrade::Reject
+        );
+        // Just outside the band on both counts: accepted.
+        assert_eq!(
+            formant_grade(&f3(240.0, 1500.0, 2500.0), 190.0),
+            FormantGrade::Identity
+        );
+        // Unresolved slots (0.0) never trigger the proximity check.
+        assert_eq!(
+            formant_grade(&f3(0.0, 0.0, 0.0), 190.0),
+            FormantGrade::Identity
+        );
+    }
+
+    #[test]
+    fn formant_grade_rejects_unusable_f0() {
+        let fmts = f3(700.0, 1500.0, 2500.0);
+        assert_eq!(formant_grade(&fmts, 0.0), FormantGrade::Reject);
+        assert_eq!(formant_grade(&fmts, -1.0), FormantGrade::Reject);
+        assert_eq!(formant_grade(&fmts, f32::NAN), FormantGrade::Reject);
+        assert_eq!(formant_grade(&fmts, f32::INFINITY), FormantGrade::Reject);
     }
 }

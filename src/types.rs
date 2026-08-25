@@ -66,6 +66,13 @@ pub const MAX_PARTIALS: usize = 32;
 pub struct VocalProfile {
     pub f0: f32,
     pub formants: [Formant; 3], // F1, F2, F3
+    /// f0 of the frame `formants` was actually measured on (they are held
+    /// across unvoiced gaps, so it can differ from `f0`). `0.0` = never
+    /// measured — the engine-default envelope. This is what formant
+    /// reliability gating must judge by: LPC's harmonic-attraction bias is a
+    /// property of the analysis frame, not of whatever frame the value is
+    /// displayed in (see `math::formant_grade`).
+    pub formants_f0: f32,
     /// Measured amplitude of each harmonic k·f0 (linear peak, Goertzel at the
     /// harmonic frequencies). Zeroed when the frame is unvoiced.
     pub partial_amplitudes: [f32; MAX_PARTIALS],
@@ -82,6 +89,7 @@ impl Default for VocalProfile {
                 frequency: 0.0,
                 bandwidth: 0.0,
             }; 3],
+            formants_f0: 0.0,
             partial_amplitudes: [0.0; MAX_PARTIALS],
             metrics: VoiceMetrics::default(),
             valid: false,

@@ -393,8 +393,15 @@ pub struct DashboardApp {
     /// the capture (snapshots of `harm_ema`, normalized to its own max).
     rec_profile_sum: [f32; 16],
     rec_profile_n: u32,
-    /// Last valid formants seen while recording.
+    /// Last display-grade formants seen while recording — measured at
+    /// f0 ≤ 350 Hz, off the harmonic suspect bands (`math::formant_grade`).
+    /// These reach the session's Detail chips but never the voiceprint.
     rec_formants: Option<[Formant; 3]>,
+    /// Last identity-grade formants (measured at f0 ≤ 200 Hz): the only ones
+    /// the voiceprint may use. Above that, LPC's harmonic attraction makes
+    /// the estimate re-encode pitch, and a similarity score built on it
+    /// compares f0, not voices (Chen, Whalen & Shadle 2019).
+    rec_id_formants: Option<[Formant; 3]>,
     /// Display-smoothed live readouts (raw values update every ~46 ms and
     /// flicker as digits). `None` = unvoiced/unknown.
     hnr_disp: Option<f32>,
@@ -500,6 +507,7 @@ impl DashboardApp {
             rec_profile_sum: [0.0; 16],
             rec_profile_n: 0,
             rec_formants: None,
+            rec_id_formants: None,
             hnr_disp: None,
             h1h2_disp: None,
             jitter_disp: None,
@@ -707,8 +715,12 @@ impl DashboardApp {
 
             // Build this capture's classical voiceprint and score it against
             // the enrolled reference.
+            // Identity-grade formants only: a capture sung above ~200 Hz f0
+            // gets a formant-less voiceprint and is scored on its remaining
+            // features (or reads "Unscored") — phase C's skip-and-renormalize
+            // machinery — instead of on harmonic-attraction artifacts.
             let voiceprint = crate::math::build_voiceprint(
-                self.rec_formants,
+                self.rec_id_formants,
                 &profile,
                 mean(&self.rec_centroid_acc),
             );
@@ -777,6 +789,7 @@ impl DashboardApp {
         self.rec_profile_sum = [0.0; 16];
         self.rec_profile_n = 0;
         self.rec_formants = None;
+        self.rec_id_formants = None;
         self.result = None;
     }
 
@@ -891,7 +904,23 @@ impl eframe::App for DashboardApp {
         }
         if matches!(self.rec, RecState::Recording { .. }) && self.current_profile.valid {
             self.rec_f0_acc.push(self.current_profile.f0);
-            self.rec_formants = Some(self.current_profile.formants);
+            // Formants are latched by the reliability of their *measurement*
+            // frame (`formants_f0`, not the current f0): LPC's harmonic-
+            // attraction bias belongs to the frame the fit ran on. Identity
+            // grade additionally feeds the voiceprint; rejects feed nothing.
+            match crate::math::formant_grade(
+                &self.current_profile.formants,
+                self.current_profile.formants_f0,
+            ) {
+                crate::math::FormantGrade::Identity => {
+                    self.rec_formants = Some(self.current_profile.formants);
+                    self.rec_id_formants = Some(self.current_profile.formants);
+                }
+                crate::math::FormantGrade::DisplayOnly => {
+                    self.rec_formants = Some(self.current_profile.formants);
+                }
+                crate::math::FormantGrade::Reject => {}
+            }
             if let Some(h) = self.current_profile.metrics.hnr_db {
                 self.rec_hnr_acc.push(h);
             }

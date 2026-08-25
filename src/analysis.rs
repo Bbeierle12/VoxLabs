@@ -255,6 +255,8 @@ pub struct AnalysisEngine {
     ui_profile_tx: Input<VocalProfile>,
     /// Last successfully measured formants, held across unvoiced frames.
     last_formants: [Formant; 3],
+    /// f0 of the frame `last_formants` was measured on (0.0 = never).
+    last_formants_f0: f32,
     /// f0-contour tracker for vibrato/steadiness. Lazily built on the first
     /// frame because the contour rate depends on the mic sample rate.
     contour: Option<crate::metrics::F0Contour>,
@@ -283,6 +285,7 @@ impl AnalysisEngine {
             profile_tx,
             ui_profile_tx,
             last_formants: DEFAULT_FORMANTS,
+            last_formants_f0: 0.0,
             contour: None,
             spectrogram: None,
             spectrum_tx,
@@ -339,9 +342,11 @@ impl AnalysisEngine {
             // Accept only if we actually resolved at least F1.
             if measured[0].frequency > 0.0 {
                 self.last_formants = measured;
+                self.last_formants_f0 = f0;
             }
         }
         let formants = self.last_formants;
+        let formants_f0 = self.last_formants_f0;
 
         // Harmonic series at k·f0 (drives the musician-facing ladder);
         // silent when unvoiced rather than holding stale bars.
@@ -393,6 +398,7 @@ impl AnalysisEngine {
         let profile = VocalProfile {
             f0,
             formants,
+            formants_f0,
             partial_amplitudes,
             metrics,
             valid: voiced,

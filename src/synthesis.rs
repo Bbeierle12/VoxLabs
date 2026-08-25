@@ -199,6 +199,7 @@ mod tests {
         VocalProfile {
             f0,
             formants,
+            formants_f0: f0,
             partial_amplitudes: [0.0; MAX_PARTIALS],
             metrics: VoiceMetrics::default(),
             valid: true,
