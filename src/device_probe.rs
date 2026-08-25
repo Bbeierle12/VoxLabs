@@ -873,7 +873,9 @@ mod android {
                         2 => "PROCESSED",
                         _ => "?",
                     };
-                    line.push_str(&format!(" → ch{ch} {kind}"));
+                    // ASCII arrow: egui's embedded font subset lacks U+2192,
+                    // which rendered as tofu on device.
+                    line.push_str(&format!(" -> ch{ch} {kind}"));
                 }
             }
             out.push(line);
