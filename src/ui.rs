@@ -410,8 +410,9 @@ pub struct DashboardApp {
     shimmer_disp: Option<f32>,
     cpp_disp: Option<f32>,
     centroid_disp: Option<f32>,
-    /// Bozeman's F1/H2 "turning over" distance in semitones (see
-    /// [`crate::math::semitones_from`]), display-smoothed.
+    /// A2/A1 in dB (see [`crate::math::a2_a1_db`]) — Bozeman's observable
+    /// for the acoustic passaggio — display-smoothed. Positive = H2 dominant
+    /// (open timbre), negative = H1 dominant (turned over).
     turnover_disp: Option<f32>,
 
     /// Which visualization the analyzer card's switchable region shows.
@@ -984,11 +985,14 @@ impl eframe::App for DashboardApp {
             &mut self.centroid_disp,
             self.current_profile.metrics.centroid_hz,
         );
-        // Bozeman F1/H2 crossing: derived straight from f0 + F1, both already
-        // in the profile, so it needs no engine-side plumbing of its own.
-        let f1 = self.current_profile.formants[0].frequency;
-        let turnover_raw = if self.current_profile.valid && f1 > 0.0 {
-            crate::math::semitones_from(2.0 * self.current_profile.f0, f1)
+        // Bozeman's turnover, read from his own observable: the A2/A1
+        // harmonic ratio (Journal of Singing 66:291, 2010) — "when H2 passes
+        // through F1 and begins to weaken, H1 will increase in power". Unlike
+        // the previous F1-based semitone distance, this needs no formant
+        // estimate, so it works exactly where the gauge matters most: in the
+        // passaggio, where LPC formants are unreliable (f0 > 350 Hz).
+        let turnover_raw = if self.current_profile.valid {
+            crate::math::a2_a1_db(&self.current_profile.partial_amplitudes)
         } else {
             None
         };
@@ -1922,13 +1926,14 @@ impl DashboardApp {
 
     /// Live harmonic-series card: per-partial ladder (dB bars, note names,
     /// cents) plus the timbre metrics strip (tilt, even/odd, singer's formant).
-    /// Bozeman's F1/H2 "turning over" gauge: shows the second harmonic's
-    /// position relative to the first formant — negative (open timbre,
-    /// *voce aperta*) below the crossing, zero at the acoustic passaggio
-    /// event, positive (closed/covered timbre, *voce chiusa*) above it. The
-    /// amber zone width follows Bozeman's note that the perceptual
-    /// transition spans "about a major second to a major third" centered on
-    /// the crossing (Journal of Singing, 2010).
+    /// Bozeman's "turning over" gauge, driven by the A2/A1 harmonic ratio —
+    /// his own observable for the event (Journal of Singing, 2010): H2
+    /// dominant (open timbre, *voce aperta*) on one side, the dominant-
+    /// harmonic switch at 0 dB, H1 dominant (turned over, *voce chiusa*) on
+    /// the other. The gauge shows sign and crossing only — no target value:
+    /// whether singers deliberately tune the crossing is disputed (Sundberg,
+    /// Lã & Gill 2013 found no systematic tuning in male opera singers), so
+    /// nothing here is presented as a number to hold.
     /// Cents tuning needle: ±50¢ around the current note, glowing teal within
     /// ±5¢ ("in tune"), amber otherwise. Ported from the Personal Harmonic
     /// Identifier prototype's needle meter — previously cents were text-only.
@@ -1990,26 +1995,32 @@ impl DashboardApp {
     }
 
     fn turning_over_gauge(&self, ui: &mut egui::Ui) {
-        const RANGE: f32 = 6.0; // displayed span, ± semitones
-        const TURN_ZONE: f32 = 2.0; // half-width of the amber "turning" band
+        const RANGE: f32 = 12.0; // displayed span, ± dB of A2/A1
+        // Half-width of the amber "turning" band. Display convention, not a
+        // measurement claim: ±3 dB (half power) keeps the needle from
+        // flickering between states around the dominant-harmonic switch.
+        const TURN_ZONE: f32 = 3.0;
 
-        let semis = self.turnover_disp;
-        let (state, color) = match semis {
-            Some(s) if s < -TURN_ZONE => ("OPEN", TEAL),
-            Some(s) if s > TURN_ZONE => ("CLOSED", CYAN_DEEP),
+        // Positive A2/A1 = H2 dominant = open timbre. The axis keeps the
+        // established left-open / right-closed reading, so the needle plots
+        // the *negated* value.
+        let a2a1 = self.turnover_disp;
+        let (state, color) = match a2a1 {
+            Some(v) if v > TURN_ZONE => ("OPEN", TEAL),
+            Some(v) if v < -TURN_ZONE => ("CLOSED", CYAN_DEEP),
             Some(_) => ("TURNING", AMBER),
             None => ("—", ink(115)),
         };
 
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("F1 / H2 · PASSAGGIO")
+                RichText::new("A2 / A1 · PASSAGGIO")
                     .font(FontId::monospace(9.5))
                     .color(ink(115)),
             );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let numeric = semis
-                    .map(|s| format!("{s:+.1} st"))
+                let numeric = a2a1
+                    .map(|v| format!("{v:+.1} dB"))
                     .unwrap_or_else(|| "—".into());
                 ui.label(
                     RichText::new(format!("{state}  {numeric}"))
@@ -2039,15 +2050,15 @@ impl DashboardApp {
         );
         ui.painter()
             .rect_filled(zone, 4.0, Color32::from_rgba_unmultiplied(217, 119, 6, 46));
-        // Crossing tick at exactly 0 semitones — the acoustic passaggio event.
+        // Crossing tick at 0 dB — the dominant-harmonic switch.
         let cx = to_x(0.0);
         ui.painter().line_segment(
             [pos2(cx, track.top() - 3.0), pos2(cx, track.bottom() + 3.0)],
             Stroke::new(1.5, ink(90)),
         );
 
-        if let Some(s) = semis {
-            let mx = to_x(s.clamp(-RANGE, RANGE));
+        if let Some(v) = a2a1 {
+            let mx = to_x((-v).clamp(-RANGE, RANGE));
             let my = track.center().y;
             ui.painter().circle_filled(pos2(mx, my), 6.0, color);
             ui.painter()

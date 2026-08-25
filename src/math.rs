@@ -811,6 +811,11 @@ pub fn freq_to_note(hz: f32) -> Option<Note> {
 /// acoustic passaggio event ("turning over"), positive once H2 has cleared F1
 /// (close timbre, *voce chiusa*). The same helper gives the treble-voice
 /// analog via `semitones_from(f0, f1)` (F1/H1 tracking).
+///
+/// No longer drives the turnover gauge — that now reads the A2/A1 harmonic
+/// ratio directly ([`a2_a1_db`]), since an F1 estimate is exactly what LPC
+/// cannot provide in the passaggio. Kept as a general pitch-distance helper.
+#[allow(dead_code)]
 pub fn semitones_from(freq: f32, reference: f32) -> Option<f32> {
     if freq <= 0.0 || reference <= 0.0 || !freq.is_finite() || !reference.is_finite() {
         return None;
@@ -1020,6 +1025,28 @@ pub fn formant_grade(formants: &[Formant; 3], measured_f0: f32) -> FormantGrade 
     } else {
         FormantGrade::DisplayOnly
     }
+}
+
+/// A2/A1 — the second harmonic's level over the first, in dB, from the same
+/// measured harmonic amplitudes as the ladder.
+///
+/// This is Bozeman's own observable for the acoustic passaggio: "When H2
+/// passes through F1 and begins to weaken, H1 will increase in power as it
+/// approaches the first formant peak" (Journal of Singing 66:291, 2010). The
+/// dominant-harmonic switch — A2/A1 crossing 0 dB — is what practitioners
+/// watch on a real-time spectrogram, and unlike an F1 estimate it exists at
+/// every pitch the app accepts.
+///
+/// Floor handling differs from [`h1_h2_db`] on purpose: H2 sinking below the
+/// −48 dB relative floor is not "unmeasurable" here — it is the deeply
+/// turned-over state itself. A1 above the floor with A2 below it returns the
+/// floor-limited value (a lower bound on how far H2 has fallen, clamped, not
+/// a precise level). `None` only when the fundamental itself is missing.
+pub fn a2_a1_db(amps: &[f32]) -> Option<f32> {
+    let (a1, a2) = (*amps.first()?, *amps.get(1)?);
+    let max = amps.iter().cloned().fold(0.0f32, f32::max);
+    let floor = max * 10f32.powf(-48.0 / 20.0);
+    (max > 1e-6 && a1 > floor).then(|| 20.0 * (a2.max(floor) / a1).log10())
 }
 
 // ── Classical voiceprint & similarity ────────────────────────────────────────
@@ -2080,5 +2107,39 @@ mod tests {
         assert_eq!(formant_grade(&fmts, -1.0), FormantGrade::Reject);
         assert_eq!(formant_grade(&fmts, f32::NAN), FormantGrade::Reject);
         assert_eq!(formant_grade(&fmts, f32::INFINITY), FormantGrade::Reject);
+    }
+
+    #[test]
+    fn a2_a1_of_sawtooth_is_minus_six_db() {
+        // Sawtooth partials fall as 1/k: A2/A1 = 1/2 → −6.02 dB.
+        let mut amps = [0.0f32; 16];
+        for (k, a) in amps.iter_mut().enumerate() {
+            *a = 1.0 / (k + 1) as f32;
+        }
+        let db = a2_a1_db(&amps).expect("measurable");
+        assert!((db + 6.02).abs() < 0.1, "got {db}");
+    }
+
+    #[test]
+    fn a2_a1_h2_below_floor_reads_deeply_negative_not_none() {
+        // H2 gone entirely is the deeply turned-over state, not "unknown":
+        // the reading clamps at the −48 dB relative floor instead of
+        // disappearing exactly when the gauge is most informative.
+        let mut amps = [0.0f32; 16];
+        amps[0] = 1.0;
+        let db = a2_a1_db(&amps).expect("A1 alone is measurable");
+        assert!((db + 48.0).abs() < 0.5, "got {db}");
+    }
+
+    #[test]
+    fn a2_a1_dominant_h2_is_positive_and_silence_is_none() {
+        let mut amps = [0.0f32; 16];
+        amps[0] = 0.5;
+        amps[1] = 1.0; // open-timbre signature: H2 riding the F1 peak
+        let db = a2_a1_db(&amps).expect("measurable");
+        assert!((db - 6.02).abs() < 0.1, "got {db}");
+
+        assert!(a2_a1_db(&[0.0; 16]).is_none());
+        assert!(a2_a1_db(&[]).is_none());
     }
 }
