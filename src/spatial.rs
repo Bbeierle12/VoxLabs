@@ -1,4 +1,5 @@
-//! TV-path spatial calibration and live path-consistency scoring.
+//! TV-path spatial calibration and live path-consistency scoring — now with
+//! a second, contrastive pass for the user's own path.
 //!
 //! The simultaneous-source research (see the "Live or Loudspeaker" brief,
 //! section 07) established that the one thing about the TV that survives
@@ -6,30 +7,44 @@
 //! source, the ratio of what two microphones hear, Y1(f)/Y2(f) =
 //! H1(f)/H2(f), cancels the program entirely and leaves only the fixed
 //! physics of driver → room → phone. The device probe measured (25 Aug,
-//! Pixel) that this phone hands the app two genuinely independent channels
-//! (corr 0.351 between mics ~14 cm apart), so that ratio is learnable here.
+//! Pixel) that this phone hands the app two genuinely independent channels,
+//! so that ratio is learnable here.
 //!
-//! Calibration (TV playing, user silent, phone in its usual spot)
-//! accumulates the 2×2 spatial covariance R(f) per STFT bin; its dominant
-//! eigenvector is the normalized relative-transfer vector ĥ(f), and the
-//! magnitude-squared coherence γ²(f) says how much that bin was actually
-//! excited by one coherent source (diffuse noise and silence give γ² ≈ 0).
-//! Live scoring projects each frame's per-bin channel vector ŷ(f) onto
-//! ĥ(f): c_T(f) = |ĥᴴŷ|² ∈ [0, 1] by Cauchy–Schwarz — near 1 when the
-//! energy arrives through the calibrated TV path — and aggregates over the
-//! band with weights = bin energy × calibration coherence.
+//! The first on-device run then taught the second lesson (quality 36%,
+//! band coverage 1%, yet consistency 0.91): at 2–4 m in a furnished room
+//! the TV arrives mostly through the *reverberant* field, which is only
+//! coherent between a ~14 cm mic pair at low frequencies — and in exactly
+//! those low bins nearly every source in the room presents the same
+//! near-in-phase channel vector. A single learned path can score high on
+//! everything. The fix is contrastive: learn the TV's path AND the user's
+//! path, then score each frame only on the bins where the two learned
+//! paths *measurably differ*. The method then carries its own honesty
+//! number — "N% of the band separates the TV from you" — and when N ≈ 0 it
+//! says the geometry doesn't support spatial discrimination instead of
+//! emitting a confident score built on a sliver of the spectrum.
+//!
+//! Calibration accumulates the 2×2 spatial covariance R(f) per STFT bin;
+//! its dominant eigenvector is the normalized relative-transfer vector
+//! ĥ(f), magnitude-squared coherence γ²(f) the per-bin weight. Live
+//! scoring projects each frame's per-bin channel vector ŷ(f) onto ĥ(f):
+//! c(f) = |ĥᴴŷ|² ∈ [0, 1] by Cauchy–Schwarz. With both paths learned, the
+//! contrast per bin is c_T − c_U ∈ [−1, 1], aggregated with weights =
+//! bin energy × γ²_T × γ²_U × separation, where separation(f) =
+//! 1 − |ĥ_Tᴴ ĥ_U|².
 //!
 //! HONESTY BOUNDARY (mirror this in every UI string):
-//!   * Two microphones make this *evidence, not proof*. Any source standing
-//!     at (or near) the TV matches the path; a second TV driver or a moved
-//!     phone breaks it. M = 2 supports one spatial constraint — the
-//!     research's M ≥ D+1 rule — so a stereo soundbar is only partially
-//!     modeled by the dominant direction.
-//!   * A low score means "not the calibrated path", never "live human".
-//!   * The calibration is per-session and dies the moment the phone moves;
-//!     the eigen-decomposition can't tell "two sources during calibration"
-//!     from "one source" better than the rank ratio λ2/λ1 it reports — so
-//!     that number is surfaced, not swallowed.
+//!   * Two microphones make this *evidence, not proof*. Any source at (or
+//!     near) the TV's position matches the TV path; anyone speaking from
+//!     the user's spot matches the user path. M = 2 supports one spatial
+//!     constraint (the research's M ≥ D+1 rule), so a stereo soundbar is
+//!     only partially modeled by its dominant direction.
+//!   * A single-path score high on 1% of the band is weak evidence and the
+//!     card must say so; the contrastive score is only evidence where the
+//!     learned paths differ, and the separation number is always shown.
+//!   * The rank ratio λ2/λ1 rises for a second source *or* heavy diffuse
+//!     reverberation — the warning names both, because the first field
+//!     test showed reverberation alone can trip it.
+//!   * Calibrations are per-session and die the moment the phone moves.
 
 use rustfft::num_complex::Complex;
 use std::sync::Mutex;
@@ -39,7 +54,7 @@ use std::sync::Mutex;
 pub const FFT_N: usize = 2048;
 /// STFT hop (samples). 50% overlap.
 pub const HOP: usize = 1024;
-/// Frames of TV-only audio a calibration accumulates (512 hops ≈ 11 s).
+/// Usable (non-quiet) frames a calibration accumulates (512 hops ≈ 11 s).
 pub const CALIB_FRAMES: usize = 512;
 /// Band used for calibration and scoring. Below ~200 Hz the phone's port
 /// roll-off and processed capture make the path unreliable; above ~8 kHz
@@ -49,28 +64,46 @@ pub const BAND_HI_HZ: f32 = 8000.0;
 /// Frame RMS (dBFS, both channels) below which no score is computed —
 /// scoring silence would manufacture a number from noise.
 pub const QUIET_DBFS: f32 = -65.0;
-/// EMA coefficient for the displayed score (per scored frame, ~21 ms).
+/// EMA coefficient for displayed scores (per scored frame, ~21 ms).
 pub const SCORE_EMA_ALPHA: f32 = 0.1;
 /// A bin's calibration weight is its coherence γ²; below this it counts as
 /// uncovered for the band-coverage statistic.
 pub const COVERED_COHERENCE: f32 = 0.5;
 /// Energy-weighted mean λ2/λ1 above which the calibration warns that more
-/// than one source was audible while it learned. Calibrated against the
-/// unit tests' geometry: a clean single path measures ≈ 0.01, two
-/// equal-power sources at TV-like vs mouth-like paths measure ≈ 0.26 —
-/// 0.2 splits them with margin, and the raw ratio is always displayed so
+/// than one source — or heavy diffuse reverberation — was audible while it
+/// learned. Calibrated against the unit tests' geometry: a clean single
+/// path measures ≈ 0.01, two equal-power sources ≈ 0.26; the first field
+/// test measured 0.22 in a live room. The raw ratio is always displayed so
 /// a borderline pass is visible rather than silently blessed.
 pub const RANK_WARN: f32 = 0.2;
 /// During calibration, quiet frames don't count; if fewer than
 /// [`CALIB_FRAMES`] usable frames arrive in this many wall frames, the
 /// calibration fails loudly instead of finishing on junk.
 pub const CALIB_MAX_WALL_FACTOR: usize = 3;
-/// UI display thresholds for the live score — visible in copy, not hidden.
+/// Single-path display thresholds — visible in copy, not hidden.
 pub const SCORE_TV: f32 = 0.85;
 pub const SCORE_NOT_TV: f32 = 0.40;
+/// Single-path band coverage under which the score is labeled weak
+/// evidence (the first field test: coverage 1% still scored 0.91).
+pub const SINGLE_WEAK_COVERAGE: f32 = 0.10;
+/// A bin separates the two paths when 1 − |ĥ_Tᴴĥ_U|² reaches this.
+pub const SEP_MIN: f32 = 0.2;
+/// Fraction of band bins that must separate (with both coherences ≥
+/// [`COVERED_COHERENCE`]) before the contrast score counts as evidence.
+pub const DISC_MIN: f32 = 0.05;
+/// Contrast display thresholds (score ∈ [−1, +1], + = TV-like).
+pub const CONTRAST_TV: f32 = 0.3;
+pub const CONTRAST_USER: f32 = -0.3;
 
-/// One learned TV path: per-bin normalized relative-transfer vectors plus
-/// the quality numbers a user needs to judge it.
+/// Which path a calibration pass is learning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathTarget {
+    Tv,
+    User,
+}
+
+/// One learned path: per-bin normalized relative-transfer vectors plus the
+/// quality numbers a user needs to judge it.
 #[derive(Clone, Debug)]
 pub struct PathCalibration {
     // Provenance fields: not read by live scoring (the processor keeps its
@@ -78,7 +111,6 @@ pub struct PathCalibration {
     // stored calibration will check against.
     #[allow(dead_code)]
     pub sample_rate: f32,
-    /// First and last (inclusive) FFT bin in the calibrated band.
     #[allow(dead_code)]
     pub bin_lo: usize,
     #[allow(dead_code)]
@@ -89,11 +121,10 @@ pub struct PathCalibration {
     pub w: Vec<f32>,
     /// Fraction of band bins with γ² ≥ [`COVERED_COHERENCE`].
     pub band_coverage: f32,
-    /// Energy-weighted mean γ² over the band — overall "how well did the
-    /// TV's audio actually pin down a path".
+    /// Energy-weighted mean γ² over the band.
     pub quality: f32,
-    /// Energy-weighted mean λ2/λ1 — 0 for one clean source; grows when a
-    /// second source (or heavy diffuse noise) shared the calibration.
+    /// Energy-weighted mean λ2/λ1 — 0 for one clean source; grows with a
+    /// second source or heavy diffuse reverberation.
     pub rank_ratio: f32,
     pub two_source_warning: bool,
 }
@@ -104,16 +135,22 @@ pub enum FrameOutcome {
     /// Calibration consumed the frame; this many usable frames remain.
     CalibrationProgress { frames_left: usize },
     /// Calibration finished on this frame.
-    CalibrationDone,
+    CalibrationDone(PathTarget),
     /// Calibration gave up: not enough non-quiet frames.
     CalibrationFailed(String),
     /// Frame below the quiet floor — no score.
     Quiet,
-    /// Scored against the current calibration.
-    Scored { score: f32, ema: f32 },
+    /// Scored against the learned path(s). `contrast` is present only when
+    /// both paths exist AND the frame had energy in separating bins.
+    Scored {
+        single: f32,
+        single_ema: f32,
+        contrast: Option<f32>,
+        contrast_ema: Option<f32>,
+    },
 }
 
-/// Streaming two-channel STFT processor: accumulates calibration, then
+/// Streaming two-channel STFT processor: accumulates calibrations, then
 /// scores. Pure Rust, cross-target, unit-tested — the Android capture
 /// thread merely feeds it samples.
 pub struct SpatialProcessor {
@@ -124,14 +161,21 @@ pub struct SpatialProcessor {
     acc_l: Vec<f32>,
     acc_r: Vec<f32>,
     // Calibration accumulators (band bins only).
-    calibrating: bool,
+    calibrating: Option<PathTarget>,
     calib_used: usize,
     calib_wall: usize,
     c11: Vec<f64>,
     c22: Vec<f64>,
     c12: Vec<Complex<f64>>,
-    calibration: Option<PathCalibration>,
-    score_ema: Option<f32>,
+    tv_path: Option<PathCalibration>,
+    user_path: Option<PathCalibration>,
+    /// Per-bin joint weight γ²_T · γ²_U · separation; empty until both
+    /// paths exist.
+    sep_w: Vec<f32>,
+    disc_coverage: Option<f32>,
+    mean_sep: Option<f32>,
+    single_ema: Option<f32>,
+    contrast_ema: Option<f32>,
 }
 
 impl SpatialProcessor {
@@ -153,26 +197,52 @@ impl SpatialProcessor {
             window,
             acc_l: Vec::with_capacity(FFT_N * 2),
             acc_r: Vec::with_capacity(FFT_N * 2),
-            calibrating: false,
+            calibrating: None,
             calib_used: 0,
             calib_wall: 0,
             c11: vec![0.0; n_bins],
             c22: vec![0.0; n_bins],
             c12: vec![Complex::new(0.0, 0.0); n_bins],
-            calibration: None,
-            score_ema: None,
+            tv_path: None,
+            user_path: None,
+            sep_w: Vec::new(),
+            disc_coverage: None,
+            mean_sep: None,
+            single_ema: None,
+            contrast_ema: None,
         }
     }
 
-    pub fn calibration(&self) -> Option<&PathCalibration> {
-        self.calibration.as_ref()
+    pub fn path(&self, target: PathTarget) -> Option<&PathCalibration> {
+        match target {
+            PathTarget::Tv => self.tv_path.as_ref(),
+            PathTarget::User => self.user_path.as_ref(),
+        }
     }
 
-    /// Begin (or restart) learning the TV path. Any previous calibration
-    /// stays in effect until the new one completes — a failed re-learn must
-    /// not silently destroy a working one.
-    pub fn begin_calibration(&mut self) {
-        self.calibrating = true;
+    /// `(disc_coverage, mean_sep)` once both paths are learned.
+    pub fn separation(&self) -> Option<(f32, f32)> {
+        Some((self.disc_coverage?, self.mean_sep?))
+    }
+
+    pub fn is_calibrating(&self) -> bool {
+        self.calibrating.is_some()
+    }
+
+    pub fn calibrating_target(&self) -> Option<PathTarget> {
+        self.calibrating
+    }
+
+    /// Usable frames still needed by the running calibration.
+    pub fn calib_frames_left(&self) -> usize {
+        CALIB_FRAMES.saturating_sub(self.calib_used)
+    }
+
+    /// Begin (or restart) learning one path. Any previously learned paths
+    /// stay in effect until the new pass completes — a failed re-learn
+    /// must not silently destroy a working calibration.
+    pub fn begin_calibration(&mut self, target: PathTarget) {
+        self.calibrating = Some(target);
         self.calib_used = 0;
         self.calib_wall = 0;
         self.c11.iter_mut().for_each(|v| *v = 0.0);
@@ -198,6 +268,15 @@ impl SpatialProcessor {
         out
     }
 
+    fn too_quiet_message(target: PathTarget) -> String {
+        match target {
+            PathTarget::Tv => "too little TV energy — turn the TV up and re-learn".into(),
+            PathTarget::User => {
+                "too little voice energy — speak or sing the whole time and re-learn".into()
+            }
+        }
+    }
+
     fn process_hop(&mut self) -> FrameOutcome {
         // Quiet gate on the raw frame, before any spectral work.
         let mut energy = 0.0f64;
@@ -208,14 +287,12 @@ impl SpatialProcessor {
         let rms_db = 10.0 * (energy / (2 * FFT_N) as f64).max(1e-18).log10() as f32;
         let quiet = rms_db < QUIET_DBFS;
 
-        if self.calibrating {
+        if let Some(target) = self.calibrating {
             self.calib_wall += 1;
             if quiet {
                 if self.calib_wall >= CALIB_FRAMES * CALIB_MAX_WALL_FACTOR {
-                    self.calibrating = false;
-                    return FrameOutcome::CalibrationFailed(
-                        "too little TV energy — turn the TV up and re-learn".into(),
-                    );
+                    self.calibrating = None;
+                    return FrameOutcome::CalibrationFailed(Self::too_quiet_message(target));
                 }
                 return FrameOutcome::CalibrationProgress {
                     frames_left: CALIB_FRAMES - self.calib_used,
@@ -233,14 +310,12 @@ impl SpatialProcessor {
             }
             self.calib_used += 1;
             if self.calib_used >= CALIB_FRAMES {
-                self.finalize_calibration();
-                return FrameOutcome::CalibrationDone;
+                self.finalize_calibration(target);
+                return FrameOutcome::CalibrationDone(target);
             }
             if self.calib_wall >= CALIB_FRAMES * CALIB_MAX_WALL_FACTOR {
-                self.calibrating = false;
-                return FrameOutcome::CalibrationFailed(
-                    "too little TV energy — turn the TV up and re-learn".into(),
-                );
+                self.calibrating = None;
+                return FrameOutcome::CalibrationFailed(Self::too_quiet_message(target));
             }
             return FrameOutcome::CalibrationProgress {
                 frames_left: CALIB_FRAMES - self.calib_used,
@@ -250,39 +325,74 @@ impl SpatialProcessor {
         if quiet {
             return FrameOutcome::Quiet;
         }
-        let Some(calib) = &self.calibration else {
+        let Some(tv) = &self.tv_path else {
             return FrameOutcome::Quiet; // nothing to score against yet
         };
         let (sl, sr) = self.spectra();
+
+        // Single-path score (TV-path consistency), as before.
         let mut num = 0.0f64;
         let mut den = 0.0f64;
+        // Contrast score, when both paths + separation weights exist.
+        let mut cnum = 0.0f64;
+        let mut cden = 0.0f64;
+        let user = self.user_path.as_ref();
         for (i, bin) in (self.bin_lo..=self.bin_hi).enumerate() {
-            let w = calib.w[i] as f64;
-            if w <= 1e-3 {
-                continue;
-            }
             let y0 = sl[bin];
             let y1 = sr[bin];
             let e = (y0.norm_sqr() + y1.norm_sqr()) as f64;
             if e <= 0.0 {
                 continue;
             }
-            let h = &calib.h[i];
-            let proj = h[0].conj() * y0 + h[1].conj() * y1;
-            let c = (proj.norm_sqr() as f64 / e).clamp(0.0, 1.0);
-            num += w * e * c;
-            den += w * e;
+            let w_t = tv.w[i] as f64;
+            if w_t > 1e-3 {
+                let h = &tv.h[i];
+                let proj = h[0].conj() * y0 + h[1].conj() * y1;
+                let c_t = (proj.norm_sqr() as f64 / e).clamp(0.0, 1.0);
+                num += w_t * e * c_t;
+                den += w_t * e;
+                if let Some(u) = user
+                    && !self.sep_w.is_empty()
+                {
+                    let wj = self.sep_w[i] as f64;
+                    if wj > 1e-4 {
+                        let hu = &u.h[i];
+                        let proj_u = hu[0].conj() * y0 + hu[1].conj() * y1;
+                        let c_u = (proj_u.norm_sqr() as f64 / e).clamp(0.0, 1.0);
+                        cnum += wj * e * (c_t - c_u);
+                        cden += wj * e;
+                    }
+                }
+            }
         }
         if den <= 1e-12 {
             return FrameOutcome::Quiet;
         }
-        let score = (num / den) as f32;
-        let ema = match self.score_ema {
-            Some(prev) => prev + SCORE_EMA_ALPHA * (score - prev),
-            None => score,
+        let single = (num / den) as f32;
+        let single_ema = match self.single_ema {
+            Some(prev) => prev + SCORE_EMA_ALPHA * (single - prev),
+            None => single,
         };
-        self.score_ema = Some(ema);
-        FrameOutcome::Scored { score, ema }
+        self.single_ema = Some(single_ema);
+
+        let (contrast, contrast_ema) = if cden > 1e-12 {
+            let c = ((cnum / cden) as f32).clamp(-1.0, 1.0);
+            let ema = match self.contrast_ema {
+                Some(prev) => prev + SCORE_EMA_ALPHA * (c - prev),
+                None => c,
+            };
+            self.contrast_ema = Some(ema);
+            (Some(c), Some(ema))
+        } else {
+            (None, self.contrast_ema)
+        };
+
+        FrameOutcome::Scored {
+            single,
+            single_ema,
+            contrast,
+            contrast_ema,
+        }
     }
 
     /// Windowed FFT of the oldest FFT_N samples of each channel.
@@ -310,8 +420,8 @@ impl SpatialProcessor {
     /// Closed-form 2×2 Hermitian eigen-decomposition per bin; dominant
     /// eigenvector becomes ĥ, coherence becomes the weight, λ2/λ1 the
     /// honesty number.
-    fn finalize_calibration(&mut self) {
-        self.calibrating = false;
+    fn finalize_calibration(&mut self, target: PathTarget) {
+        self.calibrating = None;
         let n_bins = self.c11.len();
         let mut h = Vec::with_capacity(n_bins);
         let mut w = Vec::with_capacity(n_bins);
@@ -360,8 +470,7 @@ impl SpatialProcessor {
         } else {
             0.0
         };
-        self.score_ema = None;
-        self.calibration = Some(PathCalibration {
+        let calib = PathCalibration {
             sample_rate: self.sample_rate,
             bin_lo: self.bin_lo,
             bin_hi: self.bin_hi,
@@ -371,6 +480,50 @@ impl SpatialProcessor {
             quality,
             rank_ratio,
             two_source_warning: rank_ratio > RANK_WARN,
+        };
+        match target {
+            PathTarget::Tv => self.tv_path = Some(calib),
+            PathTarget::User => self.user_path = Some(calib),
+        }
+        self.single_ema = None;
+        self.contrast_ema = None;
+        self.compute_separation();
+    }
+
+    /// Per-bin separation between the two learned paths, and the joint
+    /// scoring weights. Runs whenever a calibration completes; a no-op
+    /// until both paths exist.
+    fn compute_separation(&mut self) {
+        let (Some(tv), Some(user)) = (&self.tv_path, &self.user_path) else {
+            self.sep_w = Vec::new();
+            self.disc_coverage = None;
+            self.mean_sep = None;
+            return;
+        };
+        let n_bins = tv.h.len();
+        let mut sep_w = Vec::with_capacity(n_bins);
+        let mut disc = 0usize;
+        let mut sep_sum = 0.0f64;
+        let mut sep_den = 0.0f64;
+        for i in 0..n_bins {
+            let ht = &tv.h[i];
+            let hu = &user.h[i];
+            let dot = ht[0].conj() * hu[0] + ht[1].conj() * hu[1];
+            let sep = (1.0 - dot.norm_sqr()).clamp(0.0, 1.0);
+            let w_pair = tv.w[i] * user.w[i];
+            sep_w.push(w_pair * sep);
+            if tv.w[i] >= COVERED_COHERENCE && user.w[i] >= COVERED_COHERENCE && sep >= SEP_MIN {
+                disc += 1;
+            }
+            sep_sum += (w_pair * sep) as f64;
+            sep_den += w_pair as f64;
+        }
+        self.sep_w = sep_w;
+        self.disc_coverage = Some(disc as f32 / n_bins as f32);
+        self.mean_sep = Some(if sep_den > 1e-12 {
+            (sep_sum / sep_den) as f32
+        } else {
+            0.0
         });
     }
 }
@@ -388,11 +541,33 @@ pub struct CaptureHealth {
     pub chunks: u64,
 }
 
+/// One learned path's headline numbers for the card.
+#[derive(Clone, Debug)]
+pub struct PathSummary {
+    pub quality: f32,
+    pub band_coverage: f32,
+    pub rank_ratio: f32,
+    pub two_source_warning: bool,
+}
+
+impl PathSummary {
+    fn from(c: &PathCalibration) -> Self {
+        Self {
+            quality: c.quality,
+            band_coverage: c.band_coverage,
+            rank_ratio: c.rank_ratio,
+            two_source_warning: c.two_source_warning,
+        }
+    }
+}
+
 /// Live-score snapshot for the card.
 #[derive(Clone, Debug, Default)]
 pub struct LiveScore {
-    pub ema: Option<f32>,
-    pub last: Option<f32>,
+    /// Single-path TV consistency EMA, 0..1.
+    pub single_ema: Option<f32>,
+    /// Contrast EMA, −1 (you-like) .. +1 (TV-like); only with both paths.
+    pub contrast_ema: Option<f32>,
     /// True when recent frames were under the quiet floor.
     pub quiet: bool,
     pub scored_frames: u64,
@@ -405,16 +580,22 @@ pub enum SpatialStatus {
     /// Capture starting up (recorder being built).
     Starting,
     Calibrating {
+        target: PathTarget,
         seconds_left: f32,
         health: CaptureHealth,
     },
     Ready {
-        quality: f32,
-        band_coverage: f32,
-        rank_ratio: f32,
-        two_source_warning: bool,
+        tv: PathSummary,
+        user: Option<PathSummary>,
+        /// Fraction of band bins that separate the two paths (both
+        /// coherent, separation ≥ [`SEP_MIN`]); `None` until both learned.
+        disc_coverage: Option<f32>,
+        mean_sep: Option<f32>,
         live: LiveScore,
         health: CaptureHealth,
+        /// The most recent calibration failure, kept visible in Ready so a
+        /// failed re-learn is reported without destroying the working UI.
+        last_error: Option<String>,
     },
     Failed(String),
 }
@@ -461,7 +642,8 @@ mod capture {
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
     static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-    static RELEARN: AtomicBool = AtomicBool::new(false);
+    static LEARN_TV: AtomicBool = AtomicBool::new(false);
+    static LEARN_USER: AtomicBool = AtomicBool::new(false);
 
     struct JErr(String);
     impl From<jni::errors::Error> for JErr {
@@ -475,10 +657,14 @@ mod capture {
         SHUTDOWN.store(true, Ordering::Relaxed);
     }
 
-    /// User tapped LEARN / RE-LEARN: start the capture thread if it isn't
-    /// running, and queue a (re-)calibration either way.
-    pub fn start_learning() {
-        RELEARN.store(true, Ordering::Relaxed);
+    /// User tapped a LEARN chip: start the capture thread if it isn't
+    /// running, and queue the requested calibration either way. If a
+    /// calibration is already running, the request waits its turn.
+    pub fn start_learning(target: PathTarget) {
+        match target {
+            PathTarget::Tv => LEARN_TV.store(true, Ordering::Relaxed),
+            PathTarget::User => LEARN_USER.store(true, Ordering::Relaxed),
+        }
         if RUNNING.swap(true, Ordering::Relaxed) {
             return; // thread already up; it will notice the flag
         }
@@ -699,11 +885,19 @@ mod capture {
         let mut chunks: u64 = 0;
         let mut live = LiveScore::default();
         let mut zero_reads = 0u32;
+        let mut last_error: Option<String> = None;
 
         while !SHUTDOWN.load(Ordering::Relaxed) {
-            if RELEARN.swap(false, Ordering::Relaxed) {
-                processor.begin_calibration();
-                live = LiveScore::default();
+            if !processor.is_calibrating() {
+                if LEARN_TV.swap(false, Ordering::Relaxed) {
+                    processor.begin_calibration(PathTarget::Tv);
+                    live = LiveScore::default();
+                    last_error = None;
+                } else if LEARN_USER.swap(false, Ordering::Relaxed) {
+                    processor.begin_calibration(PathTarget::User);
+                    live = LiveScore::default();
+                    last_error = None;
+                }
             }
             let n = env
                 .call_method(
@@ -741,64 +935,67 @@ mod capture {
                 sample_rate: SAMPLE_RATE,
                 chunks,
             };
-            let mut failed: Option<String> = None;
             for o in outcomes {
                 match o {
-                    FrameOutcome::Scored { score, ema } => {
-                        live.last = Some(score);
-                        live.ema = Some(ema);
+                    FrameOutcome::Scored {
+                        single_ema,
+                        contrast_ema,
+                        ..
+                    } => {
+                        live.single_ema = Some(single_ema);
+                        if contrast_ema.is_some() {
+                            live.contrast_ema = contrast_ema;
+                        }
                         live.quiet = false;
                         live.scored_frames += 1;
                     }
                     FrameOutcome::Quiet => live.quiet = true,
-                    FrameOutcome::CalibrationDone => {
-                        if let Some(c) = processor.calibration() {
+                    FrameOutcome::CalibrationDone(target) => {
+                        if let Some(c) = processor.path(target) {
                             log::info!(
-                                "TV path learned: quality {:.2} · coverage {:.2} · rank ratio {:.2}",
+                                "{target:?} path learned: quality {:.2} · coverage {:.2} · rank ratio {:.2}",
                                 c.quality,
                                 c.band_coverage,
                                 c.rank_ratio
                             );
                         }
+                        if let Some((d, m)) = processor.separation() {
+                            log::info!("path separation: disc coverage {d:.2} · mean sep {m:.2}");
+                        }
                     }
-                    FrameOutcome::CalibrationFailed(e) => failed = Some(e),
+                    FrameOutcome::CalibrationFailed(e) => last_error = Some(e),
                     FrameOutcome::CalibrationProgress { .. } => {}
                 }
             }
-            if let Some(e) = failed {
-                set_status(SpatialStatus::Failed(e));
-            } else if processor.is_calibrating() {
+            if let Some(target) = processor.calibrating_target() {
                 set_status(SpatialStatus::Calibrating {
+                    target,
                     seconds_left: processor.calib_frames_left() as f32 * HOP as f32
                         / SAMPLE_RATE as f32,
                     health,
                 });
-            } else if let Some(c) = processor.calibration() {
+            } else if let Some(tv) = processor.path(PathTarget::Tv) {
+                let (disc_coverage, mean_sep) = match processor.separation() {
+                    Some((d, m)) => (Some(d), Some(m)),
+                    None => (None, None),
+                };
                 set_status(SpatialStatus::Ready {
-                    quality: c.quality,
-                    band_coverage: c.band_coverage,
-                    rank_ratio: c.rank_ratio,
-                    two_source_warning: c.two_source_warning,
+                    tv: PathSummary::from(tv),
+                    user: processor.path(PathTarget::User).map(PathSummary::from),
+                    disc_coverage,
+                    mean_sep,
                     live: live.clone(),
                     health,
+                    last_error: last_error.clone(),
                 });
+            } else if let Some(e) = &last_error {
+                set_status(SpatialStatus::Failed(e.clone()));
             }
         }
         let _ = env.call_method(&rec, jni_str!("stop"), jni_sig!("()V"), &[]);
         let _ = env.call_method(&rec, jni_str!("release"), jni_sig!("()V"), &[]);
         log::info!("spatial capture stopped");
         Ok(())
-    }
-}
-
-impl SpatialProcessor {
-    /// True while a calibration pass is accumulating.
-    pub fn is_calibrating(&self) -> bool {
-        self.calibrating
-    }
-    /// Usable frames still needed by the running calibration.
-    pub fn calib_frames_left(&self) -> usize {
-        CALIB_FRAMES.saturating_sub(self.calib_used)
     }
 }
 
@@ -834,14 +1031,24 @@ mod tests {
         (l, r)
     }
 
-    fn calibrate_on(proc_: &mut SpatialProcessor, l: &[f32], r: &[f32]) {
-        proc_.begin_calibration();
+    /// TV-like and user-like synthetic paths used throughout.
+    fn tv_ch(sig: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        two_ch(sig, 0, 1.0, 5, 0.7)
+    }
+    fn user_ch(sig: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        two_ch(sig, 8, 0.8, 0, 1.0)
+    }
+
+    fn calibrate_on(proc_: &mut SpatialProcessor, target: PathTarget, l: &[f32], r: &[f32]) {
+        proc_.begin_calibration(target);
         let mut done = false;
-        // Feed repeatedly until the calibration completes.
         while !done {
             for o in proc_.push(l, r) {
                 match o {
-                    FrameOutcome::CalibrationDone => done = true,
+                    FrameOutcome::CalibrationDone(t) => {
+                        assert_eq!(t, target);
+                        done = true;
+                    }
                     FrameOutcome::CalibrationFailed(e) => panic!("calibration failed: {e}"),
                     _ => {}
                 }
@@ -849,12 +1056,12 @@ mod tests {
         }
     }
 
-    fn mean_score(proc_: &mut SpatialProcessor, l: &[f32], r: &[f32]) -> f32 {
+    fn mean_single(proc_: &mut SpatialProcessor, l: &[f32], r: &[f32]) -> f32 {
         let mut sum = 0.0;
         let mut n = 0u32;
         for o in proc_.push(l, r) {
-            if let FrameOutcome::Scored { score, .. } = o {
-                sum += score;
+            if let FrameOutcome::Scored { single, .. } = o {
+                sum += single;
                 n += 1;
             }
         }
@@ -862,20 +1069,37 @@ mod tests {
         sum / n as f32
     }
 
+    /// Mean contrast over scored frames; panics if no frame produced one.
+    fn mean_contrast(proc_: &mut SpatialProcessor, l: &[f32], r: &[f32]) -> f32 {
+        let mut sum = 0.0;
+        let mut n = 0u32;
+        for o in proc_.push(l, r) {
+            if let FrameOutcome::Scored {
+                contrast: Some(c), ..
+            } = o
+            {
+                sum += c;
+                n += 1;
+            }
+        }
+        assert!(n > 0, "no contrast frames");
+        sum / n as f32
+    }
+
     #[test]
     fn tv_path_scores_high_on_tv_frames() {
         let mut p = SpatialProcessor::new(SR);
         let tv = noise(1, 120_000, 0.1);
-        let (l, r) = two_ch(&tv, 0, 1.0, 5, 0.7);
-        calibrate_on(&mut p, &l, &r);
-        let c = p.calibration().unwrap();
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let c = p.path(PathTarget::Tv).unwrap();
         assert!(c.quality > 0.9, "quality {}", c.quality);
         assert!(c.band_coverage > 0.9, "coverage {}", c.band_coverage);
         assert!(!c.two_source_warning, "rank ratio {}", c.rank_ratio);
 
         let tv2 = noise(2, 120_000, 0.1); // different program, same path
-        let (l2, r2) = two_ch(&tv2, 0, 1.0, 5, 0.7);
-        let s = mean_score(&mut p, &l2, &r2);
+        let (l2, r2) = tv_ch(&tv2);
+        let s = mean_single(&mut p, &l2, &r2);
         assert!(s > 0.9, "same-path score {s}");
     }
 
@@ -883,18 +1107,16 @@ mod tests {
     fn other_position_scores_lower() {
         let mut p = SpatialProcessor::new(SR);
         let tv = noise(3, 120_000, 0.1);
-        let (l, r) = two_ch(&tv, 0, 1.0, 5, 0.7);
-        calibrate_on(&mut p, &l, &r);
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
 
-        // A different source position: opposite delay ordering, different
-        // gains — a mouth at arm's length instead of the TV across the room.
         let voice = noise(4, 120_000, 0.1);
-        let (l2, r2) = two_ch(&voice, 8, 0.8, 0, 1.0);
-        let s_other = mean_score(&mut p, &l2, &r2);
+        let (l2, r2) = user_ch(&voice);
+        let s_other = mean_single(&mut p, &l2, &r2);
 
         let tv2 = noise(5, 120_000, 0.1);
-        let (l3, r3) = two_ch(&tv2, 0, 1.0, 5, 0.7);
-        let s_tv = mean_score(&mut p, &l3, &r3);
+        let (l3, r3) = tv_ch(&tv2);
+        let s_tv = mean_single(&mut p, &l3, &r3);
 
         assert!(
             s_tv > s_other + 0.2,
@@ -904,11 +1126,80 @@ mod tests {
     }
 
     #[test]
+    fn contrast_separates_tv_from_user() {
+        let mut p = SpatialProcessor::new(SR);
+        let tv = noise(20, 120_000, 0.1);
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let me = noise(21, 120_000, 0.1);
+        let (lu, ru) = user_ch(&me);
+        calibrate_on(&mut p, PathTarget::User, &lu, &ru);
+
+        let (d, m) = p.separation().expect("separation after both paths");
+        assert!(d > 0.5, "disc coverage {d}");
+        assert!(m > 0.2, "mean sep {m}");
+
+        let tv2 = noise(22, 120_000, 0.1);
+        let (l2, r2) = tv_ch(&tv2);
+        let c_tv = mean_contrast(&mut p, &l2, &r2);
+        assert!(c_tv > CONTRAST_TV, "tv contrast {c_tv}");
+
+        let me2 = noise(23, 120_000, 0.1);
+        let (l3, r3) = user_ch(&me2);
+        let c_me = mean_contrast(&mut p, &l3, &r3);
+        assert!(c_me < CONTRAST_USER, "user contrast {c_me}");
+    }
+
+    #[test]
+    fn identical_paths_yield_no_contrast_evidence() {
+        // Both calibrations on the SAME path — the degenerate room where
+        // geometry can't discriminate. The processor must report near-zero
+        // separation and refuse to produce contrast frames, not emit a
+        // confident direction.
+        let mut p = SpatialProcessor::new(SR);
+        let a = noise(24, 120_000, 0.1);
+        let (l, r) = tv_ch(&a);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let b = noise(25, 120_000, 0.1);
+        let (l2, r2) = tv_ch(&b);
+        calibrate_on(&mut p, PathTarget::User, &l2, &r2);
+
+        let (d, m) = p.separation().unwrap();
+        assert!(d < DISC_MIN, "disc coverage {d} on identical paths");
+        assert!(m < 0.05, "mean sep {m} on identical paths");
+
+        let c = noise(26, 60_000, 0.1);
+        let (l3, r3) = tv_ch(&c);
+        for o in p.push(&l3, &r3) {
+            if let FrameOutcome::Scored { contrast, .. } = o {
+                assert!(
+                    contrast.is_none(),
+                    "contrast produced despite zero separation: {contrast:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn user_pass_alone_does_not_enable_contrast() {
+        let mut p = SpatialProcessor::new(SR);
+        let me = noise(27, 120_000, 0.1);
+        let (l, r) = user_ch(&me);
+        calibrate_on(&mut p, PathTarget::User, &l, &r);
+        assert!(p.separation().is_none());
+        // No TV path yet: nothing is scored at all.
+        let (l2, r2) = user_ch(&noise(28, 60_000, 0.1));
+        for o in p.push(&l2, &r2) {
+            assert!(matches!(o, FrameOutcome::Quiet));
+        }
+    }
+
+    #[test]
     fn quiet_frames_produce_no_score() {
         let mut p = SpatialProcessor::new(SR);
         let tv = noise(6, 120_000, 0.1);
-        let (l, r) = two_ch(&tv, 0, 1.0, 5, 0.7);
-        calibrate_on(&mut p, &l, &r);
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
         let silence = vec![0.0f32; 40_000];
         let outcomes = p.push(&silence, &silence);
         // The STFT accumulator legitimately carries up to FFT_N−1 samples of
@@ -926,13 +1217,13 @@ mod tests {
         let mut p = SpatialProcessor::new(SR);
         let a = noise(7, 200_000, 0.1);
         let b = noise(8, 200_000, 0.1);
-        let (la, ra) = two_ch(&a, 0, 1.0, 5, 0.7);
-        let (lb, rb) = two_ch(&b, 8, 0.8, 0, 1.0);
+        let (la, ra) = tv_ch(&a);
+        let (lb, rb) = user_ch(&b);
         let n = la.len().min(lb.len());
         let l: Vec<f32> = (0..n).map(|i| la[i] + lb[i]).collect();
         let r: Vec<f32> = (0..n).map(|i| ra[i] + rb[i]).collect();
-        calibrate_on(&mut p, &l, &r);
-        let c = p.calibration().unwrap();
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let c = p.path(PathTarget::Tv).unwrap();
         assert!(
             c.two_source_warning,
             "two equal sources not flagged (rank ratio {})",
@@ -944,9 +1235,9 @@ mod tests {
     fn single_source_rank_ratio_is_low() {
         let mut p = SpatialProcessor::new(SR);
         let tv = noise(9, 120_000, 0.1);
-        let (l, r) = two_ch(&tv, 0, 1.0, 5, 0.7);
-        calibrate_on(&mut p, &l, &r);
-        let c = p.calibration().unwrap();
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let c = p.path(PathTarget::Tv).unwrap();
         assert!(c.rank_ratio < 0.1, "rank ratio {}", c.rank_ratio);
     }
 
@@ -956,8 +1247,8 @@ mod tests {
         // No shared source at all: nothing for a path to be learned from.
         let l = noise(10, 120_000, 0.1);
         let r = noise(11, 120_000, 0.1);
-        calibrate_on(&mut p, &l, &r);
-        let c = p.calibration().unwrap();
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        let c = p.path(PathTarget::Tv).unwrap();
         assert!(c.quality < 0.3, "quality {} on incoherent input", c.quality);
         assert!(
             c.band_coverage < 0.3,
@@ -969,7 +1260,7 @@ mod tests {
     #[test]
     fn calibration_fails_loudly_on_silence() {
         let mut p = SpatialProcessor::new(SR);
-        p.begin_calibration();
+        p.begin_calibration(PathTarget::Tv);
         let silence = vec![0.0f32; FFT_N * CALIB_FRAMES * CALIB_MAX_WALL_FACTOR];
         let outcomes = p.push(&silence, &silence);
         assert!(
@@ -978,19 +1269,19 @@ mod tests {
                 .any(|o| matches!(o, FrameOutcome::CalibrationFailed(_))),
             "silent calibration did not fail"
         );
-        assert!(p.calibration().is_none());
+        assert!(p.path(PathTarget::Tv).is_none());
     }
 
     #[test]
     fn relearn_keeps_old_calibration_until_done() {
         let mut p = SpatialProcessor::new(SR);
         let tv = noise(12, 120_000, 0.1);
-        let (l, r) = two_ch(&tv, 0, 1.0, 5, 0.7);
-        calibrate_on(&mut p, &l, &r);
-        assert!(p.calibration().is_some());
-        p.begin_calibration();
+        let (l, r) = tv_ch(&tv);
+        calibrate_on(&mut p, PathTarget::Tv, &l, &r);
+        assert!(p.path(PathTarget::Tv).is_some());
+        p.begin_calibration(PathTarget::Tv);
         // Old calibration must survive an in-progress relearn.
-        assert!(p.calibration().is_some());
+        assert!(p.path(PathTarget::Tv).is_some());
         assert!(p.is_calibrating());
     }
 }
