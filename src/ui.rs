@@ -2186,7 +2186,7 @@ impl DashboardApp {
         if tract_grid_for(basis).is_none() {
             ("CALIBRATING", ink(115), false)
         } else if self.tract_live {
-            ("LIVE", TEAL, true)
+            ("TRACKING", TEAL, true)
         } else if self.current_profile.metrics.voiced_but_noisy {
             // Periodicity present but the room is too loud to measure it
             // honestly: say so, instead of silently holding.
@@ -2951,21 +2951,35 @@ impl DashboardApp {
                         .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(state)
-                            .font(FontId::monospace(10.0))
-                            .color(accent)
-                            .strong(),
-                    );
-                    if live {
+                    // Two distinct facts, two chips. LIVE (cyan, blinking)
+                    // means a recording is running — the acquisition is
+                    // live, exactly as the card always showed. The model
+                    // chip beside it says what the mesh is doing with that
+                    // audio: TRACKING on gated frames, else HELD / NOISY /
+                    // CALIBRATING / —. Dropping the LIVE indicator in favor
+                    // of the model state alone read as "live capture is
+                    // gone" — it isn't, and the card must not imply it.
+                    if recording {
                         let blink = if now.fract() < 0.5 { 255 } else { 64 };
+                        ui.label(
+                            RichText::new("LIVE")
+                                .font(FontId::monospace(10.0))
+                                .color(CYAN_DEEP),
+                        );
                         let (dot, _) = ui.allocate_exact_size(vec2(10.0, 10.0), Sense::hover());
                         ui.painter().circle_filled(
                             dot.center(),
                             3.0,
                             Color32::from_rgba_unmultiplied(6, 182, 212, blink),
                         );
+                        ui.add_space(10.0);
                     }
+                    ui.label(
+                        RichText::new(state)
+                            .font(FontId::monospace(10.0))
+                            .color(accent)
+                            .strong(),
+                    );
                 });
             });
             let (rect, _) =
