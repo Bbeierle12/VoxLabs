@@ -25,6 +25,7 @@ mod lab {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
+    use voice_harmonic_engine::audio_file::{self, resample};
     use voice_harmonic_engine::fach::{self, Ltas, RegisterDetector, TurnoverTracker};
     use voice_harmonic_engine::frame::{ANALYSIS_FRAME, FrameAnalyzer};
     use voice_harmonic_engine::math;
@@ -40,108 +41,6 @@ mod lab {
     /// study option, since higher voices never sing below 200 Hz. This is
     /// the default ceiling for that pool (`--vtl-f0-max` overrides it).
     pub const RELAXED_F0_MAX: f32 = 300.0;
-
-    // ─── Decoding ──────────────────────────────────────────────────────
-
-    /// Decode any supported container/codec to mono f32 at its native rate.
-    pub fn decode(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
-        use symphonia::core::audio::SampleBuffer;
-        use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
-        use symphonia::core::errors::Error;
-        use symphonia::core::formats::FormatOptions;
-        use symphonia::core::io::MediaSourceStream;
-        use symphonia::core::meta::MetadataOptions;
-        use symphonia::core::probe::Hint;
-
-        let file = File::open(path)?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-        let probed = symphonia::default::get_probe().format(
-            &hint,
-            mss,
-            &FormatOptions::default(),
-            &MetadataOptions::default(),
-        )?;
-        let mut format = probed.format;
-        let track = format
-            .tracks()
-            .iter()
-            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-            .ok_or_else(|| anyhow::anyhow!("no decodable audio track"))?;
-        let track_id = track.id;
-        let sr = track
-            .codec_params
-            .sample_rate
-            .ok_or_else(|| anyhow::anyhow!("unknown sample rate"))?;
-        let mut decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())?;
-        let mut mono: Vec<f32> = Vec::new();
-        loop {
-            let packet = match format.next_packet() {
-                Ok(p) => p,
-                Err(Error::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-                Err(Error::ResetRequired) => break,
-                Err(e) => return Err(e.into()),
-            };
-            if packet.track_id() != track_id {
-                continue;
-            }
-            match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    let spec = *decoded.spec();
-                    let ch = spec.channels.count().max(1);
-                    let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
-                    buf.copy_interleaved_ref(decoded);
-                    for fr in buf.samples().chunks(ch) {
-                        mono.push(fr.iter().sum::<f32>() / ch as f32);
-                    }
-                }
-                Err(Error::DecodeError(_)) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok((mono, sr))
-    }
-
-    /// Windowed-sinc resampler (Hann window, 32 taps each side, cutoff at
-    /// 0.45 × the lower rate). Enough for a study tool; identity when the
-    /// rates already match.
-    pub fn resample(x: &[f32], sr_in: f32, sr_out: f32) -> Vec<f32> {
-        if (sr_in - sr_out).abs() < 0.5 || x.is_empty() {
-            return x.to_vec();
-        }
-        let ratio = sr_out as f64 / sr_in as f64;
-        let n_out = (x.len() as f64 * ratio).floor() as usize;
-        let fc = 0.45 * sr_in.min(sr_out) / sr_in; // cycles per input sample
-        let taps: isize = 32;
-        let mut out = Vec::with_capacity(n_out);
-        for i in 0..n_out {
-            let t = i as f64 / ratio;
-            let c = t.floor() as isize;
-            let frac = (t - c as f64) as f32;
-            let mut acc = 0.0f32;
-            for k in -taps..=taps {
-                let idx = c + k;
-                if idx < 0 || idx >= x.len() as isize {
-                    continue;
-                }
-                let d = k as f32 - frac; // sample offset from t
-                let arg = 2.0 * fc * d;
-                let sinc = if arg.abs() < 1e-6 {
-                    1.0
-                } else {
-                    (std::f32::consts::PI * arg).sin() / (std::f32::consts::PI * arg)
-                };
-                let w = 0.5 + 0.5 * (std::f32::consts::PI * d / taps as f32).cos();
-                acc += x[idx as usize] * 2.0 * fc * sinc * w;
-            }
-            out.push(acc);
-        }
-        out
-    }
 
     // ─── Per-file analysis ─────────────────────────────────────────────
 
@@ -549,14 +448,8 @@ mod lab {
             for p in entries {
                 if p.is_dir() {
                     walk(&p, out);
-                } else if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                    let e = ext.to_ascii_lowercase();
-                    if matches!(
-                        e.as_str(),
-                        "wav" | "flac" | "mp3" | "m4a" | "aac" | "ogg" | "oga"
-                    ) {
-                        out.push(p);
-                    }
+                } else if audio_file::is_audio_file(&p) {
+                    out.push(p);
                 }
             }
         }
@@ -623,14 +516,15 @@ mod lab {
                 .to_string_lossy()
                 .replace('\\', "/");
             eprint!("[{}/{}] {rel} … ", n + 1, files.len());
-            let (samples, sr_native) = match decode(path) {
+            let dec = match audio_file::decode(path) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("decode failed: {e}");
                     continue;
                 }
             };
-            let samples = resample(&samples, sr_native as f32, sr);
+            let sr_native = dec.sample_rate;
+            let samples = resample(&dec.samples, sr_native as f32, sr);
             let rep = analyze_samples(&samples, sr, sr_native, vtl_f0_max);
             eprintln!(
                 "{:.1} s, voiced {:.0}%, identity {:.0}%, FHE(m) {}",
@@ -955,8 +849,9 @@ mod lab {
             }
             Some("file") => {
                 let path = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
-                let (samples, sr_native) = decode(&path)?;
-                let samples = resample(&samples, sr_native as f32, DEFAULT_SR);
+                let dec = audio_file::decode(&path)?;
+                let sr_native = dec.sample_rate;
+                let samples = resample(&dec.samples, sr_native as f32, DEFAULT_SR);
                 let rep = analyze_samples(&samples, DEFAULT_SR, sr_native, RELAXED_F0_MAX);
                 println!("{}", path.display());
                 println!(
@@ -1119,14 +1014,13 @@ mod lab {
         }
 
         #[test]
-        fn resample_preserves_a_tone() {
+        fn resampled_tone_analyzes_at_its_pitch() {
             let sr_in = 44_100.0;
             let n = 44_100;
             let x: Vec<f32> = (0..n)
                 .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr_in).sin())
                 .collect();
             let y = resample(&x, sr_in, 48_000.0);
-            assert!((y.len() as f32 - 48_000.0).abs() < 2.0);
             let rep = analyze_samples(&y, 48_000.0, 44_100, RELAXED_F0_MAX);
             let t = rep.tessitura.expect("tessitura");
             assert!((t.p50 - 440.0).abs() < 3.0, "p50 {}", t.p50);
@@ -1139,10 +1033,11 @@ mod lab {
             let p = dir.join("tone.wav");
             let s = synth_vowel(150.0, 2600.0, 48_000.0, 1.0);
             write_wav(&p, &s, 48_000).unwrap();
-            let (d, sr) = decode(&p).unwrap();
-            assert_eq!(sr, 48_000);
-            assert!((d.len() as isize - s.len() as isize).abs() < 4);
-            let err: f32 = d
+            let dec = audio_file::decode(&p).unwrap();
+            assert_eq!(dec.sample_rate, 48_000);
+            assert!((dec.samples.len() as isize - s.len() as isize).abs() < 4);
+            let err: f32 = dec
+                .samples
                 .iter()
                 .zip(&s)
                 .map(|(a, b)| (a - b).abs())

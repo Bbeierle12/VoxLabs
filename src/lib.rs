@@ -22,13 +22,24 @@ mod analysis;
 // NativeActivity glue. Gated so desktop and web are untouched.
 #[cfg(target_os = "android")]
 mod android;
+// "Share → VoxLabs": reads the launching intent's audio stream into the
+// import folder. JNI, Android-only.
+#[cfg(target_os = "android")]
+mod share_intent;
 
+// Audio-file decoding + resampling for the in-app import path and the
+// `voxlab` harness. Native only (the web build has no files).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod audio_file;
 // Raw-audio export of a running capture (WAV mirror of the analysis
 // frames), so a phone capture can go through the `voxlab` harness like a
 // dataset file. Desktop + Android; the web target has no disk.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capture_log;
 mod concurrency;
+// In-app file import: a file through the capture pipeline. Cross-target
+// (inert on web).
+mod import;
 // Voice-part (Fach) measurements: FHE, LTAS, cluster stats, tessitura,
 // turnover, dominant harmonic, register events. Pure math, cross-target,
 // public for the study harness.
@@ -72,7 +83,7 @@ pub mod types;
 mod ui;
 
 pub use concurrency::ConcurrencyBridges;
-pub use ui::DashboardApp;
+pub use ui::{AppPaths, DashboardApp};
 
 /// Consecutive `process_frame` failures tolerated before the desktop analysis
 /// loop gives up and reports itself stopped. A single failure can be a
@@ -95,6 +106,7 @@ pub fn run() -> anyhow::Result<()> {
     use crate::concurrency::AnalysisState;
     use cpal::traits::{DeviceTrait, HostTrait};
     use std::panic::AssertUnwindSafe;
+    use std::path::Path;
     use std::thread;
 
     env_logger::init();
@@ -174,10 +186,16 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     let store_path = persist::default_store_path();
-    // Raw captures land beside the archive: `<data dir>/VoxLabs/captures/`.
-    let capture_dir = store_path
+    // Raw captures and the import folder live beside the archive:
+    // `<data dir>/VoxLabs/{captures,import}/`.
+    let data_dir = store_path
         .as_ref()
-        .and_then(|p| p.parent().map(|d| d.join("captures")));
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    let paths = AppPaths {
+        store: store_path,
+        captures: data_dir.as_ref().map(|d| d.join("captures")),
+        imports: data_dir.as_ref().map(|d| d.join("import")),
+    };
 
     eframe::run_native(
         "Voice Harmonic Engine",
@@ -191,8 +209,7 @@ pub fn run() -> anyhow::Result<()> {
                 spectrum_rx,
                 scope_rx,
                 input_sample_rate,
-                store_path,
-                capture_dir,
+                paths,
             )))
         }),
     )

@@ -75,9 +75,8 @@ async fn start_web() -> Result<(), String> {
                     48_000.0,
                     // No filesystem in the browser: the archive lives only
                     // for this session (disk persistence is native-only),
-                    // and there is no raw-capture export either.
-                    None,
-                    None,
+                    // and there is no raw-capture export or file import.
+                    voice_harmonic_engine::AppPaths::default(),
                 )))
             }),
         )

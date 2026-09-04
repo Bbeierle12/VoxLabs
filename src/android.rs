@@ -236,10 +236,24 @@ fn android_main(app: AndroidApp) {
     // (`/sdcard/Android/data/<pkg>/files/captures`): no permission needed,
     // and unlike internal storage it is reachable with a plain `adb pull`
     // (no `run-as`), which is how the study harness collects them.
-    let capture_dir = app
+    let external = app
         .external_data_path()
-        .or_else(|| app.internal_data_path())
-        .map(|p| p.join("captures"));
+        .or_else(|| app.internal_data_path());
+    let paths = crate::ui::AppPaths {
+        store: store_path,
+        captures: external.as_ref().map(|p| p.join("captures")),
+        // The import folder: `adb push`, a file manager, or the share
+        // sheet (see `share_intent`) puts audio here; the Sessions screen
+        // lists and analyzes it.
+        imports: external.as_ref().map(|p| p.join("import")),
+    };
+    // A file shared to the app ("Share → VoxLabs") arrives as this
+    // activity's intent; copy it into the import folder now and hand it to
+    // the UI to analyze on its first frame.
+    let shared = paths
+        .imports
+        .as_deref()
+        .and_then(|dir| crate::share_intent::take_shared_audio(dir));
 
     let native_options = eframe::NativeOptions {
         android_app: Some(app),
@@ -252,7 +266,7 @@ fn android_main(app: AndroidApp) {
         "Voice Harmonic Engine",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(DashboardApp::new(
+            let mut app = DashboardApp::new(
                 cc,
                 event_tx,
                 telemetry,
@@ -260,9 +274,12 @@ fn android_main(app: AndroidApp) {
                 spectrum_rx,
                 scope_rx,
                 input_sample_rate,
-                store_path,
-                capture_dir,
-            )))
+                paths,
+            );
+            if let Some(path) = shared {
+                app.queue_import(path);
+            }
+            Ok(Box::new(app))
         }),
     ) {
         log::error!("eframe exited with error: {e:?}");

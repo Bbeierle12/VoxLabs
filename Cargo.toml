@@ -96,6 +96,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # pure Rust, on every target that records. The `voxlab` harness also uses
 # it for synthetic fixtures.
 hound = "3.5"
+# File import (src/audio_file.rs), in the app and in the `voxlab` harness:
+# pure-Rust decoding of WAV/FLAC/MP3/AAC/Vorbis. Pure Rust, so it builds for
+# Android unchanged; the web target has no files to decode.
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac", "vorbis", "ogg"] }
 
 # Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
 # logger, plus winit's default backends (x11/wayland, matching eframe's stock
@@ -106,9 +110,6 @@ wgpu = "29.0.3"
 pollster = "0.4.0"
 env_logger = "0.11.10"
 winit = "0.30.13"
-# Fach Lab study harness (`voxlab` binary): pure-Rust audio decoding for the
-# dataset (WAV/FLAC/MP3/AAC/Vorbis).
-symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac", "vorbis", "ogg"] }
 
 # Android only: android-activity's NativeActivity glue provides the `android_main`
 # entry (via winit's `android-native-activity` backend), eframe renders through
@@ -168,3 +169,22 @@ label = "Voice Harmonic Engine"
 # must also grant it at runtime (see docs/android-build.md).
 [[package.metadata.android.uses_permission]]
 name = "android.permission.RECORD_AUDIO"
+
+# "Share → VoxLabs" / "Open with VoxLabs" for audio files (src/share_intent.rs).
+# cargo-apk adds the MAIN/LAUNCHER filter itself when none is declared, so it
+# has to be spelled out once we declare any.
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = ["android.intent.category.LAUNCHER"]
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.SEND"]
+categories = ["android.intent.category.DEFAULT"]
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "audio/*"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.VIEW"]
+categories = ["android.intent.category.DEFAULT"]
+[[package.metadata.android.application.activity.intent_filter.data]]
+mime_type = "audio/*"

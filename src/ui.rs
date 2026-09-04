@@ -23,6 +23,8 @@ use eframe::egui::{
 use rtrb::Producer;
 use std::path::PathBuf;
 
+use crate::import;
+
 // Raw-audio capture export: the real sink on native targets, an inert
 // stand-in on web (no disk), so the capture screen compiles unchanged.
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,6 +92,14 @@ const MIN_ENROLL_VOICED_FRACTION: f32 = 0.5;
 /// Recording auto-stops here so a capture left running off-screen can't grow
 /// its accumulators unbounded.
 const MAX_REC_SECS: f64 = 60.0;
+/// File import: frames folded into the capture accumulators per repaint.
+/// 128 frames is 5.5 s of audio per tick, so a three-minute file lands in
+/// under a second of repaints while the screen stays responsive.
+const IMPORT_FRAMES_PER_TICK: usize = 128;
+/// How often the import-folder listing is re-read while it is on screen.
+const IMPORT_LIST_REFRESH_SECS: f64 = 2.0;
+/// Import-folder rows shown on the Sessions screen (newest first).
+const IMPORT_LIST_MAX: usize = 12;
 
 /// How long the analysis thread may go without publishing a frame — while the
 /// microphone is demonstrably live — before the UI calls it stalled. One
@@ -358,6 +368,19 @@ pub(crate) struct Session {
     capture_file: Option<String>,
 }
 
+/// Where the app keeps things on disk. Any of them may be `None` (the web
+/// build has no disk at all); each feature that needs a path degrades on
+/// its own — no archive, no raw-capture export, no file import.
+#[derive(Clone, Debug, Default)]
+pub struct AppPaths {
+    /// The reference + session archive (`archive.json`).
+    pub store: Option<PathBuf>,
+    /// Raw-capture WAV exports.
+    pub captures: Option<PathBuf>,
+    /// The import folder the Sessions screen lists and analyzes.
+    pub imports: Option<PathBuf>,
+}
+
 struct CaptureResult {
     match_pct: Option<f32>,
     /// Mean f0 over the capture's voiced frames; `None` = no voiced signal
@@ -577,6 +600,20 @@ pub struct DashboardApp {
     /// Where raw capture WAVs are written (`None` = no export on this
     /// platform). See `capture_log`.
     capture_dir: Option<PathBuf>,
+    /// The import folder: audio files here can be analyzed as captures
+    /// (`None` = no file import on this platform). See `import`.
+    import_dir: Option<PathBuf>,
+    /// A file analysis in flight; while it runs, the capture accumulators
+    /// take the file's frames and ignore the microphone.
+    import_job: Option<import::Job>,
+    /// Cached listing of `import_dir`, refreshed every couple of seconds
+    /// while the Sessions screen is up (the folder is small; a stat per
+    /// repaint would still be wasteful).
+    import_list: Vec<import::Entry>,
+    import_list_at: f64,
+    /// A file handed over before the first frame (share sheet); started on
+    /// the first repaint, when `now` exists.
+    pending_import: Option<PathBuf>,
     /// User switch for the raw-audio export (default on: the study needs
     /// the files, and the one-minute cap bounds the size).
     export_audio: bool,
@@ -598,9 +635,13 @@ impl DashboardApp {
         spectrum_rx: Output<Vec<f32>>,
         scope_rx: Output<Vec<f32>>,
         sample_rate: f32,
-        store_path: Option<PathBuf>,
-        capture_dir: Option<PathBuf>,
+        paths: AppPaths,
     ) -> Self {
+        let AppPaths {
+            store: store_path,
+            captures: capture_dir,
+            imports: import_dir,
+        } = paths;
         let mut visuals = egui::Visuals::light();
         visuals.override_text_color = Some(INK);
         visuals.panel_fill = BG_BASE;
@@ -696,11 +737,22 @@ impl DashboardApp {
             next_session_num: saved.next_session_num,
             store_path,
             capture_dir,
+            import_dir,
+            import_job: None,
+            import_list: Vec::new(),
+            import_list_at: -1e9,
+            pending_import: None,
             export_audio: true,
             last_capture: None,
             capture_error: None,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
+    }
+
+    /// Analyze a file at startup (the Android share sheet hands one over
+    /// before the UI exists). Runs on the first repaint.
+    pub fn queue_import(&mut self, path: PathBuf) {
+        self.pending_import = Some(path);
     }
 
     /// Write the current reference + archive to `store_path` (no-op on web).
@@ -855,6 +907,7 @@ impl DashboardApp {
         // accumulators can't grow unbounded; the tab bar shows a live dot
         // meanwhile.
         if let RecState::Recording { start } = self.rec
+            && self.import_job.is_none()
             && now - start >= MAX_REC_SECS
         {
             self.stop_rec(now);
@@ -984,14 +1037,26 @@ impl DashboardApp {
             return;
         }
         let mono = |s: String, a: u8| RichText::new(s).font(FontId::monospace(10.0)).color(ink(a));
+        let imported = self
+            .last_capture
+            .as_ref()
+            .is_some_and(|c| self.is_imported(&c.path));
         ui.horizontal(|ui| {
-            let label = if self.export_audio {
-                "AUDIO EXPORT: ON"
+            if imported {
+                ui.label(
+                    RichText::new("FILE")
+                        .font(FontId::monospace(9.5))
+                        .color(TEAL_DARK),
+                );
             } else {
-                "AUDIO EXPORT: OFF"
-            };
-            if probe_chip(ui, label) {
-                self.export_audio = !self.export_audio;
+                let label = if self.export_audio {
+                    "AUDIO EXPORT: ON"
+                } else {
+                    "AUDIO EXPORT: OFF"
+                };
+                if probe_chip(ui, label) {
+                    self.export_audio = !self.export_audio;
+                }
             }
             ui.add_space(8.0);
             match (&self.last_capture, &self.capture_error) {
@@ -1027,10 +1092,10 @@ impl DashboardApp {
         }
     }
 
+    /// Begin a live capture: reset the accumulators, arm the raw-audio
+    /// export.
     fn start_rec(&mut self, now: f64) {
-        self.rec = RecState::Recording { start: now };
-        self.last_capture = None;
-        self.capture_error = None;
+        self.reset_rec(now);
         if self.export_audio
             && let Some(dir) = &self.capture_dir
         {
@@ -1042,6 +1107,14 @@ impl DashboardApp {
                 }
             }
         }
+    }
+
+    /// Enter Recording with every per-capture accumulator cleared. Shared
+    /// by the live capture and the file import.
+    fn reset_rec(&mut self, now: f64) {
+        self.rec = RecState::Recording { start: now };
+        self.last_capture = None;
+        self.capture_error = None;
         self.rec_f0_acc.clear();
         self.rec_frames_total = 0;
         self.rec_hnr_acc.clear();
@@ -1106,7 +1179,13 @@ impl DashboardApp {
                 profile: res.profile,
                 formants: res.formants,
                 coverage_pct: res.coverage_pct,
-                capture_file: self.last_capture.as_ref().map(CaptureFile::file_name),
+                capture_file: self.last_capture.as_ref().map(|c| {
+                    if self.is_imported(&c.path) {
+                        import::session_file_name(&c.path)
+                    } else {
+                        c.file_name()
+                    }
+                }),
             };
             self.next_session_num += 1;
             // Sidecar for the study harness: the session's own measurements
@@ -1150,37 +1229,15 @@ impl DashboardApp {
         format!("V-{:04X}", (h >> 16) as u16)
     }
 
-    /// One waveform sample per frame: recording follows the live input RMS,
-    /// idle decays flat (same smoothing constants as the prototype).
-    fn push_wave_sample(&mut self) {
-        const H: f32 = 52.0;
-        let recording = matches!(self.rec, RecState::Recording { .. });
-        let last = *self.wave.last().unwrap_or(&2.0);
-        let next = if recording {
-            let jitter = 0.7 + 0.6 * self.rand01();
-            let target = (3.0 + self.input_rms() * 260.0 * jitter).min(H * 0.42);
-            last + (target - last) * 0.55
-        } else {
-            last + (2.0 - last) * 0.12
-        };
-        self.wave.push(next.max(1.5));
-        self.wave.remove(0);
-    }
-}
-
-// ── top level ────────────────────────────────────────────────────────────────
-
-impl eframe::App for DashboardApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // Continuous repaint: canvases + live readouts animate every frame.
-        ui.ctx().request_repaint();
-        let now = ui.input(|i| i.time);
-
-        self.watch_engine(now);
-        self.advance(now);
-
-        if self.ui_profile_rx.updated() {
-            self.current_profile = *self.ui_profile_rx.read();
+    /// Feed one profile into the live readouts and, while a capture is
+    /// running, its accumulators. `fresh` marks a new analysis frame (the
+    /// live path repaints ~3× per frame and calls this every repaint with
+    /// `fresh` only on the first; a file import calls it once per frame).
+    /// The microphone loop and the file-import worker both end here, which
+    /// is what makes an imported file a capture like any other.
+    fn ingest_profile(&mut self, p: VocalProfile, fresh: bool) {
+        if fresh {
+            self.current_profile = p;
 
             // Coverage accounting, once per analysis frame (repaints arrive
             // ~3x more often than profiles; counting those would inflate
@@ -1295,6 +1352,146 @@ impl eframe::App for DashboardApp {
                 }
                 self.rec_profile_n += 1;
             }
+        }
+    }
+
+    /// Drain the import worker: up to [`IMPORT_FRAMES_PER_TICK`] frames per
+    /// repaint into the capture accumulators, then the hand-off to the
+    /// Analyzing state when the file ends.
+    fn poll_import(&mut self, now: f64) {
+        let mut n = 0;
+        while n < IMPORT_FRAMES_PER_TICK {
+            let Some(job) = self.import_job.as_mut() else {
+                return;
+            };
+            match job.try_recv() {
+                None => return,
+                Some(import::Msg::Meta { .. }) => {}
+                Some(import::Msg::Profile(p)) => {
+                    self.ingest_profile(*p, true);
+                    n += 1;
+                }
+                Some(import::Msg::Done) => {
+                    self.finish_import(now);
+                    return;
+                }
+                Some(import::Msg::Error(e)) => {
+                    let name = job.name.clone();
+                    self.import_job = None;
+                    self.rec = RecState::Idle;
+                    self.persist_notice = Some(format!("Could not analyze {name} — {e}"));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Analyze `path` as a capture: the accumulators reset, the worker
+    /// starts, and the Capture screen shows the progress. Refused while a
+    /// live capture or another import is running.
+    fn start_import(&mut self, path: PathBuf, now: f64) {
+        if self.import_job.is_some()
+            || matches!(
+                self.rec,
+                RecState::Recording { .. } | RecState::Analyzing { .. }
+            )
+        {
+            return;
+        }
+        self.reset_rec(now);
+        self.import_job = Some(import::Job::start(path, self.sample_rate));
+        self.screen = Screen::Capture;
+    }
+
+    /// The file ended: what the export line and the sidecar need comes from
+    /// the job, and the state machine proceeds exactly as after a live stop.
+    fn finish_import(&mut self, now: f64) {
+        let Some(job) = self.import_job.take() else {
+            return;
+        };
+        self.last_capture = Some(CaptureFile {
+            path: job.path,
+            seconds: job.seconds,
+            peak_dbfs: job.peak_dbfs,
+            clipped: job.clipped,
+        });
+        self.rec = RecState::Analyzing {
+            start: now,
+            elapsed: job.seconds as f64,
+        };
+    }
+
+    fn cancel_import(&mut self) {
+        // Dropping the job disconnects the worker, which then returns.
+        self.import_job = None;
+        self.rec = RecState::Idle;
+        self.result = None;
+    }
+
+    /// Whether `path` is one of the import folder's files (a session saved
+    /// from it records `import/<name>` rather than a capture export name).
+    fn is_imported(&self, path: &std::path::Path) -> bool {
+        self.import_dir
+            .as_ref()
+            .is_some_and(|d| path.starts_with(d))
+    }
+
+    fn refresh_import_list(&mut self, now: f64) {
+        if now - self.import_list_at < IMPORT_LIST_REFRESH_SECS {
+            return;
+        }
+        self.import_list_at = now;
+        self.import_list = self
+            .import_dir
+            .as_deref()
+            .map(import::list)
+            .unwrap_or_default();
+    }
+
+    /// One waveform sample per frame: recording follows the live input RMS,
+    /// idle decays flat (same smoothing constants as the prototype).
+    fn push_wave_sample(&mut self) {
+        const H: f32 = 52.0;
+        let recording = matches!(self.rec, RecState::Recording { .. });
+        let last = *self.wave.last().unwrap_or(&2.0);
+        let next = if recording {
+            let jitter = 0.7 + 0.6 * self.rand01();
+            let target = (3.0 + self.input_rms() * 260.0 * jitter).min(H * 0.42);
+            last + (target - last) * 0.55
+        } else {
+            last + (2.0 - last) * 0.12
+        };
+        self.wave.push(next.max(1.5));
+        self.wave.remove(0);
+    }
+}
+
+// ── top level ────────────────────────────────────────────────────────────────
+
+impl eframe::App for DashboardApp {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Continuous repaint: canvases + live readouts animate every frame.
+        ui.ctx().request_repaint();
+        let now = ui.input(|i| i.time);
+
+        self.watch_engine(now);
+        self.advance(now);
+        if let Some(path) = self.pending_import.take() {
+            self.start_import(path, now);
+        }
+
+        let fresh = self.ui_profile_rx.updated();
+        let live = if fresh {
+            *self.ui_profile_rx.read()
+        } else {
+            self.current_profile
+        };
+        if self.import_job.is_some() {
+            // A file is being analyzed: its frames drive everything and the
+            // microphone is ignored until it ends.
+            self.poll_import(now);
+        } else {
+            self.ingest_profile(live, fresh);
         }
         // Display smoothing for the digit readouts; reset when the value goes
         // away so stale numbers never linger.
@@ -3101,8 +3298,15 @@ impl DashboardApp {
                     // gone" — it isn't, and the card must not imply it.
                     if recording {
                         let blink = if now.fract() < 0.5 { 255 } else { 64 };
+                        // A file import drives the same card from a file,
+                        // not the microphone: say so instead of LIVE.
+                        let source = if self.import_job.is_some() {
+                            "FILE"
+                        } else {
+                            "LIVE"
+                        };
                         ui.label(
-                            RichText::new("LIVE")
+                            RichText::new(source)
                                 .font(FontId::monospace(10.0))
                                 .color(CYAN_DEEP),
                         );
@@ -3393,7 +3597,9 @@ impl DashboardApp {
                 }
 
                 if resp.clicked() {
-                    if recording {
+                    if self.import_job.is_some() {
+                        self.cancel_import();
+                    } else if recording {
                         self.stop_rec(now);
                     } else {
                         self.start_rec(now);
@@ -3401,7 +3607,13 @@ impl DashboardApp {
                 }
 
                 ui.add_space(12.0);
-                let hint = if let RecState::Recording { start } = self.rec {
+                let hint = if let Some(job) = &self.import_job {
+                    format!(
+                        "Analyzing {} · {:.0}% — tap to cancel",
+                        job.name,
+                        100.0 * job.progress()
+                    )
+                } else if let RecState::Recording { start } = self.rec {
                     format!(
                         "Recording {:.0} s{} — tap to stop (auto-stops at {MAX_REC_SECS:.0} s)",
                         now - start,
@@ -3917,9 +4129,100 @@ impl DashboardApp {
         });
     }
 
+    /// The import folder, as a card: each audio file with an ANALYZE chip
+    /// that runs it through the capture pipeline. Nothing is drawn on
+    /// platforms without an import folder.
+    fn files_card(&mut self, ui: &mut egui::Ui) {
+        let Some(dir) = self.import_dir.clone() else {
+            return;
+        };
+        let now = ui.input(|i| i.time);
+        self.refresh_import_list(now);
+        let busy = self.import_job.is_some()
+            || matches!(
+                self.rec,
+                RecState::Recording { .. } | RecState::Analyzing { .. }
+            );
+        let mut start: Option<PathBuf> = None;
+        glass(20.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Files").size(14.0).color(INK).strong());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("IMPORT FOLDER")
+                            .font(FontId::monospace(9.5))
+                            .color(ink(115)),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            if self.import_list.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No audio files yet. Share a recording to VoxLabs from any app, \
+                         or drop WAV / FLAC / MP3 / M4A / OGG files in the folder below.",
+                    )
+                    .size(12.0)
+                    .color(ink(140)),
+                );
+            }
+            for entry in self.import_list.iter().take(IMPORT_LIST_MAX) {
+                ui.horizontal(|ui| {
+                    let name = if entry.name.chars().count() > 30 {
+                        let head: String = entry.name.chars().take(27).collect();
+                        format!("{head}…")
+                    } else {
+                        entry.name.clone()
+                    };
+                    ui.label(RichText::new(name).size(12.5).color(INK));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(import::size_label(entry.bytes))
+                            .font(FontId::monospace(9.5))
+                            .color(ink(110)),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if busy {
+                            ui.label(
+                                RichText::new("BUSY")
+                                    .font(FontId::monospace(9.5))
+                                    .color(ink(90)),
+                            );
+                        } else if probe_chip(ui, "ANALYZE") {
+                            start = Some(entry.path.clone());
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+            }
+            if self.import_list.len() > IMPORT_LIST_MAX {
+                ui.label(
+                    RichText::new(format!(
+                        "+{} more (newest {IMPORT_LIST_MAX} shown)",
+                        self.import_list.len() - IMPORT_LIST_MAX
+                    ))
+                    .font(FontId::monospace(9.5))
+                    .color(ink(110)),
+                );
+            }
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(dir.display().to_string())
+                    .font(FontId::monospace(9.0))
+                    .color(ink(100)),
+            );
+        });
+        if let Some(path) = start {
+            self.start_import(path, now);
+        }
+        ui.add_space(14.0);
+    }
+
     fn screen_sessions(&mut self, ui: &mut egui::Ui) {
         self.screen_kicker(ui, "CAPTURE ARCHIVE", "Sessions");
         ui.add_space(16.0);
+
+        self.files_card(ui);
 
         // Filter chips.
         ui.horizontal(|ui| {
