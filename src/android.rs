@@ -32,7 +32,7 @@
 
 use crate::audio::AudioEngine;
 use crate::concurrency::{AnalysisState, ConcurrencyBridges, Telemetry};
-use crate::types::{Formant, VocalProfile};
+use crate::types::VocalProfile;
 use crate::ui::DashboardApp;
 use rtrb::Consumer;
 use std::panic::AssertUnwindSafe;
@@ -43,9 +43,7 @@ use std::time::{Duration, Instant};
 use triple_buffer::Input;
 use winit::platform::android::activity::AndroidApp;
 
-/// Samples per analysis frame. Mirrors `analysis::ANALYSIS_FRAME` (2048 @ 44.1
-/// kHz ≈ 46 ms) — kept local so the GPU analysis module stays desktop-only.
-const ANALYSIS_FRAME: usize = 2048;
+use crate::frame::ANALYSIS_FRAME;
 
 /// Fallback microphone rate when the input device can't be queried yet (e.g.
 /// `RECORD_AUDIO` not granted at launch). 48 kHz is the near-universal Android
@@ -129,23 +127,6 @@ fn retire_previous_generation() {
         }
     }
 }
-
-/// Spectral envelope held before the first voiced frame and through unvoiced
-/// gaps, so synthesis never collapses. Mirrors `analysis::DEFAULT_FORMANTS`.
-const DEFAULT_FORMANTS: [Formant; 3] = [
-    Formant {
-        frequency: 500.0,
-        bandwidth: 80.0,
-    },
-    Formant {
-        frequency: 1500.0,
-        bandwidth: 120.0,
-    },
-    Formant {
-        frequency: 2500.0,
-        bandwidth: 160.0,
-    },
-];
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
@@ -303,22 +284,18 @@ fn cpu_analysis_loop(
     telemetry: &Telemetry,
     shutdown: &AtomicBool,
 ) {
+    use crate::frame::FrameAnalyzer;
     use crate::math;
 
-    let mut last_formants = DEFAULT_FORMANTS;
-    // f0 of the frame `last_formants` was measured on (0.0 = never), so the
-    // UI's formant-reliability gate judges by measurement conditions.
-    let mut last_formants_f0 = 0.0f32;
+    // The per-frame DSP is the shared `FrameAnalyzer` (identical to what the
+    // `voxlab` study harness runs on files); this loop owns only the ring
+    // drain, room-calibration bookkeeping, UI feeds, and timing.
+    let mut analyzer = FrameAnalyzer::new(sample_rate);
     let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
-    // f0-contour tracker for vibrato/steadiness, mirroring the desktop path.
-    let mut contour = crate::metrics::F0Contour::new(sample_rate / ANALYSIS_FRAME as f32);
     // Scrolling-spectrogram STFT, mirroring the desktop path.
     let mut spectrogram = crate::spectrogram::Spectrogram::new();
-    // Ambient-floor tracker for the SNR voicing gate (see math::NoiseFloor).
-    let mut noise_floor = math::NoiseFloor::new();
     // Room calibration state, mirroring the desktop engine.
     let mut calibrator = math::RoomCalibrator::new();
-    let mut room_interferer: Option<math::Interferer> = None;
     let mut timer = FrameTimer::new(sample_rate);
 
     loop {
@@ -339,29 +316,20 @@ fn cpu_analysis_loop(
             let started = Instant::now();
             let frame = &accumulator[..ANALYSIS_FRAME];
 
-            // --- Pitch (f0): pure-CPU YIN ---
-            let pitch = math::yin_pitch(frame, sample_rate);
-            let (f0, yin_voiced) = match pitch {
-                Some(p) if p.confidence > 0.4 && (50.0..=1000.0).contains(&p.f0) => (p.f0, true),
-                _ => (0.0, false),
-            };
+            let result = analyzer.analyze(frame);
 
-            // SNR voicing gate, mirroring the desktop path: periodicity
-            // alone is not voice — a YIN-voiced frame must also clear the
-            // learned ambient floor by VOICED_MIN_SNR_DB or it is demoted
-            // to unvoiced here, protecting every downstream consumer at one
-            // point. The floor learns from unvoiced frames only.
-            let rms = math::frame_rms(frame);
-
-            // Room calibration pass, mirroring the desktop engine.
+            // Room calibration pass, mirroring the desktop engine. It wants
+            // the pre-gate periodicity (a calibrating room with a voice in
+            // it must fail), which the analyzer reports alongside the
+            // gated profile.
             let (calibrating, calib_done) = telemetry.take_calibration_frame();
             if calibrating {
-                calibrator.push(rms, yin_voiced.then_some(f0));
+                calibrator.push(result.rms, result.yin_f0);
                 if calib_done {
                     match calibrator.finish() {
                         Ok(cal) => {
-                            noise_floor.seed(cal.ambient_rms);
-                            room_interferer = cal.interferer;
+                            analyzer.seed_floor(cal.ambient_rms);
+                            analyzer.set_interferer(cal.interferer);
                             telemetry.set_calibration_result(Some((
                                 cal.ambient_rms,
                                 cal.interferer.map(|i| (i.f0_hz, i.rms)),
@@ -381,84 +349,7 @@ fn cpu_analysis_loop(
                 }
             }
 
-            let snr_db = noise_floor.snr_db(rms);
-            let snr_ok = snr_db.is_none_or(|s| s >= math::VOICED_MIN_SNR_DB);
-            // Calibrated-interferer gate (see the desktop engine's comment).
-            let hum = room_interferer.is_some_and(|i| math::interferer_match(f0, rms, &i));
-            let voiced = yin_voiced && snr_ok && !hum;
-            let voiced_but_noisy = yin_voiced && (!snr_ok || hum);
-            if !yin_voiced {
-                noise_floor.push_unvoiced(rms);
-            }
-            let f0 = if voiced { f0 } else { 0.0 };
-
-            // --- Formants via LPC on a decimated signal (voiced frames only) ---
-            if voiced {
-                let m = ((sample_rate / 11_025.0).round() as usize).max(1);
-                let fs_dec = sample_rate / m as f32;
-                let order = (2 + (fs_dec / 1000.0) as usize).clamp(8, 20);
-
-                let decimated = math::decimate(frame, m);
-                let lpc = math::lpc_coefficients(&decimated, order, 0.97);
-                let measured = math::formants_from_lpc(&lpc, fs_dec);
-                if measured[0].frequency > 0.0 {
-                    last_formants = measured;
-                    last_formants_f0 = f0;
-                }
-            }
-
-            // Harmonic series at k·f0, mirroring the desktop analysis path.
-            let partial_amplitudes = if voiced {
-                math::harmonic_amplitudes(frame, sample_rate, f0)
-            } else {
-                [0.0; crate::types::MAX_PARTIALS]
-            };
-
-            // Voice-quality metrics, mirroring the desktop analysis path.
-            contour.push(f0, voiced);
-            let (vibrato, steadiness_cents) = contour.analyze();
-            let perturbation = if voiced {
-                math::cycle_perturbation(frame, sample_rate, f0)
-            } else {
-                None
-            };
-            let metrics = crate::types::VoiceMetrics {
-                hnr_db: if voiced {
-                    math::hnr_db(frame, sample_rate, f0)
-                } else {
-                    None
-                },
-                h1_h2_db: if voiced {
-                    math::h1_h2_db(&partial_amplitudes)
-                } else {
-                    None
-                },
-                vibrato,
-                steadiness_cents,
-                jitter_pct: perturbation.map(|p| p.jitter_pct),
-                shimmer_db: perturbation.map(|p| p.shimmer_db),
-                cpp_db: if voiced {
-                    math::cpp_db(frame, sample_rate)
-                } else {
-                    None
-                },
-                centroid_hz: if voiced {
-                    math::spectral_centroid(frame, sample_rate)
-                } else {
-                    None
-                },
-                snr_db,
-                voiced_but_noisy,
-            };
-
-            let profile = VocalProfile {
-                f0,
-                formants: last_formants,
-                formants_f0: last_formants_f0,
-                partial_amplitudes,
-                metrics,
-                valid: voiced,
-            };
+            let profile = result.profile;
             profile_tx.write(profile);
             ui_profile_tx.write(profile);
 

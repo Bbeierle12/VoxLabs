@@ -45,7 +45,11 @@ mod persist;
 // f0-contour metrics (vibrato/steadiness): used by the desktop and Android
 // analysis loops; the web target has no analysis thread yet.
 #[cfg(not(target_arch = "wasm32"))]
-mod metrics;
+pub mod metrics;
+// The shared per-frame CPU pipeline (Android loop + the `voxlab` study
+// harness). Public so the harness binary can drive it.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod frame;
 // Scrolling-spectrogram STFT. Compiled on all targets (its consts size the
 // UI's waterfall buffers); the engine itself is driven only by the desktop
 // and Android analysis loops.
