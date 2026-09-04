@@ -23,6 +23,11 @@ mod analysis;
 #[cfg(target_os = "android")]
 mod android;
 
+// Raw-audio export of a running capture (WAV mirror of the analysis
+// frames), so a phone capture can go through the `voxlab` harness like a
+// dataset file. Desktop + Android; the web target has no disk.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod capture_log;
 mod concurrency;
 // Voice-part (Fach) measurements: FHE, LTAS, cluster stats, tessitura,
 // turnover, dominant harmonic, register events. Pure math, cross-target,
@@ -169,6 +174,10 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     let store_path = persist::default_store_path();
+    // Raw captures land beside the archive: `<data dir>/VoxLabs/captures/`.
+    let capture_dir = store_path
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.join("captures")));
 
     eframe::run_native(
         "Voice Harmonic Engine",
@@ -183,6 +192,7 @@ pub fn run() -> anyhow::Result<()> {
                 scope_rx,
                 input_sample_rate,
                 store_path,
+                capture_dir,
             )))
         }),
     )
@@ -214,6 +224,7 @@ fn analysis_loop(
         }
 
         while accumulator.len() >= analysis::ANALYSIS_FRAME {
+            capture_log::push(&accumulator[..analysis::ANALYSIS_FRAME]);
             match engine.process_frame(&accumulator[..analysis::ANALYSIS_FRAME], input_sample_rate)
             {
                 Ok(()) => {

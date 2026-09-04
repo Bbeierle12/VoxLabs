@@ -22,6 +22,46 @@ use eframe::egui::{
 };
 use rtrb::Producer;
 use std::path::PathBuf;
+
+// Raw-audio capture export: the real sink on native targets, an inert
+// stand-in on web (no disk), so the capture screen compiles unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use crate::capture_log::{self as capture_export, CaptureFile};
+#[cfg(target_arch = "wasm32")]
+mod capture_export {
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct CaptureFile {
+        pub path: PathBuf,
+        pub seconds: f32,
+        pub peak_dbfs: f32,
+        pub clipped: usize,
+    }
+
+    impl CaptureFile {
+        pub fn file_name(&self) -> String {
+            self.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        }
+    }
+
+    pub fn arm(_dir: &Path, _sample_rate: u32) -> std::io::Result<PathBuf> {
+        Err(std::io::Error::other("no filesystem on web"))
+    }
+
+    pub fn disarm() -> Option<CaptureFile> {
+        None
+    }
+
+    pub fn is_armed() -> bool {
+        false
+    }
+}
+#[cfg(target_arch = "wasm32")]
+use capture_export::CaptureFile;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use triple_buffer::Output;
@@ -245,9 +285,8 @@ fn teal_a(a: u8) -> Color32 {
 }
 
 /// Small teal chip button (the CALIBRATE pattern, as a helper); returns
-/// whether it was clicked. Android-only because only the device-probe card
-/// draws it so far — widen the cfg when a second caller appears.
-#[cfg(target_os = "android")]
+/// whether it was clicked. Drawn by the device-probe card (Android) and
+/// the capture-export toggle (everywhere).
 fn probe_chip(ui: &mut egui::Ui, label: &str) -> bool {
     let font = FontId::monospace(9.5);
     let galley = ui
@@ -313,6 +352,10 @@ pub(crate) struct Session {
     /// real captures. (The session's voiceprint is derivable from these +
     /// `profile` + `centroid_hz` via `math::build_voiceprint` when needed.)
     formants: Option<[Formant; 3]>,
+    /// File name of the raw-audio export of this capture (in the capture
+    /// directory), so a saved session can be joined to its WAV by the study
+    /// harness. `None` when export was off or unavailable (web).
+    capture_file: Option<String>,
 }
 
 struct CaptureResult {
@@ -531,6 +574,17 @@ pub struct DashboardApp {
     /// Where the reference + archive are persisted (JSON). `None` on web (no
     /// disk) — the archive then lives only for the session.
     store_path: Option<PathBuf>,
+    /// Where raw capture WAVs are written (`None` = no export on this
+    /// platform). See `capture_log`.
+    capture_dir: Option<PathBuf>,
+    /// User switch for the raw-audio export (default on: the study needs
+    /// the files, and the one-minute cap bounds the size).
+    export_audio: bool,
+    /// The most recent finished capture file, shown on the result card and
+    /// linked into the session on save.
+    last_capture: Option<CaptureFile>,
+    /// Why the last export could not be started, if it could not.
+    capture_error: Option<String>,
     rng: u64,
 }
 
@@ -545,6 +599,7 @@ impl DashboardApp {
         scope_rx: Output<Vec<f32>>,
         sample_rate: f32,
         store_path: Option<PathBuf>,
+        capture_dir: Option<PathBuf>,
     ) -> Self {
         let mut visuals = egui::Visuals::light();
         visuals.override_text_color = Some(INK);
@@ -640,6 +695,10 @@ impl DashboardApp {
 
             next_session_num: saved.next_session_num,
             store_path,
+            capture_dir,
+            export_audio: true,
+            last_capture: None,
+            capture_error: None,
             rng: 0x9E37_79B9_7F4A_7C15,
         }
     }
@@ -917,8 +976,72 @@ impl DashboardApp {
         }
     }
 
+    /// Result-card line for the raw-audio export: what was saved (name,
+    /// length, peak, clipping), where, and the on/off chip. Nothing is
+    /// drawn on platforms with no export directory.
+    fn capture_export_line(&mut self, ui: &mut egui::Ui) {
+        if self.capture_dir.is_none() {
+            return;
+        }
+        let mono = |s: String, a: u8| RichText::new(s).font(FontId::monospace(10.0)).color(ink(a));
+        ui.horizontal(|ui| {
+            let label = if self.export_audio {
+                "AUDIO EXPORT: ON"
+            } else {
+                "AUDIO EXPORT: OFF"
+            };
+            if probe_chip(ui, label) {
+                self.export_audio = !self.export_audio;
+            }
+            ui.add_space(8.0);
+            match (&self.last_capture, &self.capture_error) {
+                (Some(cap), _) => {
+                    let clipped = if cap.clipped > 0 {
+                        format!(" · {} CLIPPED", cap.clipped)
+                    } else {
+                        String::new()
+                    };
+                    ui.label(mono(
+                        format!(
+                            "{} · {:.1} s · peak {:.1} dBFS{clipped}",
+                            cap.file_name(),
+                            cap.seconds,
+                            cap.peak_dbfs
+                        ),
+                        150,
+                    ));
+                }
+                (None, Some(err)) => {
+                    ui.label(RichText::new(err.as_str()).size(11.0).color(AMBER_TEXT));
+                }
+                (None, None) => {
+                    ui.label(mono("no audio saved for this capture".into(), 110));
+                }
+            }
+        });
+        if let Some(cap) = &self.last_capture
+            && let Some(dir) = cap.path.parent()
+        {
+            ui.add_space(3.0);
+            ui.label(mono(format!("in {}", dir.display()), 100));
+        }
+    }
+
     fn start_rec(&mut self, now: f64) {
         self.rec = RecState::Recording { start: now };
+        self.last_capture = None;
+        self.capture_error = None;
+        if self.export_audio
+            && let Some(dir) = &self.capture_dir
+        {
+            match capture_export::arm(dir, self.sample_rate.round() as u32) {
+                Ok(path) => log::info!("capture export → {}", path.display()),
+                Err(e) => {
+                    log::warn!("capture export could not start: {e}");
+                    self.capture_error = Some(format!("Audio export off: {e}"));
+                }
+            }
+        }
         self.rec_f0_acc.clear();
         self.rec_frames_total = 0;
         self.rec_hnr_acc.clear();
@@ -943,6 +1066,7 @@ impl DashboardApp {
                 start: now,
                 elapsed: now - start,
             };
+            self.last_capture = capture_export::disarm();
         }
     }
 
@@ -982,8 +1106,24 @@ impl DashboardApp {
                 profile: res.profile,
                 formants: res.formants,
                 coverage_pct: res.coverage_pct,
+                capture_file: self.last_capture.as_ref().map(CaptureFile::file_name),
             };
             self.next_session_num += 1;
+            // Sidecar for the study harness: the session's own measurements
+            // next to its WAV (`capture-….json`), so the phone's numbers and
+            // the harness's numbers join on the file name with a plain
+            // `adb pull` — the archive itself stays app-private.
+            if let Some(cap) = &self.last_capture {
+                let sidecar = cap.path.with_extension("json");
+                match serde_json::to_vec_pretty(&session) {
+                    Ok(bytes) => {
+                        if let Err(e) = std::fs::write(&sidecar, bytes) {
+                            log::warn!("capture sidecar {} not written: {e}", sidecar.display());
+                        }
+                    }
+                    Err(e) => log::warn!("capture sidecar could not be encoded: {e}"),
+                }
+            }
             self.sessions.insert(0, session);
             // Enrollment and the new capture just changed the archive — write it
             // through so it survives a restart.
@@ -3166,7 +3306,9 @@ impl DashboardApp {
                             .color(ink(128)),
                     );
                 });
-                ui.add_space(14.0);
+                ui.add_space(6.0);
+                self.capture_export_line(ui);
+                ui.add_space(10.0);
                 if let Some(reason) = &blocked {
                     // Save is withheld (G2): say why inline; only Discard.
                     ui.label(RichText::new(reason.as_str()).size(12.0).color(AMBER_TEXT));
@@ -3261,8 +3403,13 @@ impl DashboardApp {
                 ui.add_space(12.0);
                 let hint = if let RecState::Recording { start } = self.rec {
                     format!(
-                        "Recording {:.0} s — tap to stop (auto-stops at {MAX_REC_SECS:.0} s)",
-                        now - start
+                        "Recording {:.0} s{} — tap to stop (auto-stops at {MAX_REC_SECS:.0} s)",
+                        now - start,
+                        if capture_export::is_armed() {
+                            " · saving audio"
+                        } else {
+                            ""
+                        }
                     )
                 } else {
                     "Tap to begin capture · sustained /a/ · 8 s min".to_string()

@@ -74,7 +74,9 @@ async fn start_web() -> Result<(), String> {
                     // spectrogram bin→Hz map well-formed (it stays idle).
                     48_000.0,
                     // No filesystem in the browser: the archive lives only
-                    // for this session (disk persistence is native-only).
+                    // for this session (disk persistence is native-only),
+                    // and there is no raw-capture export either.
+                    None,
                     None,
                 )))
             }),

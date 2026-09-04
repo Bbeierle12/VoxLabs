@@ -232,6 +232,14 @@ fn android_main(app: AndroidApp) {
     // (`/data/data/<pkg>/files`), which is writable without any permission and
     // cleared only on uninstall. Captured before `app` moves into the options.
     let store_path = app.internal_data_path().map(|p| p.join("archive.json"));
+    // Raw capture WAVs go to app-specific *external* storage
+    // (`/sdcard/Android/data/<pkg>/files/captures`): no permission needed,
+    // and unlike internal storage it is reachable with a plain `adb pull`
+    // (no `run-as`), which is how the study harness collects them.
+    let capture_dir = app
+        .external_data_path()
+        .or_else(|| app.internal_data_path())
+        .map(|p| p.join("captures"));
 
     let native_options = eframe::NativeOptions {
         android_app: Some(app),
@@ -253,6 +261,7 @@ fn android_main(app: AndroidApp) {
                 scope_rx,
                 input_sample_rate,
                 store_path,
+                capture_dir,
             )))
         }),
     ) {
@@ -316,6 +325,9 @@ fn cpu_analysis_loop(
             let started = Instant::now();
             let frame = &accumulator[..ANALYSIS_FRAME];
 
+            // Mirror the frame to the capture export (no-op unless a capture
+            // is armed) before anything else sees it.
+            crate::capture_log::push(frame);
             let result = analyzer.analyze(frame);
 
             // Room calibration pass, mirroring the desktop engine. It wants

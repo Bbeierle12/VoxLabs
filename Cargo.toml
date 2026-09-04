@@ -92,6 +92,10 @@ eframe = { version = "0.34.3", default-features = false, features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.18.1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# Raw-audio capture export (src/capture_log.rs): 32-bit float WAV writer,
+# pure Rust, on every target that records. The `voxlab` harness also uses
+# it for synthetic fixtures.
+hound = "3.5"
 
 # Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
 # logger, plus winit's default backends (x11/wayland, matching eframe's stock
@@ -103,9 +107,8 @@ pollster = "0.4.0"
 env_logger = "0.11.10"
 winit = "0.30.13"
 # Fach Lab study harness (`voxlab` binary): pure-Rust audio decoding for the
-# dataset (WAV/FLAC/MP3/AAC/Vorbis) and WAV writing for synthetic fixtures.
+# dataset (WAV/FLAC/MP3/AAC/Vorbis).
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac", "vorbis", "ogg"] }
-hound = "3.5"
 
 # Android only: android-activity's NativeActivity glue provides the `android_main`
 # entry (via winit's `android-native-activity` backend), eframe renders through
