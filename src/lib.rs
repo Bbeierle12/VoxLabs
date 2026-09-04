@@ -36,7 +36,7 @@ pub mod fach;
 // dead-code analysis flags.
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod device_probe;
-mod math;
+pub mod math;
 // TV-path spatial calibration + live path-consistency scoring. The math is
 // cross-target and unit-tested; the continuous two-channel capture thread
 // is Android-only (same dead-code shape as device_probe on desktop).
@@ -61,9 +61,9 @@ mod spectrogram;
 mod synthesis;
 // Story two-mode vocal tract model: runtime (tract) + published basis data
 // (tract_data). Compiled on all targets — pure math, no threads or I/O.
-mod tract;
+pub mod tract;
 mod tract_data;
-mod types;
+pub mod types;
 mod ui;
 
 pub use concurrency::ConcurrencyBridges;

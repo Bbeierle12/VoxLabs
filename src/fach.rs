@@ -237,8 +237,45 @@ pub struct ClusterStats {
     pub width_hz: f32,
 }
 
+/// Triangular smoothing of a power spectrum over ±`half_width_hz`, in
+/// linear power. A sustained vowel's mean spectrum is a line spectrum at
+/// k·f0, and [`cluster_stats`] on it would just pick the loudest harmonic
+/// near 2.8 kHz and report a one-bin width. Smoothing with a kernel one
+/// harmonic spacing wide (half-width ≈ f0) turns the lines into the
+/// envelope the cluster statistics are meant to describe, with almost no
+/// residual ripple (a box that wide always straddles the same number of
+/// lines; the second pass removes what is left).
+pub fn smooth_power(mean_power: &[f32], bin_hz: f32, half_width_hz: f32) -> Vec<f32> {
+    let n = mean_power.len();
+    if n == 0 || bin_hz <= 0.0 {
+        return Vec::new();
+    }
+    let r = ((0.5 * half_width_hz / bin_hz).round() as usize).min(n);
+    if r == 0 {
+        return mean_power.to_vec();
+    }
+    let pass = |x: &[f32]| -> Vec<f32> {
+        // Prefix sums for an O(n) box filter.
+        let mut acc = Vec::with_capacity(n + 1);
+        acc.push(0.0f64);
+        for &p in x {
+            let last = *acc.last().unwrap();
+            acc.push(last + p as f64);
+        }
+        (0..n)
+            .map(|i| {
+                let lo = i.saturating_sub(r);
+                let hi = (i + r + 1).min(n);
+                ((acc[hi] - acc[lo]) / (hi - lo) as f64) as f32
+            })
+            .collect()
+    };
+    pass(&pass(mean_power))
+}
+
 /// Cluster statistics on a mean power spectrum. `None` if the window is
-/// empty or the spectrum is silent.
+/// empty or the spectrum is silent. Callers measuring a sustained vowel
+/// should pass the spectrum through [`smooth_power`] first.
 pub fn cluster_stats(mean_power: &[f32], bin_hz: f32) -> Option<ClusterStats> {
     if mean_power.is_empty() || bin_hz <= 0.0 {
         return None;
@@ -373,8 +410,14 @@ pub fn note_name(hz: f32) -> String {
 pub struct TurnoverEvent {
     /// Interpolated f0 at the A2/A1 = 0 dB crossing.
     pub f0_hz: f32,
-    /// True for below→above with rising pitch (the ascending turnover).
+    /// Pitch direction at the crossing: true on an ascending glide. Real
+    /// voices turn over at a slightly different pitch going up than coming
+    /// down, so the two are reported separately.
     pub rising: bool,
+    /// Which harmonic took over: true when H1 became dominant (A2/A1 fell
+    /// through 0 dB — the physical ascending turnover, H2 leaving F1),
+    /// false when H2 took over (A2/A1 rose through 0 dB).
+    pub to_h1: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,7 +466,8 @@ impl TurnoverTracker {
             };
             self.pending = Some(TurnoverEvent {
                 f0_hz: pf0 + t * (f0 - pf0),
-                rising: r > pr && f0 >= pf0,
+                rising: f0 >= pf0,
+                to_h1: r < pr,
             });
         }
         let now = if r <= -TURNOVER_HYSTERESIS_DB {
@@ -438,7 +482,8 @@ impl TurnoverTracker {
             // Confirmed: the ratio moved a full hysteresis band across zero.
             let ev = self.pending.take().unwrap_or(TurnoverEvent {
                 f0_hz: f0,
-                rising: now == Region::Above,
+                rising: self.prev.is_none_or(|(pf0, _)| f0 >= pf0),
+                to_h1: now == Region::Below,
             });
             self.events.push(ev);
         }
@@ -657,6 +702,33 @@ mod tests {
     }
 
     #[test]
+    fn smoothing_turns_a_line_spectrum_into_its_envelope() {
+        // Harmonics of 200 Hz under a Gaussian envelope centred on 2800 Hz.
+        let bin_hz = 23.4375; // 48 kHz / 2048
+        let n = 1025;
+        let mut lines = vec![0.0f32; n];
+        for k in 1..60 {
+            let f = 200.0 * k as f32;
+            let i = (f / bin_hz).round() as usize;
+            if i < n {
+                lines[i] = (-((f - 2800.0) / 400.0).powi(2)).exp();
+            }
+        }
+        // Unsmoothed: the loudest harmonic (2800 exactly) with a one-bin width.
+        let raw = cluster_stats(&lines, bin_hz).unwrap();
+        assert!(raw.width_hz < 2.0 * bin_hz, "raw width {}", raw.width_hz);
+        // Smoothed over ±f0: a contiguous envelope several hundred Hz wide
+        // (the Gaussian's own −3 dB width is 666 Hz), still peaking near 2800.
+        let sm = smooth_power(&lines, bin_hz, 200.0);
+        let env = cluster_stats(&sm, bin_hz).unwrap();
+        assert!((env.peak_hz - 2800.0).abs() < 150.0, "peak {}", env.peak_hz);
+        assert!(env.width_hz > 500.0, "smoothed width {}", env.width_hz);
+        assert!(env.prominence_db > 10.0);
+        assert!(smooth_power(&[], bin_hz, 100.0).is_empty());
+        assert_eq!(smooth_power(&lines, bin_hz, 0.0), lines);
+    }
+
+    #[test]
     fn tessitura_percentiles() {
         let f0s: Vec<f32> = (0..101).map(|i| 100.0 + i as f32).collect(); // 100..200
         let t = tessitura(&f0s).unwrap();
@@ -679,11 +751,12 @@ mod tests {
 
     #[test]
     fn turnover_fires_once_at_the_crossing_on_a_glide() {
-        // f0 200 → 400 over 100 frames; A2/A1 = (f0 − 300)/10 dB crosses 0 at 300.
+        // f0 200 → 400 over 100 frames; A2/A1 = (300 − f0)/10 dB crosses 0
+        // at 300, falling as pitch rises (H2 leaves F1, H1 takes over).
         let mut t = TurnoverTracker::new();
         for i in 0..=100 {
             let f0 = 200.0 + 2.0 * i as f32;
-            t.push(Some(f0), Some((f0 - 300.0) / 10.0));
+            t.push(Some(f0), Some((300.0 - f0) / 10.0));
         }
         let ev = t.events();
         assert_eq!(ev.len(), 1, "events {ev:?}");
@@ -692,7 +765,16 @@ mod tests {
             "crossing {}",
             ev[0].f0_hz
         );
-        assert!(ev[0].rising);
+        assert!(ev[0].rising && ev[0].to_h1);
+        // The same glide back down: descending crossing, H2 takes over.
+        for i in (0..=100).rev() {
+            let f0 = 200.0 + 2.0 * i as f32;
+            t.push(Some(f0), Some((300.0 - f0) / 10.0));
+        }
+        let ev = t.events();
+        assert_eq!(ev.len(), 2, "events {ev:?}");
+        assert!(!ev[1].rising && !ev[1].to_h1);
+        assert!((ev[1].f0_hz - 300.0).abs() < 4.0);
     }
 
     #[test]
