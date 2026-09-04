@@ -24,6 +24,10 @@ mod analysis;
 mod android;
 
 mod concurrency;
+// Voice-part (Fach) measurements: FHE, LTAS, cluster stats, tessitura,
+// turnover, dominant harmonic, register events. Pure math, cross-target,
+// public for the study harness.
+pub mod fach;
 // Capture-stack capability probe (UNPROCESSED support, microphone inventory,
 // channel independence). Report/analysis types compile everywhere so the UI
 // and tests are cross-target; the JNI half is Android-only. The dead_code
