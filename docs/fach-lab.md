@@ -121,7 +121,42 @@ directory if needed; the app never does.
 
 ---
 
-## 5. Known answers (M0 acceptance)
+## 5. Analyzing files in the app
+
+The app itself analyzes audio files, through the same pipeline as a live
+capture — the result card, the voiceprint match, the session archive, and
+the sidecar export are all the live ones. Two ways in:
+
+**Share sheet.** In Drive, Files, a voice recorder, or anything else that
+can share an audio file, choose *Share → VoxLabs (dev)* (or *Open with*).
+The app starts, copies the file into its import folder, and analyzes it
+immediately: the Capture screen shows *Analyzing <file> · 43 %*, the
+tract card reads FILE instead of LIVE, and the result card appears when
+the file ends. (A share opens a fresh instance of the app; the previous
+one, if it was open, is retired — the same relaunch path an activity
+restart takes.)
+
+**Import folder.** Put files in
+
+| Platform | Import folder |
+|---|---|
+| Android | `/sdcard/Android/data/com.voiceharmonic.engine.dev/files/import/` (`adb push song.wav /sdcard/Android/data/com.voiceharmonic.engine.dev/files/import/`) |
+| Desktop | `~/.local/share/VoxLabs/import/` |
+
+and they appear in the **Files** card at the top of the Sessions screen,
+newest first, each with an ANALYZE chip. The record button cancels a
+running analysis. Formats: WAV, FLAC, MP3, M4A/AAC, OGG; stereo is
+downmixed; any sample rate is resampled to the engine's.
+
+A session saved from a file records `capture_file = import/<name>` (a
+live capture records `capture-….wav`), and its sidecar JSON is written
+beside the file in the import folder. While a file runs, the microphone
+is ignored by the capture accumulators; the spectrogram and scope still
+show the room.
+
+---
+
+## 6. Known answers (M0 acceptance)
 
 `voxlab synth` writes three fixtures; `voxlab analyze` on them must report:
 
