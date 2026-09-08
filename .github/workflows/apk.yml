@@ -1,0 +1,87 @@
+# apk-pipeline: build a Rust/cargo-apk APK in GitHub Actions, signed with the project's
+# vault key (VoxLabs-style projects: NativeActivity, NDK, 16 KB page alignment).
+#
+# Install: copy to <project>/.github/workflows/apk.yml; run `apk ci-secrets NAME` once.
+# cargo-apk reads the keystore path and password from CARGO_APK_RELEASE_KEYSTORE and
+# CARGO_APK_RELEASE_KEYSTORE_PASSWORD; the vault keystores hold one key, so no alias is needed.
+name: APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NDK_VERSION: r26d               # the runbook pins NDK 26.3.x
+  APK_GLOB: target/release/apk/*.apk
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - uses: android-actions/setup-android@v3
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+      - name: Install cargo-apk
+        run: cargo install cargo-apk --locked
+
+      - name: Restore the signing key from secrets
+        env:
+          APK_KEYSTORE_B64: ${{ secrets.APK_KEYSTORE_B64 }}
+        run: |
+          test -n "$APK_KEYSTORE_B64" || { echo "APK_KEYSTORE_B64 is not set: run 'apk ci-secrets <name>'" >&2; exit 1; }
+          printf '%s' "$APK_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/pipeline.jks"
+
+      - name: Build
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+          # Pixel 8+ use 16 KB pages; a 4 KB-aligned .so installs and then dies on launch.
+          RUSTFLAGS: -C link-arg=-Wl,-z,max-page-size=16384
+          CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/pipeline.jks
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.APK_KS_PASS }}
+        run: cargo apk build --lib --release
+
+      - name: Locate the APK
+        run: |
+          ls -la "$(dirname "$APK_GLOB")"
+          APK=$(ls $APK_GLOB | grep -v unaligned | head -n 1)
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apk
+          path: ${{ env.APK }}
+
+      - name: Show the signer and the page alignment
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          unzip -l "$APK" | grep -iE 'META-INF|\.so' || true
+          "$BT/apksigner" verify --verbose --print-certs "$APK" || true
+          "$BT/apksigner" verify --print-certs "$APK" | grep 'SHA-256'
+          unzip -o -q "$APK" 'lib/*' -d "$RUNNER_TEMP/apkchk"
+          "${{ steps.ndk.outputs.ndk-path }}"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$RUNNER_TEMP"/apkchk/lib/arm64-v8a/*.so | grep LOAD
+
+      - name: Attach to the rolling "latest" pre-release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest >/dev/null 2>&1 \
+            || gh release create latest --prerelease --title "Latest build" \
+                 --notes "Rolling build from main. Download the APK and tap it to install; updates keep app data because every build is signed with the same key."
+          gh release upload latest "$APK" --clobber
