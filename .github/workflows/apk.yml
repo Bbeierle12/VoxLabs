@@ -55,19 +55,26 @@ jobs:
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.APK_KS_PASS }}
         run: cargo apk build --lib --release
 
-      - name: Show the signer and the page alignment
+      - name: Locate the APK
         run: |
-          APK=$(ls $APK_GLOB | head -n 1)
+          ls -la "$(dirname "$APK_GLOB")"
+          APK=$(ls $APK_GLOB | grep -v unaligned | head -n 1)
           echo "APK=$APK" >> "$GITHUB_ENV"
-          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
-          "$BT/apksigner" verify --print-certs "$APK" | grep 'SHA-256'
-          unzip -o -q "$APK" 'lib/*' -d "$RUNNER_TEMP/apkchk"
-          "${{ steps.ndk.outputs.ndk-path }}"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$RUNNER_TEMP"/apkchk/lib/arm64-v8a/*.so | grep LOAD
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: apk
           path: ${{ env.APK }}
+
+      - name: Show the signer and the page alignment
+        run: |
+          BT="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)"
+          unzip -l "$APK" | grep -iE 'META-INF|\.so' || true
+          "$BT/apksigner" verify --verbose --print-certs "$APK" || true
+          "$BT/apksigner" verify --print-certs "$APK" | grep 'SHA-256'
+          unzip -o -q "$APK" 'lib/*' -d "$RUNNER_TEMP/apkchk"
+          "${{ steps.ndk.outputs.ndk-path }}"/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf -l "$RUNNER_TEMP"/apkchk/lib/arm64-v8a/*.so | grep LOAD
 
       - name: Attach to the rolling "latest" pre-release
         if: github.event_name != 'pull_request'
