@@ -11,3 +11,9 @@ dist/
 /.claude/
 
 .idea/
+
+# apk-pipeline: signing material never enters git
+*.p12
+*.pk8
+*.password
+secrets.env
