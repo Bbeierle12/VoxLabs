@@ -14,7 +14,7 @@ pub(super) fn tract_grid_for(
     basis: &'static crate::tract::TractBasis,
 ) -> Option<&'static crate::tract::TractGrid> {
     use crate::pipeline::stages::inverse::{shared_grid, shared_grid_if_built};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     static BUILDING_M: AtomicBool = AtomicBool::new(false);
     static BUILDING_F: AtomicBool = AtomicBool::new(false);
 
@@ -28,6 +28,7 @@ pub(super) fn tract_grid_for(
     };
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use std::sync::atomic::Ordering;
         if !building.swap(true, Ordering::Relaxed) {
             std::thread::spawn(move || {
                 shared_grid(basis, crate::tract::GRID_N);
