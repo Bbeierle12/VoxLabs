@@ -1,0 +1,69 @@
+# Live Model — Plan v3 §5 Phase 1, the walking skeleton.
+#
+# Loaded by the runner (not generated). Selects the stream format, the
+# ordered stages with their backends, the taps the shell renders, and the
+# runner's limits. Stage parameters come from pipeline.toml; any key may be
+# overridden here under [params.<section>] (a key no config struct declares
+# fails to load).
+
+name = "live_model"
+
+# Every stage output the shell shows in its debug panel; `tract` also drives
+# the tube view.
+taps = ["yin", "lpc", "inverse", "tract"]
+
+# Stream format (D14: hop 1024 is canonical for the whole pipeline). The
+# shell substitutes the device's real sample rate before building; frame
+# and hop are as written. A frame must hold yin.window + sample_rate /
+# yin.f0_min_hz samples (1024 + 960 at 48 kHz).
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 2048
+hop = 1024
+
+[runner]
+# Idle sleep between ring-buffer drains, ms. Range: 1..=10.
+poll_ms = 5
+# Tap channel depth, messages. A full channel drops and counts. Range: 8..=256.
+tap_capacity = 64
+# Timing summary to the log every this many hops (512 hops ≈ 11 s at hop
+# 1024 / 48 kHz). Range: 47..=4700.
+report_every_hops = 512
+# Gate: worst hop < this fraction of the 21.3 ms hop budget (the report's
+# Experiment 1 threshold, applied natively). Range: 0.1..=1.0.
+hop_budget_fraction_max = 0.5
+# Gate: mic-to-render latency ceiling, ms (ring arrival → tap consumed by
+# the UI at paint). Range: 20.0..=200.0.
+mic_to_render_max_ms = 100.0
+# The shell waits this long for the worker's init (two 41×41 grid builds)
+# before opening audio anyway, ms. Range: 500..=10000.
+init_timeout_ms = 4000
+# Not-yet-wrapped per-frame work (harmonics, metrics, gates, spectrogram)
+# runs every this many hops: 2 keeps the pre-pipeline 2048-sample cadence,
+# so those numbers are unchanged until Phase 2 wraps them. Range: 1..=4.
+legacy_frame_every_hops = 2
+# Drained-but-unconsumed audio the re-framer reserves, in frames; more than
+# this in flight means the worker is behind and allocates. Range: 1..=8.
+pending_capacity_frames = 2
+
+# Ordered stages. Each input must be produced earlier (or be the source
+# AudioFrame); the builder names the missing adapter chain otherwise.
+[[stage]]
+name = "yin"
+backend = "yin_cpu"
+
+[[stage]]
+name = "lpc"
+backend = "lpc_levinson"
+
+[[stage]]
+name = "inverse"
+backend = "grid_story"
+
+[[stage]]
+name = "tract"
+backend = "story_two_mode"
+
+# Parameter overrides on top of pipeline.toml, e.g.
+#   [params.tract]
+#   grid_n = 21

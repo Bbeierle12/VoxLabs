@@ -26,6 +26,8 @@ mod live;
 mod model;
 mod nav;
 mod overview;
+#[cfg(not(target_arch = "wasm32"))]
+mod pipeline_panel;
 mod recording;
 mod room;
 mod room_probe;
@@ -305,6 +307,10 @@ pub struct DashboardApp {
     /// Why the last export could not be started, if it could not.
     capture_error: Option<String>,
     rng: u64,
+    /// The pipeline runner's taps and stats, once a shell attaches one
+    /// (Android; see `pipeline_panel`). None on desktop until Phase 5c.
+    #[cfg(not(target_arch = "wasm32"))]
+    pipeline: Option<pipeline_panel::PipelineShell>,
 }
 
 impl eframe::App for DashboardApp {
@@ -314,6 +320,8 @@ impl eframe::App for DashboardApp {
         let now = ui.input(|i| i.time);
 
         self.watch_engine(now);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_pipeline();
         self.advance(now);
         if let Some(path) = self.pending_import.take() {
             self.start_import(path, now);

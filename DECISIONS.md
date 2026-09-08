@@ -21,6 +21,9 @@ mirrored back to the plan.
 | D11 | Provenance record per run (stage impls, versions, params, target, build flags, input hash) is the input to `vox-validation`; output format is Vocal Tract Lab's Evidence tab | Proposed |
 | D12 | No pipeline editor before Phase 8, and Phase 8 is gated on external use | Proposed |
 | D13 | Rename `voice_harmonic_engine` → `vox-core` and split `ui.rs` *before* the Coral subtree import | Proposed |
+| D14 | Hop 1024 is canonical for the whole pipeline; spectrogram moves to hop 1024 with `overlap` as its own parameter | Decided |
+| D16 | LPC order is adaptive (8–20 after decimation to 11 025 Hz) by design; not fixed 24 | Decided |
+| D17 | `parabolic_flat_eps` (1e-6 YIN vs 1e-12 elsewhere) and synthesis vs analysis default bandwidths: confirm intentional or reconcile, from the code | Decided (check in Phase 1) |
 | O1 | Whether inverse tables and PCA bases derived from VTL `.speaker` files are GPL-encumbered | Open — check the data files' license in the VTL repo; get a real opinion before any sale |
 | O2 | Canonical Coral signing key | Open |
 | O3 | Whether Resonator adopts the core (cheap if it's a 3-stage pipeline config) | Open |
@@ -36,3 +39,33 @@ mirrored back to the plan.
   renamed to `vox-core`, Android package to `org.voxlabs.core`, `ui.rs` split
   into `src/ui/`. Its row above still reads "Proposed" because that is how §1
   is written; the plan is the place to change it.
+- **D14, D16, D17** (2026-09-08): copied from Plan v3 §1 as written (D15 and
+  D18 exist in the plan but were not requested here). D14 is applied to the
+  runner (`pipelines/live_model.toml`, hop 1024); the spectrogram still runs at
+  hop 512 with its own `[spectrogram]` keys until it becomes a stage (Phase 5c).
+  D16 is the code as it stands: `lpc.order_base + fs_dec / lpc.order_hz_per_pole`
+  clamped to `[lpc.order_min, lpc.order_max]` = 8–20 at 11 025 Hz.
+- **D17 findings** (2026-09-08, read from the code and history; nothing
+  changed):
+  - `yin.parabolic_flat_eps = 1e-6` vs `1e-12` in `hnr`, `perturbation`, and
+    `vibrato`. All four guard the same formula, `|s0 − 2·s1 + s2|`. YIN's runs
+    on the cumulative-mean-normalized difference, whose values are of order 1,
+    so 1e-6 is a real "flat neighbourhood" threshold at f32 precision. The
+    other three run on raw signal-scale quantities (autocorrelation sums,
+    sample peaks, DFT power) where 1e-12 only catches an exact-zero
+    denominator. Both were introduced together in commit b32aed4
+    (2026-07-01, "publish jitter/shimmer/CPP on both analysis paths") with no
+    comment either way. Verdict: consistent with intent (different scales), but
+    undocumented; reconciling to one value would change YIN's lag refinement.
+    Recommendation: keep both, document the scale argument on the fields.
+  - Synthesis default bandwidths `[50, 100, 150]` vs analysis `[80, 120, 160]`.
+    The synthesis triple is the oscillator's start-up envelope before any
+    profile arrives (narrower = more resonant idle tone); the analysis triple is
+    the envelope held until the first voiced frame. They can both reach the
+    oscillator: `set_profile` adopts the analysis defaults whenever a voiced
+    frame's LPC resolves no F1. Both also date from b32aed4 with no comment.
+    Verdict: cannot be confirmed intentional from the code; the values do not
+    interact numerically (the glide converges either way), so no behavior
+    hinges on it. Recommendation: reconcile to the analysis triple when Phase 2
+    wraps synthesis, since that is the envelope the analyzer actually holds.
+

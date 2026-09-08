@@ -45,8 +45,87 @@ pub use spatial::SpatialConfig;
 pub use spectrogram::{ResampleConfig, SpectrogramConfig};
 pub use stream::StreamConfig;
 pub use synthesis::SynthesisConfig;
-pub use tract::TractConfig;
+pub use tract::{InverseConfig, TractConfig};
 pub use voiceprint::VoiceprintConfig;
+
+/// Every stage's parameters together — the shape of `pipeline.toml`. This is
+/// what the pipeline builder hands each stage's `init`; a mode file
+/// (`pipelines/live_model.toml`) may override any key under `[params]`.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PipelineParams {
+    pub stream: StreamConfig,
+    pub yin: YinConfig,
+    pub voicing: VoicingConfig,
+    pub noise_floor: NoiseFloorConfig,
+    pub room_calibration: RoomCalibrationConfig,
+    pub lpc: LpcConfig,
+    pub formants: FormantConfig,
+    pub harmonics: HarmonicsConfig,
+    pub hnr: HnrConfig,
+    pub perturbation: PerturbationConfig,
+    pub cpp: CppConfig,
+    pub centroid: CentroidConfig,
+    pub timbre: TimbreConfig,
+    pub voice_class: VoiceClassConfig,
+    pub tuning: TuningConfig,
+    pub voiceprint: VoiceprintConfig,
+    pub vibrato: VibratoConfig,
+    pub spectrogram: SpectrogramConfig,
+    pub resample: ResampleConfig,
+    pub synthesis: SynthesisConfig,
+    pub fach: FachConfig,
+    pub spatial: SpatialConfig,
+    pub tract: TractConfig,
+    pub inverse: InverseConfig,
+}
+
+impl PipelineParams {
+    /// The code's defaults, section by section; identical to `pipeline.toml`.
+    pub const DEFAULT: Self = Self {
+        stream: StreamConfig::DEFAULT,
+        yin: YinConfig::DEFAULT,
+        voicing: VoicingConfig::DEFAULT,
+        noise_floor: NoiseFloorConfig::DEFAULT,
+        room_calibration: RoomCalibrationConfig::DEFAULT,
+        lpc: LpcConfig::DEFAULT,
+        formants: FormantConfig::DEFAULT,
+        harmonics: HarmonicsConfig::DEFAULT,
+        hnr: HnrConfig::DEFAULT,
+        perturbation: PerturbationConfig::DEFAULT,
+        cpp: CppConfig::DEFAULT,
+        centroid: CentroidConfig::DEFAULT,
+        timbre: TimbreConfig::DEFAULT,
+        voice_class: VoiceClassConfig::DEFAULT,
+        tuning: TuningConfig::DEFAULT,
+        voiceprint: VoiceprintConfig::DEFAULT,
+        vibrato: VibratoConfig::DEFAULT,
+        spectrogram: SpectrogramConfig::DEFAULT,
+        resample: ResampleConfig::DEFAULT,
+        synthesis: SynthesisConfig::DEFAULT,
+        fach: FachConfig::DEFAULT,
+        spatial: SpatialConfig::DEFAULT,
+        tract: TractConfig::DEFAULT,
+        inverse: InverseConfig::DEFAULT,
+    };
+
+    /// The repository's `pipeline.toml`, compiled in so every target — the
+    /// Android APK has no source tree — loads the same parameters.
+    pub const TOML: &'static str = include_str!("../../pipeline.toml");
+
+    /// Parses a `pipeline.toml` text. Unknown tables or keys are an error,
+    /// not a warning: a misspelled key that silently fell back to its
+    /// default would be exactly the drift this file exists to prevent.
+    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+}
+
+impl Default for PipelineParams {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// One configuration value as it appears in `pipeline.toml`, used by the
 /// parity test to compare a struct's defaults against the file.
@@ -120,7 +199,8 @@ macro_rules! stage_config {
         }
     ) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq)]
+        #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        #[serde(default, deny_unknown_fields)]
         pub struct $name {
             $(
                 $(#[$fmeta])*
@@ -194,119 +274,49 @@ pub fn all_sections() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
         (FachConfig::SECTION, FachConfig::DEFAULT.entries()),
         (SpatialConfig::SECTION, SpatialConfig::DEFAULT.entries()),
         (TractConfig::SECTION, TractConfig::DEFAULT.entries()),
+        (InverseConfig::SECTION, InverseConfig::DEFAULT.entries()),
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
-    /// The file the code's defaults must match, byte for byte at the number
-    /// level. Read at compile time so the test cannot silently pass against
-    /// a missing file.
-    const PIPELINE_TOML: &str = include_str!("../../pipeline.toml");
-
-    /// A deliberately tiny reader for the subset of TOML `pipeline.toml`
-    /// uses: `[table]` headers, `key = <number | [numbers]>` lines, `#`
-    /// comments. Anything else fails the test — the file is ours, and a
-    /// parsing gap means a syntax the parity check would not see.
-    fn parse(text: &str) -> BTreeMap<String, BTreeMap<String, String>> {
-        let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-        let mut section = String::new();
-        for (n, raw) in text.lines().enumerate() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-                section = name.trim().to_string();
-                assert!(
-                    out.insert(section.clone(), BTreeMap::new()).is_none(),
-                    "pipeline.toml:{}: duplicate table [{section}]",
-                    n + 1
-                );
-                continue;
-            }
-            let (key, value) = line
-                .split_once('=')
-                .unwrap_or_else(|| panic!("pipeline.toml:{}: not `key = value`: {raw}", n + 1));
-            assert!(
-                !section.is_empty(),
-                "pipeline.toml:{}: key before any table",
-                n + 1
-            );
-            let prev = out
-                .get_mut(&section)
-                .unwrap()
-                .insert(key.trim().to_string(), value.trim().to_string());
-            assert!(
-                prev.is_none(),
-                "pipeline.toml:{}: duplicate key {key}",
-                n + 1
-            );
-        }
-        out
-    }
-
-    fn parse_f32(s: &str) -> f32 {
-        s.replace('_', "")
-            .parse::<f32>()
-            .unwrap_or_else(|e| panic!("not a number: {s:?} ({e})"))
-    }
-
-    fn matches(text: &str, value: &Value) -> bool {
-        match value {
-            Value::Int(i) => text.replace('_', "").parse::<i64>().ok() == Some(*i),
-            Value::Float(f) => parse_f32(text) == *f,
-            Value::Float64(f) => text.replace('_', "").parse::<f64>().ok() == Some(*f),
-            Value::Floats(fs) => {
-                let inner = text
-                    .strip_prefix('[')
-                    .and_then(|t| t.strip_suffix(']'))
-                    .unwrap_or_else(|| panic!("not an array: {text}"));
-                let parsed: Vec<f32> = inner
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(parse_f32)
-                    .collect();
-                parsed == *fs
-            }
-        }
-    }
-
-    /// Every default in code appears in `pipeline.toml` with the same value,
-    /// every key in the file belongs to a field, and no table is orphaned.
+    /// Every default in code equals `pipeline.toml` (parsed by the `toml`
+    /// crate; unknown keys are rejected by `deny_unknown_fields`), and every
+    /// field of every section is present in the file — a missing key would
+    /// otherwise deserialize to its default and hide the drift.
     #[test]
     fn pipeline_toml_matches_code_defaults() {
-        let file = parse(PIPELINE_TOML);
+        let parsed = PipelineParams::from_toml(PipelineParams::TOML)
+            .unwrap_or_else(|e| panic!("pipeline.toml does not parse: {e}"));
+        assert_eq!(
+            parsed,
+            PipelineParams::DEFAULT,
+            "pipeline.toml drifted from the code defaults"
+        );
+
+        let table: toml::Table = PipelineParams::TOML
+            .parse()
+            .expect("pipeline.toml as a table");
         let mut seen = std::collections::BTreeSet::new();
         for (section, entries) in all_sections() {
-            let table = file
-                .get(section)
-                .unwrap_or_else(|| panic!("pipeline.toml has no [{section}] table"));
             assert!(
                 seen.insert(section),
                 "section [{section}] declared twice in code"
             );
-            for (key, value) in &entries {
-                let text = table.get(*key).unwrap_or_else(|| {
-                    panic!("pipeline.toml [{section}] is missing `{key}` (code default {value:?})")
-                });
+            let sub = table
+                .get(section)
+                .and_then(toml::Value::as_table)
+                .unwrap_or_else(|| panic!("pipeline.toml has no [{section}] table"));
+            for (key, _) in &entries {
                 assert!(
-                    matches(text, value),
-                    "pipeline.toml [{section}] {key} = {text} but the code default is {value:?}"
-                );
-            }
-            for key in table.keys() {
-                assert!(
-                    entries.iter().any(|(k, _)| k == key),
-                    "pipeline.toml [{section}] has `{key}`, which no config field declares"
+                    sub.contains_key(*key),
+                    "pipeline.toml [{section}] is missing `{key}`"
                 );
             }
         }
-        for section in file.keys() {
+        for section in table.keys() {
             assert!(
                 seen.contains(section.as_str()),
                 "pipeline.toml table [{section}] belongs to no config struct"
@@ -318,5 +328,15 @@ mod tests {
     fn default_trait_equals_default_const() {
         assert_eq!(YinConfig::default(), YinConfig::DEFAULT);
         assert_eq!(TractConfig::default(), TractConfig::DEFAULT);
+        assert_eq!(PipelineParams::default(), PipelineParams::DEFAULT);
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        let text = format!("{}\n[yin]\nthreshhold = 0.2\n", "");
+        assert!(
+            PipelineParams::from_toml(&text).is_err(),
+            "typo must not fall back to default"
+        );
     }
 }

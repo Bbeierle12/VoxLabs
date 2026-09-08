@@ -57,6 +57,10 @@ impl DashboardApp {
     /// or `None` when everything is running. Ordered by how much it costs the
     /// user: no analysis at all, then stopped, then stalled, then audio I/O.
     pub(super) fn engine_notice(&self) -> Option<&'static str> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(notice) = self.pipeline_notice() {
+            return Some(notice);
+        }
         // No microphone outranks everything else: with no input stream the
         // analysis path is idle by definition, so any staleness or GPU notice
         // below would only describe a consequence of this.

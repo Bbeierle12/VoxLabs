@@ -39,6 +39,9 @@ pub mod capture_log;
 mod concurrency;
 // Stage configuration: every tunable number, mirrored in pipeline.toml.
 pub mod config;
+// The analysis pipeline (Plan v3 Phase 1): Stage trait, builder, runner,
+// taps, and the wrapped kernels. Cross-target except the runner thread.
+pub mod pipeline;
 // In-app file import: a file through the capture pipeline. Cross-target
 // (inert on web).
 mod import;

@@ -7,9 +7,13 @@
 //! egui app the desktop and web targets use.
 //!
 //! Two deliberate de-risking choices for this first on-device build:
-//!   1. **CPU DSP only.** Analysis runs `math::yin_pitch` + LPC formants on the
-//!      CPU (see [`cpu_analysis_loop`]); it never constructs the wgpu `GpuYin`
-//!      compute path, so a missing/limited Vulkan driver can't break launch.
+//!   1. **CPU DSP only.** Analysis runs through the pipeline runner
+//!      (`pipeline::runner`, Plan v3 Phase 1): YIN, LPC, the grid inverse and
+//!      the Story tract as stages, with the not-yet-wrapped per-frame work
+//!      (gates, harmonics, metrics, spectrogram, room calibration) in a hop
+//!      observer at its old 2048-sample cadence (see [`LegacyTail`]). It
+//!      never constructs the wgpu `GpuYin` compute path, so a missing or
+//!      limited Vulkan driver can't break launch.
 //!   2. **glow (GLES/EGL) renderer**, not wgpu/Vulkan — forced via
 //!      `NativeOptions.renderer`.
 //!
@@ -32,52 +36,40 @@
 
 use crate::audio::AudioEngine;
 use crate::concurrency::{AnalysisState, ConcurrencyBridges, Telemetry};
+use crate::pipeline::runner::{HopObserver, Runner, RunnerState};
+use crate::pipeline::{AudioFrame, PipelineDefinition, Wire};
 use crate::types::VocalProfile;
 use crate::ui::DashboardApp;
-use rtrb::Consumer;
-use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 use triple_buffer::Input;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::frame::ANALYSIS_FRAME;
+use crate::frame::{ANALYSIS_FRAME, FrameAnalyzer};
 
 /// Fallback microphone rate when the input device can't be queried yet (e.g.
 /// `RECORD_AUDIO` not granted at launch). 48 kHz is the near-universal Android
 /// capture rate.
 const FALLBACK_SAMPLE_RATE: f32 = 48_000.0;
 
-/// Idle sleep between ring-buffer drains on the analysis thread. Also the
-/// granularity at which it notices a shutdown request.
-const ANALYSIS_POLL_MS: u64 = 5;
-
-/// How long a new generation waits for the previous analysis thread to finish
-/// before giving up and detaching it. The loop polls its shutdown flag every
-/// [`ANALYSIS_POLL_MS`], so this is ~100x the expected wait: long enough that
-/// it never fires in practice, short enough that a wedged thread can't stop
-/// the activity from relaunching.
+/// How long a new generation waits for the previous runner to finish before
+/// giving up and detaching it. The worker polls its shutdown flag every
+/// `runner.poll_ms`, so this is ~100x the expected wait: long enough that it
+/// never fires in practice, short enough that a wedged thread can't stop the
+/// activity from relaunching.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Poll interval while waiting out [`SHUTDOWN_GRACE`].
 const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
-/// Per-frame analysis times kept for the p95 estimate (~11 s at 48 kHz).
-const TIMING_WINDOW: usize = 256;
-
-/// How often, in frames, the frame-cost summary is logged. 512 frames is ~22 s
-/// at 48 kHz — frequent enough to watch live over `adb logcat`, rare enough
-/// not to be the noisiest thing in it.
-const TIMING_REPORT_FRAMES: u32 = 512;
-
 /// One `android_main` invocation's background resources, parked where the
 /// *next* invocation can reach them.
 struct Generation {
-    /// Set to ask this generation's analysis loop to return.
+    /// Set to ask this generation's runner to return.
     shutdown: Arc<AtomicBool>,
-    analysis: Option<JoinHandle<()>>,
+    runner: Option<Runner>,
     /// Dropping this closes the AAudio input/output streams — the reason the
     /// engine lives here instead of on the parked `android_main` stack frame,
     /// which the new generation cannot reach.
@@ -111,19 +103,22 @@ fn retire_previous_generation() {
     // checks this flag every 0.1 s chunk and releases the recorder itself.
     crate::spatial::request_shutdown();
 
-    if let Some(handle) = previous.analysis.take() {
+    if let Some(mut runner) = previous.runner.take() {
+        let stats = runner.stats();
         let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while !handle.is_finished() && Instant::now() < deadline {
+        let done = |s: RunnerState| matches!(s, RunnerState::Stopped | RunnerState::Failed);
+        while !done(stats.state()) && Instant::now() < deadline {
             thread::sleep(SHUTDOWN_POLL);
         }
-        if handle.is_finished() {
-            // Never `join()` blind: a wedged loop would hang the relaunch.
-            let _ = handle.join();
+        if done(stats.state()) {
+            // Never join blind: a wedged worker would hang the relaunch.
+            runner.stop();
         } else {
             log::warn!(
-                "previous analysis thread did not stop within {} ms; detaching it",
+                "previous pipeline runner did not stop within {} ms; detaching it",
                 SHUTDOWN_GRACE.as_millis()
             );
+            runner.detach();
         }
     }
 }
@@ -153,40 +148,73 @@ fn android_main(app: AndroidApp) {
     let input_sample_rate = query_input_sample_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     log::info!("android input sample rate: {input_sample_rate} Hz");
 
-    // CPU YIN + LPC on the non-real-time analysis thread. A panic in here used
-    // to unwind into nothing and leave the UI showing its last profile forever;
-    // now the death is caught, logged to logcat, and published as
-    // `AnalysisState::Stopped` so the UI can say analysis has stopped.
-    let analysis_telemetry = bridges.telemetry.clone();
+    // The analysis worker is the pipeline runner (Plan v3 Phase 1): the
+    // Live Model stages per hop, plus the legacy per-frame tail. The runner
+    // builds its pipeline on its own thread — the two inversion grids — so
+    // audio is opened only once it is ready (bounded by the mode file's
+    // init_timeout_ms), rather than letting the ring overflow meanwhile.
     let shutdown = Arc::new(AtomicBool::new(false));
-    let loop_shutdown = shutdown.clone();
-    let analysis = thread::spawn(move || {
-        analysis_telemetry.set_analysis_state(AnalysisState::Running);
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            cpu_analysis_loop(
-                profile_tx,
-                ui_profile_tx,
-                audio_rx,
-                spectrum_tx,
-                scope_tx,
-                input_sample_rate,
-                &analysis_telemetry,
-                &loop_shutdown,
-            );
-        }));
-        // A requested shutdown is a relaunch, not a fault: it must not be
-        // logged as an error, and the retired generation's telemetry must not
-        // be marked `Stopped` (nothing reads it, but the log would mislead).
-        if loop_shutdown.load(Ordering::Relaxed) {
-            log::info!("analysis loop stopped for an activity relaunch");
-            return;
+    let telemetry_for_runner = bridges.telemetry.clone();
+    let (runner, shell) = match PipelineDefinition::live_model() {
+        Ok(def) => {
+            let format = def.format(Some(input_sample_rate));
+            if format.frame_samples != ANALYSIS_FRAME {
+                // The legacy tail's analyzer is built around ANALYSIS_FRAME
+                // (its contour rate, its noise-floor timing); a mode file
+                // that changes the frame must wait for Phase 2 to wrap it.
+                log::error!(
+                    "live_model.toml frame_samples {} != ANALYSIS_FRAME {}; refusing to start",
+                    format.frame_samples,
+                    ANALYSIS_FRAME
+                );
+                telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
+                (None, None)
+            } else {
+                let tail = LegacyTail {
+                    analyzer: FrameAnalyzer::new(input_sample_rate),
+                    profile_tx,
+                    ui_profile_tx,
+                    spectrum_tx,
+                    scope_tx,
+                    telemetry: telemetry_for_runner.clone(),
+                    spectrogram: crate::spectrogram::Spectrogram::new(),
+                    calibrator: crate::math::RoomCalibrator::new(),
+                    every: def.runner.legacy_frame_every_hops,
+                };
+                let init_timeout = Duration::from_millis(def.runner.init_timeout_ms);
+                let poll = Duration::from_millis(def.runner.poll_ms);
+                let (runner, shell) = Runner::spawn(
+                    def,
+                    format,
+                    audio_rx,
+                    Some(Box::new(tail)),
+                    shutdown.clone(),
+                );
+                match runner.wait_ready(init_timeout, poll) {
+                    RunnerState::Running => {
+                        telemetry_for_runner.set_analysis_state(AnalysisState::Running)
+                    }
+                    RunnerState::Building => {
+                        log::warn!(
+                            "pipeline still building after {} ms; opening audio anyway",
+                            init_timeout.as_millis()
+                        );
+                        telemetry_for_runner.set_analysis_state(AnalysisState::Running);
+                    }
+                    RunnerState::Failed | RunnerState::Stopped => {
+                        log::error!("pipeline failed to start; live analysis unavailable");
+                        telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
+                    }
+                }
+                (Some(runner), Some(shell))
+            }
         }
-        match outcome {
-            Ok(()) => log::error!("analysis loop exited; live analysis has stopped"),
-            Err(_) => log::error!("analysis loop panicked; live analysis has stopped"),
+        Err(e) => {
+            log::error!("live_model.toml did not load: {e}");
+            telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
+            (None, None)
         }
-        analysis_telemetry.set_analysis_state(AnalysisState::Stopped);
-    });
+    };
 
     // cpal AAudio engine. Non-fatal on failure: without RECORD_AUDIO the input
     // stream can't open, but we still want the UI up so the user can grant it.
@@ -214,7 +242,7 @@ fn android_main(app: AndroidApp) {
     // invocation may never get the chance to clean up after itself.
     let generation = Generation {
         shutdown,
-        analysis: Some(analysis),
+        runner,
         audio,
     };
     match ACTIVE_GENERATION.lock() {
@@ -279,6 +307,9 @@ fn android_main(app: AndroidApp) {
             if let Some(path) = shared {
                 app.queue_import(path);
             }
+            if let Some(shell) = shell {
+                app.attach_pipeline(shell);
+            }
             Ok(Box::new(app))
         }),
     ) {
@@ -295,176 +326,78 @@ fn query_input_sample_rate() -> Option<f32> {
     Some(config.config().sample_rate as f32)
 }
 
-/// CPU-only analysis loop: drains the input ring buffer, and for each whole
-/// frame estimates f0 (YIN) and — on voiced frames — the formants (decimate →
-/// LPC → root-solve), publishing the profile to synthesis + UI. This mirrors
-/// `AnalysisEngine::process_frame`'s CPU path but never touches wgpu.
-#[allow(clippy::too_many_arguments)]
-fn cpu_analysis_loop(
-    mut profile_tx: Input<VocalProfile>,
-    mut ui_profile_tx: Input<VocalProfile>,
-    mut audio_rx: Consumer<f32>,
-    mut spectrum_tx: Input<Vec<f32>>,
-    mut scope_tx: Input<Vec<f32>>,
-    sample_rate: f32,
-    telemetry: &Telemetry,
-    shutdown: &AtomicBool,
-) {
-    use crate::frame::FrameAnalyzer;
-    use crate::math;
+/// The per-frame work Phase 1 does not wrap yet, run as a runner hop
+/// observer every `every` hops — with hop 1024 and `every` 2 that is one
+/// call per 2048 new samples on the frame ending there, exactly the frames
+/// the pre-pipeline loop analyzed, so every number this publishes (gates,
+/// harmonics, metrics, spectrogram, calibration) is unchanged. YIN and LPC
+/// run twice per such frame until Phase 2 wraps the rest and the analyzer
+/// takes its pitch and formants from the wires.
+struct LegacyTail {
+    analyzer: FrameAnalyzer,
+    profile_tx: Input<VocalProfile>,
+    ui_profile_tx: Input<VocalProfile>,
+    spectrum_tx: Input<Vec<f32>>,
+    scope_tx: Input<Vec<f32>>,
+    telemetry: Arc<Telemetry>,
+    spectrogram: crate::spectrogram::Spectrogram,
+    calibrator: crate::math::RoomCalibrator,
+    every: u64,
+}
 
-    // The per-frame DSP is the shared `FrameAnalyzer` (identical to what the
-    // `voxlab` study harness runs on files); this loop owns only the ring
-    // drain, room-calibration bookkeeping, UI feeds, and timing.
-    let mut analyzer = FrameAnalyzer::new(sample_rate);
-    let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
-    // Scrolling-spectrogram STFT, mirroring the desktop path.
-    let mut spectrogram = crate::spectrogram::Spectrogram::new();
-    // Room calibration state, mirroring the desktop engine.
-    let mut calibrator = math::RoomCalibrator::new();
-    let mut timer = FrameTimer::new(sample_rate);
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
+impl HopObserver for LegacyTail {
+    fn on_hop(&mut self, frame: &AudioFrame, _wires: &[Wire], hop: u64) {
+        if hop % self.every != 0 {
             return;
         }
+        let samples = &frame.samples;
 
-        while let Ok(sample) = audio_rx.pop() {
-            accumulator.push(sample);
-        }
+        // Mirror the frame to the capture export (no-op unless a capture
+        // is armed) before anything else sees it.
+        crate::capture_log::push(samples);
+        let result = self.analyzer.analyze(samples);
 
-        while accumulator.len() >= ANALYSIS_FRAME {
-            // A large backlog can hold us in here for many frames, so the
-            // shutdown request is checked at frame granularity too.
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            let started = Instant::now();
-            let frame = &accumulator[..ANALYSIS_FRAME];
-
-            // Mirror the frame to the capture export (no-op unless a capture
-            // is armed) before anything else sees it.
-            crate::capture_log::push(frame);
-            let result = analyzer.analyze(frame);
-
-            // Room calibration pass, mirroring the desktop engine. It wants
-            // the pre-gate periodicity (a calibrating room with a voice in
-            // it must fail), which the analyzer reports alongside the
-            // gated profile.
-            let (calibrating, calib_done) = telemetry.take_calibration_frame();
-            if calibrating {
-                calibrator.push(result.rms, result.yin_f0);
-                if calib_done {
-                    match calibrator.finish() {
-                        Ok(cal) => {
-                            analyzer.seed_floor(cal.ambient_rms);
-                            analyzer.set_interferer(cal.interferer);
-                            telemetry.set_calibration_result(Some((
-                                cal.ambient_rms,
-                                cal.interferer.map(|i| (i.f0_hz, i.rms)),
-                            )));
-                            log::info!(
-                                "room calibrated: ambient rms {:.5}, interferer {:?}",
-                                cal.ambient_rms,
-                                cal.interferer
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!("room calibration failed: {e:?}");
-                            telemetry.set_calibration_result(None);
-                        }
+        // Room calibration pass, mirroring the desktop engine. It wants the
+        // pre-gate periodicity (a calibrating room with a voice in it must
+        // fail), which the analyzer reports alongside the gated profile.
+        let (calibrating, calib_done) = self.telemetry.take_calibration_frame();
+        if calibrating {
+            self.calibrator.push(result.rms, result.yin_f0);
+            if calib_done {
+                match self.calibrator.finish() {
+                    Ok(cal) => {
+                        self.analyzer.seed_floor(cal.ambient_rms);
+                        self.analyzer.set_interferer(cal.interferer);
+                        self.telemetry.set_calibration_result(Some((
+                            cal.ambient_rms,
+                            cal.interferer.map(|i| (i.f0_hz, i.rms)),
+                        )));
+                        log::info!(
+                            "room calibrated: ambient rms {:.5}, interferer {:?}",
+                            cal.ambient_rms,
+                            cal.interferer
+                        );
                     }
-                    calibrator = math::RoomCalibrator::new();
+                    Err(e) => {
+                        log::warn!("room calibration failed: {e:?}");
+                        self.telemetry.set_calibration_result(None);
+                    }
                 }
+                self.calibrator = crate::math::RoomCalibrator::new();
             }
-
-            let profile = result.profile;
-            profile_tx.write(profile);
-            ui_profile_tx.write(profile);
-
-            // Spectrogram + oscilloscope feeds, mirroring the desktop path.
-            spectrogram.process_block(frame);
-            spectrum_tx.write(spectrogram.magnitudes_db().to_vec());
-            scope_tx.write(frame.to_vec());
-
-            // Heartbeat for the UI's staleness watch.
-            telemetry.note_analysis_frame();
-
-            accumulator.drain(..ANALYSIS_FRAME);
-            timer.record(started.elapsed());
         }
 
-        thread::sleep(Duration::from_millis(ANALYSIS_POLL_MS));
-    }
-}
+        let profile = result.profile;
+        self.profile_tx.write(profile);
+        self.ui_profile_tx.write(profile);
 
-/// Rolling per-frame cost tracker for the Android analysis loop.
-///
-/// One analysis frame covers `ANALYSIS_FRAME / sample_rate` seconds of audio
-/// (42.7 ms at 48 kHz). Take longer than that on average and the input ring
-/// buffer backs up until the capture callback starts overrunning, which shows
-/// up as xruns and dropped input rather than as an obvious slowdown — so the
-/// number is worth logging even when it is comfortably inside budget.
-///
-/// Deliberately a measurement, not a control loop: the review's F25 asks for
-/// the benchmark first and an adaptive cadence *only* if a real device shows
-/// the budget being exceeded.
-struct FrameTimer {
-    budget_ms: f32,
-    recent: Vec<f32>,
-    next: usize,
-    since_report: u32,
-}
+        // Spectrogram + oscilloscope feeds, mirroring the desktop path.
+        self.spectrogram.process_block(samples);
+        self.spectrum_tx
+            .write(self.spectrogram.magnitudes_db().to_vec());
+        self.scope_tx.write(samples.to_vec());
 
-impl FrameTimer {
-    fn new(sample_rate: f32) -> Self {
-        Self {
-            budget_ms: ANALYSIS_FRAME as f32 / sample_rate * 1000.0,
-            recent: Vec::with_capacity(TIMING_WINDOW),
-            next: 0,
-            since_report: 0,
-        }
-    }
-
-    fn record(&mut self, elapsed: Duration) {
-        let ms = elapsed.as_secs_f32() * 1000.0;
-        if self.recent.len() < TIMING_WINDOW {
-            self.recent.push(ms);
-        } else {
-            self.recent[self.next] = ms;
-            self.next = (self.next + 1) % TIMING_WINDOW;
-        }
-
-        self.since_report += 1;
-        if self.since_report < TIMING_REPORT_FRAMES {
-            return;
-        }
-        self.since_report = 0;
-        self.report();
-    }
-
-    fn report(&self) {
-        if self.recent.is_empty() {
-            return;
-        }
-        let mut sorted = self.recent.clone();
-        sorted.sort_by(f32::total_cmp);
-        let at = |q: f32| sorted[((sorted.len() - 1) as f32 * q).round() as usize];
-        let (p50, p95, max) = (at(0.5), at(0.95), sorted[sorted.len() - 1]);
-        let headroom = p95 / self.budget_ms * 100.0;
-
-        if p95 > self.budget_ms {
-            log::warn!(
-                "analysis frame cost over budget: p50 {p50:.1} ms, p95 {p95:.1} ms, \
-                 max {max:.1} ms vs {:.1} ms budget ({headroom:.0}%)",
-                self.budget_ms
-            );
-        } else {
-            log::info!(
-                "analysis frame cost: p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms \
-                 vs {:.1} ms budget ({headroom:.0}%)",
-                self.budget_ms
-            );
-        }
+        // Heartbeat for the UI's staleness watch.
+        self.telemetry.note_analysis_frame();
     }
 }

@@ -101,11 +101,11 @@ harness's numbers join on the file name.
 | Desktop | `$XDG_DATA_HOME/VoxLabs/captures/` (`~/.local/share/VoxLabs/captures/`) |
 | Web | no export (no filesystem) |
 
-Pull and analyze (dev package id shown; the release id is
-`org.voxlabs.core`):
+Pull and analyze (cargo-apk gives the debug and release builds the same
+application id, `org.voxlabs.core`):
 
 ```bash
-adb pull /sdcard/Android/data/org.voxlabs.core.dev/files/captures ./captures
+adb pull /sdcard/Android/data/org.voxlabs.core/files/captures ./captures
 voxlab analyze ./captures --out ./captures/results
 ```
 
@@ -140,7 +140,7 @@ restart takes.)
 
 | Platform | Import folder |
 |---|---|
-| Android | `/sdcard/Android/data/org.voxlabs.core.dev/files/import/` (`adb push song.wav /sdcard/Android/data/org.voxlabs.core.dev/files/import/`) |
+| Android | `/sdcard/Android/data/org.voxlabs.core/files/import/` (`adb push song.wav /sdcard/Android/data/org.voxlabs.core/files/import/`) |
 | Desktop | `~/.local/share/VoxLabs/import/` |
 
 and they appear in the **Files** card at the top of the Sessions screen,

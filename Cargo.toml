@@ -39,6 +39,7 @@ rtrb = "0.3.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 triple_buffer = "9.0.0"
+toml = "1.1.5"
 
 # Desktop + web: restore eframe's stock default feature set, so those two targets
 # behave identically to before this Android work (wgpu renderer, accesskit,

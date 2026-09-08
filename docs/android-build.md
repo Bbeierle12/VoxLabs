@@ -2,9 +2,11 @@
 
 Native Android build of **Voice Harmonic Engine**: the same egui `DashboardApp`
 as desktop, packaged as a `NativeActivity` APK. Real-time mic capture + additive
-synthesis via cpal's AAudio backend; pitch/formant DSP runs on the **CPU**
-(`math::yin_pitch` + LPC) — the wgpu GPU-compute path is desktop-only and is not
-compiled into the APK.
+synthesis via cpal's AAudio backend; analysis runs on the **CPU** through the
+pipeline runner (`pipelines/live_model.toml`: YIN → LPC → grid inverse → Story
+tract, plus the not-yet-wrapped per-frame work as a hop observer) — the wgpu
+GPU-compute path is desktop-only and is not compiled into the APK. The Phase 1
+on-device gate procedure is in `phase1-gate.md`.
 
 - **Package:** `org.voxlabs.core`
 - **App label:** Voice Harmonic Engine
@@ -165,7 +167,7 @@ This build host has **no device access**; do the following on your phone.
    but the audio input stream can't open, so the dashboard stays in "SEARCHING".
 7. **Watch logs while testing:**
    ```bash
-   "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio RustStdoutStderr '*:E'
+   "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio vox_core::pipeline::runner RustStdoutStderr '*:E'
    ```
    (`android_logger` is configured without an explicit tag, so each line is
    tagged with the Rust module path that logged it — `vox_core::<module>`.)

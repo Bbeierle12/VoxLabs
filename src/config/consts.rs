@@ -27,6 +27,8 @@ pub const SQUARED: i32 = 2;
 pub const ADJACENT_PAIR: usize = 2;
 /// Milliseconds in a second. Range: exactly 1000.
 pub const MILLIS_PER_SECOND: f32 = 1000.0;
+/// Microseconds in a second (`f64`, for timing arithmetic). Range: exactly 1e6.
+pub const MICROS_PER_SECOND_F64: f64 = 1_000_000.0;
 /// Closed-form eigenvalues of a 2×2 Hermitian matrix `[[a, c], [c*, b]]`:
 /// `λ = (a + b ± sqrt((a − b)² + 4|c|²)) / 2`; this is the 4. Range: exactly 4.
 pub const EIGEN2_DISCRIMINANT_FACTOR: f64 = 4.0;

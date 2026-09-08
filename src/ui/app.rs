@@ -177,6 +177,8 @@ impl DashboardApp {
             last_capture: None,
             capture_error: None,
             rng: 0x9E37_79B9_7F4A_7C15,
+            #[cfg(not(target_arch = "wasm32"))]
+            pipeline: None,
         }
     }
 

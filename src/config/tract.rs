@@ -1,6 +1,7 @@
 //! Story two-mode vocal-tract model configuration (`tract.rs`,
-//! `tract_data.rs` scalars). The published basis tables stay in
-//! `tract_data.rs`; only the solver and inversion parameters live here.
+//! `tract_data.rs` scalars) and the grid-inverse stage. The published basis
+//! tables stay in `tract_data.rs`; only the solver and inversion parameters
+//! live here.
 
 use super::stage_config;
 
@@ -64,5 +65,17 @@ stage_config! {
         vtl_weight_f2: f32 = 0.3,
         /// Weight of the F3-derived length. Range: 0.5..=1.0; with vtl_weight_f2 sums to 1.
         vtl_weight_f3: f32 = 0.7,
+    }
+}
+
+stage_config! {
+    /// The grid-inverse stage (`pipeline::stages::inverse`): measured
+    /// (F1, F2) → Story mode coefficients through the precomputed grid.
+    pub struct InverseConfig, section = "inverse" {
+        /// EMA coefficient for the per-frame vocal-tract-length estimate that
+        /// picks the basis and scales the formants into its length reference.
+        /// Anatomy accumulates slowly; identity-grade frames only.
+        /// Range: 0.01..=0.3.
+        vtl_ema_alpha: f32 = 0.05,
     }
 }
