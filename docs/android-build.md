@@ -6,7 +6,7 @@ synthesis via cpal's AAudio backend; pitch/formant DSP runs on the **CPU**
 (`math::yin_pitch` + LPC) — the wgpu GPU-compute path is desktop-only and is not
 compiled into the APK.
 
-- **Package:** `com.voiceharmonic.engine`
+- **Package:** `org.voxlabs.core`
 - **App label:** Voice Harmonic Engine
 - **minSdk 26 (Android 8.0), target 34.** AAudio (the low-latency audio path)
   requires API 26, so 26 is the floor.
@@ -46,7 +46,10 @@ Java 21 is required (present) for `keytool` / `apksigner`.
 
 ## 2. Release signing keystore (secret — never commit)
 
-A self-signed release keystore was generated **outside the repo**:
+A self-signed release keystore was generated **outside the repo**. Its file
+name and certificate predate the `vox-core` / `org.voxlabs.core` rename and are
+deliberately unchanged: the key is what signs the APK, and Android requires every
+update to be signed by the same key.
 
 | field | value |
 |-------|-------|
@@ -102,27 +105,27 @@ cargo apk build --lib --release
 Confirm the alignment — every LOAD segment must read `0x4000`, not `0x1000`:
 
 ```bash
-unzip -o target/release/apk/voice_harmonic_engine.apk 'lib/*' -d /tmp/apkchk
+unzip -o target/release/apk/vox-core.apk 'lib/*' -d /tmp/apkchk
 "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -l \
-  /tmp/apkchk/lib/arm64-v8a/libvoice_harmonic_engine.so | grep LOAD
+  /tmp/apkchk/lib/arm64-v8a/libvox_core.so | grep LOAD
 ```
 
 Output (already produced here):
 
 ```
-target/release/apk/voice_harmonic_engine.apk      # cargo-apk output
-dist/voice_harmonic_engine-release.apk            # copy kept as the deliverable
+target/release/apk/vox-core.apk      # cargo-apk output
+dist/vox-core-release.apk            # copy kept as the deliverable
 ```
 
-`--lib` is required: the app is a `cdylib` (`libvoice_harmonic_engine.so`) loaded
+`--lib` is required: the app is a `cdylib` (`libvox_core.so`) loaded
 by NativeActivity; the `[[bin]]` target is only the desktop/web entry.
 
 Verify the signature and manifest:
 
 ```bash
 BT="$ANDROID_HOME/build-tools/34.0.0"
-"$BT/apksigner" verify --print-certs target/release/apk/voice_harmonic_engine.apk
-"$BT/aapt" dump badging     target/release/apk/voice_harmonic_engine.apk
+"$BT/apksigner" verify --print-certs target/release/apk/vox-core.apk
+"$BT/aapt" dump badging     target/release/apk/vox-core.apk
 ```
 
 Expected: v2 + v3 signature schemes verified, signer SHA-256 matching the table
@@ -145,10 +148,10 @@ This build host has **no device access**; do the following on your phone.
    ```
 4. **Install (replace if already installed):**
    ```bash
-   "$ANDROID_HOME/platform-tools/adb" install -r dist/voice_harmonic_engine-release.apk
+   "$ANDROID_HOME/platform-tools/adb" install -r dist/vox-core-release.apk
    ```
    If a previous install with a different signature blocks it:
-   `adb uninstall com.voiceharmonic.engine` first.
+   `adb uninstall org.voxlabs.core` first.
 5. **Launch** "Voice Harmonic Engine" from the app drawer (default system icon —
    no custom launcher icon is bundled yet; see Known rough edges).
 6. **Grant the microphone permission.** This build uses a plain `NativeActivity`
@@ -156,14 +159,16 @@ This build host has **no device access**; do the following on your phone.
    manually — either:
    - Settings → Apps → Voice Harmonic Engine → Permissions → Microphone → Allow, **or**
    ```bash
-   "$ANDROID_HOME/platform-tools/adb" shell pm grant com.voiceharmonic.engine android.permission.RECORD_AUDIO
+   "$ANDROID_HOME/platform-tools/adb" shell pm grant org.voxlabs.core android.permission.RECORD_AUDIO
    ```
    then fully close and reopen the app. Until RECORD_AUDIO is granted the UI runs
    but the audio input stream can't open, so the dashboard stays in "SEARCHING".
 7. **Watch logs while testing:**
    ```bash
-   "$ANDROID_HOME/platform-tools/adb" logcat -s VoiceHarmonicEngine RustStdoutStderr '*:E'
+   "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio RustStdoutStderr '*:E'
    ```
+   (`android_logger` is configured without an explicit tag, so each line is
+   tagged with the Rust module path that logged it — `vox_core::<module>`.)
 
 ---
 

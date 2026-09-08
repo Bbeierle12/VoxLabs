@@ -1,10 +1,10 @@
-//! Binary entry points. The real work lives in the `voice_harmonic_engine`
+//! Binary entry points. The real work lives in the `vox_core`
 //! library crate; this file is only the thin per-platform `main`.
 
 // Desktop: hand off to the shared native runner in the library.
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 fn main() -> anyhow::Result<()> {
-    voice_harmonic_engine::run()
+    vox_core::run()
 }
 
 // Android: the real entry point is `android_main` inside the library's `android`
@@ -39,7 +39,7 @@ fn main() {
 #[cfg(target_arch = "wasm32")]
 async fn start_web() -> Result<(), String> {
     use eframe::wasm_bindgen::JsCast as _;
-    use voice_harmonic_engine::{ConcurrencyBridges, DashboardApp};
+    use vox_core::{ConcurrencyBridges, DashboardApp};
 
     let document = web_sys::window()
         .ok_or("no global `window` — is this running in a browser?")?
@@ -76,7 +76,7 @@ async fn start_web() -> Result<(), String> {
                     // No filesystem in the browser: the archive lives only
                     // for this session (disk persistence is native-only),
                     // and there is no raw-capture export or file import.
-                    voice_harmonic_engine::AppPaths::default(),
+                    vox_core::AppPaths::default(),
                 )))
             }),
         )

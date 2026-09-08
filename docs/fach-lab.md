@@ -102,10 +102,10 @@ harness's numbers join on the file name.
 | Web | no export (no filesystem) |
 
 Pull and analyze (dev package id shown; the release id is
-`com.voiceharmonic.engine`):
+`org.voxlabs.core`):
 
 ```bash
-adb pull /sdcard/Android/data/com.voiceharmonic.engine.dev/files/captures ./captures
+adb pull /sdcard/Android/data/org.voxlabs.core.dev/files/captures ./captures
 voxlab analyze ./captures --out ./captures/results
 ```
 
@@ -140,7 +140,7 @@ restart takes.)
 
 | Platform | Import folder |
 |---|---|
-| Android | `/sdcard/Android/data/com.voiceharmonic.engine.dev/files/import/` (`adb push song.wav /sdcard/Android/data/com.voiceharmonic.engine.dev/files/import/`) |
+| Android | `/sdcard/Android/data/org.voxlabs.core.dev/files/import/` (`adb push song.wav /sdcard/Android/data/org.voxlabs.core.dev/files/import/`) |
 | Desktop | `~/.local/share/VoxLabs/import/` |
 
 and they appear in the **Files** card at the top of the Sessions screen,

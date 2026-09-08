@@ -3,7 +3,7 @@
 # Pixel 8 and later (Android 15+) run with 16 KB memory pages. A shared library
 # whose ELF LOAD segments are aligned to 4 KB cannot be mapped there: dlopen
 # fails, and since this app is a NativeActivity whose entire body is
-# libvoice_harmonic_engine.so, the failure looks like a clean install that dies
+# libvox_core.so, the failure looks like a clean install that dies
 # the moment it is launched — no install error, no visible crash reason.
 #
 # NDK r27+ links 16 KB-aligned by default; r26.3 (pinned in

@@ -1,10 +1,10 @@
 [package]
-name = "voice_harmonic_engine"
+name = "vox-core"
 version = "0.1.0"
 edition = "2024"
 
 # The crate is both an rlib (linked by the desktop/web `[[bin]]`) and a cdylib
-# (`libvoice_harmonic_engine.so`, which the Android APK loads and whose
+# (`libvox_core.so`, which the Android APK loads and whose
 # `android_main` symbol android-activity's NativeActivity glue calls). Desktop
 # and web are unaffected: they keep using the rlib via the binary target.
 [lib]
@@ -149,8 +149,8 @@ web-sys = { version = "0.3", features = [
 # path + password from the CARGO_APK_RELEASE_KEYSTORE[_PASSWORD] env vars, so no
 # secret is committed. See docs/android-build.md.
 [package.metadata.android]
-package = "com.voiceharmonic.engine"
-apk_name = "voice_harmonic_engine"
+package = "org.voxlabs.core"
+apk_name = "vox-core"
 build_targets = ["aarch64-linux-android"]
 
 [package.metadata.android.sdk]
