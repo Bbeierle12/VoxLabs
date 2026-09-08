@@ -30,7 +30,12 @@ Why this and not the general glyph platform: the prior-art research killed the g
 | D10 | Vocal Tract Lab's posterior inverse and MRI-reduced model are the target designs for `Inverse` backend #2 and `TractModel` backend #2; Kotlin DSP retires after tolerance-band parity | Decided (v2) |
 | D11 | Provenance record per run (stage impls, versions, params, target, build flags, input hash) is the input to `vox-validation`; output format is Vocal Tract Lab's Evidence tab | Proposed |
 | D12 | No pipeline editor before Phase 8, and Phase 8 is gated on external use | Proposed |
-| D13 | Rename `voice_harmonic_engine` → `vox-core` and split `ui.rs` *before* the Coral subtree import | Proposed |
+| D13 | Rename `voice_harmonic_engine` → `vox-core` and split `ui.rs` *before* the Coral subtree import | Done (Phase 0, PR #1) |
+| D14 | Hop 1024 is canonical for the whole pipeline; spectrogram moves to hop 1024 with `overlap` as its own parameter | Decided |
+| D15 | `analysis::AnalysisEngine` + GPU YIN path removed; desktop engine becomes the pipeline on `FrameAnalyzer`, reversing the earlier "report Unavailable, don't fall back" ruling. Freeze GPU fixture output first; gate new engine against it within `gpu_yin_matches_cpu` tolerance and against the `voxlab` harness bit-for-bit. Remove `pollster`; remove `wgpu` only if eframe doesn't render with it | Decided — lands in Phase 5c, not Phase 1 |
+| D16 | LPC order is adaptive (8–20 after decimation to 11 025 Hz) by design; not fixed 24 | Decided |
+| D17 | `parabolic_flat_eps` (1e-6 YIN vs 1e-12 elsewhere) and synthesis vs analysis default bandwidths: confirm intentional or reconcile, from the code | Decided (check in Phase 1) |
+| D18 | Phone and desktop are both products. **Phone first**: the Pixel 10 Pro XL running the Rust core native arm64 is the target for Phases 1–5a, and every latency gate in those phases is measured there. Desktop must build and pass contract tests throughout, and gets its own product pass in Phase 5c. Browser wasm is secondary (Phase 5b) | Decided |
 | O1 | Whether inverse tables and PCA bases derived from VTL `.speaker` files are GPL-encumbered | Open — check the data files' license in the VTL repo; get a real opinion before any sale |
 | O2 | Canonical Coral signing key | Open |
 | O3 | Whether Resonator adopts the core (cheap if it's a 3-stage pipeline config) | Open |
@@ -107,7 +112,9 @@ Each phase: write acceptance tests first; gate must pass before the next phase s
 - `Stage` trait, `Pipeline` builder (validates wires against §2, preallocates), `Runner` (worker thread, per-hop), `Tap` (bounded channel to the shell).
 - Wrap: YIN → `F0Track`, LPC/Levinson → `FormantTrack`, existing 41×41 grid → `TractParams`, Story `TractModel` → `AreaFunction` + 2.5D tube.
 - Pipeline `live_model.toml`: ring buffer → YIN, LPC → grid inverse → Story tract → tube view.
-- **Gate:** sings into mic, tube moves; each tap shows a live value in a debug panel; end-to-end latency measured and logged against a threshold in config; all wrapped stages pass their prior tests as contract tests; wiring a wrong type fails at build with the adapter suggestion.
+- Shell for this phase: the existing cargo-apk/egui Android build and the egui desktop build. The Tauri/React shell arrives with the Coral import in Phase 4. The pipeline is shell-agnostic (D9); do not stand up Tauri here.
+- Desktop: keep the existing GPU engine untouched this phase. Desktop must build and pass all contract tests; the desktop live engine swap (D15) happens in Phase 5c.
+- **Gate (measured on the Pixel 10 Pro XL, `org.voxlabs.core.dev` build):** sings into mic, tube moves; each tap shows a live value in a debug panel; end-to-end mic-to-render latency logged against the threshold in config, with per-stage timing from the runner; zero hop deadline misses over 10 min (worst-case hop < 50 % of the 21.3 ms budget — the report's Experiment 1 threshold, applied natively); all wrapped stages pass their prior tests as contract tests; wiring a wrong type fails at build with the adapter suggestion. Desktop must build and pass the same contract tests but is not the latency gate.
 
 ### Phase 2 — Wrap the rest of C2; provenance; validation
 - Wrap Goertzel, HNR, CPP, jitter/shimmer, tilt, LTAS, voiceprint, Fach measures. Add ISO 532-1 loudness stage with the Python reference's vectors as contract tests (answers "where psychoacoustic lives").
@@ -127,13 +134,24 @@ Each phase: write acceptance tests first; gate must pass before the next phase s
 - Coral's Spectrogram and Rehearsal views become tap renderers over the shared shell.
 - **Gate:** Coral 0.2.0 fixtures reproduce within tolerance from the Rust branch; the TypeScript worker is deleted, not kept "just in case."
 
-### Phase 5 — wasm runner
-- `vox-wasm` hosts the `Runner` in a Web Worker (the Vocal Tract Lab web-UI architecture). This gives the web target the analysis thread it lacks.
-- Build constraint: `rustfft`/`realfft` `wasm_simd` must be enabled at compile time (wasm has no runtime feature detection). Two wasm build profiles in config: SIMD and non-SIMD fallback.
-- Experiment 1 (report): C2 kernel (FFT-2048 + LPC-24 per 1024-hop) running in the Pixel 10 Pro XL Tauri System WebView, 60 s continuous 48 kHz. Metric: deadline misses per minute, worst-case per-frame time. Build it two ways — Rust→wasm worker, and Emscripten C in the audio worklet — only if the Rust path fails.
-- Experiment 2 (report): `navigator.gpu` probe + three.js scene with the production airway mesh and morph targets, WebGL2 vs `WebGPURenderer`, animated at the 43 ms cadence for 2 min. Metric: sustained fps, dropped frames.
-- Cross-target tolerance: same fixture through native arm64, desktop x86_64, wasm32; every tap compared within the D5 bands. This is where the FMA/denormal divergence shows up; record the observed deltas and set the bands from data, not guesses.
-- **Gate:** Experiment 1 — zero deadline misses over 10 min, worst-case frame < 50 % of the 21.3 ms hop budget. Experiment 2 — WebGL2 ≥ 55 fps sustained → keep WebGL2; < 30 fps with `navigator.gpu` present → pursue WebGPU; < 30 fps and no WebGPU → reduce mesh/morph complexity. Tolerance run — all taps within bands, bands committed to `pipeline.toml`. Any failure produces an experiment log and a decision on O5/O6, not a workaround.
+### Phase 5a — Android under the Tauri shell (primary target)
+- The Rust core runs **native arm64** under Tauri 2 Android; the WebView is UI only. No wasm on the phone.
+- Wire cpal under Tauri's Android harness: manual `ndk_context::initialize_android_context` (O6, cpal #720). All capture stays native; nothing through WebView `getUserMedia` (D6).
+- Experiment 2 (report): `navigator.gpu` probe + three.js scene with the production airway mesh and morph targets, WebGL2 vs `WebGPURenderer`, in the Pixel's System WebView, animated at the 43 ms cadence for 2 min. Metric: sustained fps, dropped frames.
+- Native-vs-desktop tolerance: same fixture through arm64 native and desktop x86_64; every tap compared within the D5 bands. Record observed deltas; set the bands from data.
+- **Gate:** Live Model runs in the Tauri Android build on the Pixel with the same latency numbers as the Phase 1 egui build (no regression from the shell swap). Experiment 2 — WebGL2 ≥ 55 fps sustained → keep WebGL2; < 30 fps with `navigator.gpu` present → pursue WebGPU; < 30 fps and no WebGPU → reduce mesh/morph complexity. Tolerance bands committed to `pipeline.toml`.
+
+### Phase 5c — Desktop product under the Tauri shell
+- Execute D15: freeze the GPU engine's fixture output, replace `analysis::AnalysisEngine` with the pipeline on `FrameAnalyzer`, re-home spectrogram (stage), scope (tap consumer), room calibration (wired to `calibrate.toml` from Phase 2). Delete `yin_diff.wgsl`, `yin_scan.wgsl`, `math::yin_f0_from_diff_cumsum`, `pollster`; `wgpu` only if eframe doesn't render with it.
+- Desktop-specific product features that the phone doesn't carry: file import at scale, multi-file batch through `vox-harness`, larger-screen layouts for the same tap views.
+- Desktop-vs-phone tolerance: same fixture through x86_64 and arm64; every tap within D5 bands; bands committed.
+- **Gate:** new desktop engine matches the frozen GPU baseline within `gpu_yin_matches_cpu` tolerance and the `voxlab` harness bit-for-bit; Live Model, Fingerprint, and Choir modes run on desktop from the same pipeline TOMLs as the phone with no mode-specific code paths; egui desktop build retired (or kept only for Resonator per O3).
+
+### Phase 5b — Browser wasm target (secondary; may be deferred indefinitely)
+- `vox-wasm` hosts the `Runner` in a Web Worker. Build constraint: `rustfft`/`realfft` `wasm_simd` at compile time; two build profiles, SIMD and fallback.
+- Experiment 1 (report): C2 kernel per 1024-hop in a browser, 60 s continuous. Rust→wasm worker first; Emscripten C in the audio worklet only if Rust fails (O5 fallback rule).
+- Three-way tolerance: add wasm32 to the Phase 5a comparison. This is where FMA/denormal divergence shows up.
+- **Gate:** zero deadline misses over 10 min, worst-case frame < 50 % of budget. Any failure produces an experiment log and a decision on O5, not a workaround. This phase does not block Phases 6–7.
 
 ### Phase 6 — Workbench + VTL backend (desktop only)
 - `vox-tract-vtl` behind a feature flag: VTL formant-fitting as `Inverse` backend #3, VTL geometry as `TractModel` backend #3, 19-D `TractParams`.
