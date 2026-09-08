@@ -1,16 +1,46 @@
-use crate::types::{Formant, MAX_PARTIALS, Voiceprint};
+use crate::config::consts::{
+    ADJACENT_PAIR, CENTS_PER_SEMITONE, DB_LOG_BASE, DB_PER_DECADE_AMPLITUDE, DB_PER_DECADE_POWER,
+    HALF, HAMMING_A0, HAMMING_A1, HANN_A0, MIDI_A4, PARABOLIC_HEIGHT_DENOM, PARABOLIC_PEAK_DENOM,
+    PERCENT, SEMITONES_PER_OCTAVE, SEMITONES_PER_OCTAVE_I32, SEMITONES_PER_OCTAVE_USIZE, TWO,
+    TWO_USIZE,
+};
+use crate::config::voiceprint::N_SCALAR_FEATURES;
+use crate::config::{
+    CentroidConfig, CppConfig, FormantConfig, HarmonicsConfig, HnrConfig, LpcConfig,
+    NoiseFloorConfig, PerturbationConfig, RoomCalibrationConfig, TimbreConfig, TuningConfig,
+    VoiceClassConfig, VoiceprintConfig, VoicingConfig, YinConfig,
+};
+use crate::types::{Formant, MAX_PARTIALS, N_FORMANTS, VOICEPRINT_PROFILE_LEN, Voiceprint};
 use aberth::AberthSolver;
-use std::f32::consts::PI;
+use std::f32::consts::TAU;
+
+// Stage configuration (Plan v3 §4): the defaults in `config`, mirrored in
+// `pipeline.toml`. Phase 1 threads these through `Stage::init`.
+const YIN: YinConfig = YinConfig::DEFAULT;
+const VOICING: VoicingConfig = VoicingConfig::DEFAULT;
+const NOISE: NoiseFloorConfig = NoiseFloorConfig::DEFAULT;
+const CALIB: RoomCalibrationConfig = RoomCalibrationConfig::DEFAULT;
+const LPC: LpcConfig = LpcConfig::DEFAULT;
+const FORMANT: FormantConfig = FormantConfig::DEFAULT;
+const HARMONICS: HarmonicsConfig = HarmonicsConfig::DEFAULT;
+const HNR: HnrConfig = HnrConfig::DEFAULT;
+const PERTURB: PerturbationConfig = PerturbationConfig::DEFAULT;
+const CPP: CppConfig = CppConfig::DEFAULT;
+const CENTROID: CentroidConfig = CentroidConfig::DEFAULT;
+const TIMBRE: TimbreConfig = TimbreConfig::DEFAULT;
+const CLASS: VoiceClassConfig = VoiceClassConfig::DEFAULT;
+const TUNING: TuningConfig = TuningConfig::DEFAULT;
+const VOICEPRINT: VoiceprintConfig = VoiceprintConfig::DEFAULT;
 
 /// YIN analysis window length: the number of samples compared per lag in the
 /// difference function. The analysis frame must be at least this plus the
 /// maximum search lag so `x[j + tau]` never reads past the frame end.
-pub const YIN_WINDOW: usize = 1024;
+pub const YIN_WINDOW: usize = YIN.window;
 
 /// YIN search bounds (Hz) and the absolute threshold for the CMND dip.
-const YIN_F0_MIN: f32 = 50.0;
-const YIN_F0_MAX: f32 = 1000.0;
-const YIN_THRESHOLD: f32 = 0.12;
+const YIN_F0_MIN: f32 = YIN.f0_min_hz;
+const YIN_F0_MAX: f32 = YIN.f0_max_hz;
+const YIN_THRESHOLD: f32 = YIN.threshold;
 
 thread_local! {
     // rustfft's planner caches plans by size; sharing one per thread means
@@ -43,7 +73,7 @@ pub fn levinson_durbin(autocorr: &[f32], order: usize) -> Vec<f32> {
     let mut e = autocorr[0];
 
     for i in 1..=order {
-        if e.abs() < 1e-9 {
+        if e.abs() < LPC.levinson_error_floor {
             // Prediction error has collapsed (silent or degenerate frame).
             // Stop the recursion; remaining higher-order coeffs stay 0, which
             // is a valid lower-order polynomial rather than a NaN blow-up.
@@ -80,13 +110,13 @@ pub fn levinson_durbin(autocorr: &[f32], order: usize) -> Vec<f32> {
 /// **reverse** the coefficients: since `z^p * A(z) = sum_k a_k z^(p-k)`, the
 /// reversed array is a polynomial in `x = z`, so the returned roots are the
 /// poles directly.
-pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; 3] {
+pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; N_FORMANTS] {
     let mut result = [Formant {
         frequency: 0.0,
         bandwidth: 0.0,
-    }; 3];
+    }; N_FORMANTS];
 
-    if lpc.len() < 3 {
+    if lpc.len() < FORMANT.min_coefficients {
         return result;
     }
 
@@ -94,12 +124,12 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; 3] {
     let coeffs: Vec<f64> = lpc.iter().rev().map(|&c| c as f64).collect();
 
     let mut solver = AberthSolver::new();
-    solver.max_iterations = 50;
-    solver.epsilon = 1e-9;
+    solver.max_iterations = FORMANT.aberth_max_iterations;
+    solver.epsilon = FORMANT.aberth_epsilon;
     let roots = solver.find_roots(&coeffs);
 
     let fs = sample_rate as f64;
-    let two_pi = 2.0 * std::f64::consts::PI;
+    let two_pi = std::f64::consts::TAU;
     let mut formants: Vec<Formant> = Vec::new();
 
     for z in roots.iter() {
@@ -116,7 +146,9 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; 3] {
         let bandwidth = -fs * r.ln() / std::f64::consts::PI;
 
         // Speech formant band + sharpness gate (wide resonances aren't formants).
-        if (90.0..=5000.0).contains(&freq) && bandwidth < 500.0 {
+        if (FORMANT.band_lo_hz..=FORMANT.band_hi_hz).contains(&freq)
+            && bandwidth < FORMANT.max_bandwidth_hz
+        {
             formants.push(Formant {
                 frequency: freq as f32,
                 bandwidth: bandwidth as f32,
@@ -148,11 +180,11 @@ pub fn parabolic_interpolation(diff_fn: &[f32], tau: usize) -> f32 {
     let s1 = diff_fn[tau];
     let s2 = diff_fn[tau + 1];
 
-    let denom = s0 - 2.0 * s1 + s2;
-    if denom.abs() < 1e-6 {
+    let denom = s0 - TWO * s1 + s2;
+    if denom.abs() < YIN.parabolic_flat_eps {
         tau as f32
     } else {
-        tau as f32 + (s0 - s2) / (2.0 * denom)
+        tau as f32 + (s0 - s2) / (TWO * denom)
     }
 }
 
@@ -193,10 +225,10 @@ pub fn yin_difference(samples: &[f32], window: usize, max_lag: usize) -> Vec<f32
 /// length `len`. Returns `None` if the range is too short to analyze.
 fn yin_bounds(len: usize, sample_rate: f32) -> Option<(usize, usize)> {
     let tau_max = ((sample_rate / YIN_F0_MIN) as usize).min(len.saturating_sub(1));
-    if tau_max < 3 {
+    if tau_max < YIN.min_max_lag {
         return None;
     }
-    let tau_min = ((sample_rate / YIN_F0_MAX) as usize).clamp(2, tau_max - 1);
+    let tau_min = ((sample_rate / YIN_F0_MAX) as usize).clamp(YIN.min_tau, tau_max - 1);
     Some((tau_min, tau_max))
 }
 
@@ -300,14 +332,14 @@ pub fn yin_f0_from_diff_cumsum(
 /// the frame is too short to analyze.
 pub fn yin_pitch(samples: &[f32], sample_rate: f32) -> Option<PitchEstimate> {
     let n = samples.len();
-    let w = YIN_WINDOW.min(n / 2);
-    if w < 2 {
+    let w = YIN_WINDOW.min(n / TWO_USIZE);
+    if w < YIN.min_window {
         return None;
     }
     // Largest lag we can evaluate without `x[j+tau]` leaving the frame, also
     // bounded by the lowest pitch we care about.
     let max_lag = ((sample_rate / YIN_F0_MIN) as usize).min(n - w);
-    if max_lag < 3 {
+    if max_lag < YIN.min_max_lag {
         return None;
     }
     let diff = yin_difference(samples, w, max_lag);
@@ -335,17 +367,17 @@ fn lowpass_fir(cutoff_norm: f32, num_taps: usize) -> Vec<f32> {
     let mut taps = vec![0.0f32; num_taps];
     let mut sum = 0.0f32;
     for (i, tap) in taps.iter_mut().enumerate() {
-        let centered = i as f32 - m / 2.0;
-        let sinc = if centered.abs() < 1e-6 {
-            2.0 * cutoff_norm
+        let centered = i as f32 - m / TWO;
+        let sinc = if centered.abs() < LPC.sinc_center_eps {
+            TWO * cutoff_norm
         } else {
-            (2.0 * PI * cutoff_norm * centered).sin() / (PI * centered)
+            (TAU * cutoff_norm * centered).sin() / (std::f32::consts::PI * centered)
         };
-        let window = 0.54 - 0.46 * (2.0 * PI * i as f32 / m).cos();
+        let window = HAMMING_A0 - HAMMING_A1 * (TAU * i as f32 / m).cos();
         *tap = sinc * window;
         sum += *tap;
     }
-    if sum.abs() > 1e-9 {
+    if sum.abs() > LPC.fir_gain_eps {
         for tap in taps.iter_mut() {
             *tap /= sum;
         }
@@ -360,9 +392,9 @@ pub fn decimate(samples: &[f32], factor: usize) -> Vec<f32> {
     if factor <= 1 {
         return samples.to_vec();
     }
-    let cutoff = 0.45 / factor as f32;
-    let taps = lowpass_fir(cutoff, 31);
-    let half = (taps.len() / 2) as isize;
+    let cutoff = LPC.decimation_cutoff_of_nyquist / factor as f32;
+    let taps = lowpass_fir(cutoff, LPC.decimation_fir_taps);
+    let half = (taps.len() / TWO_USIZE) as isize;
     let n = samples.len() as isize;
 
     let mut out = Vec::with_capacity(samples.len() / factor + 1);
@@ -403,12 +435,12 @@ pub fn lpc_coefficients(samples: &[f32], order: usize, preemph: f32) -> Vec<f32>
     // Hamming window to tame autocorrelation edge effects.
     let m = (len - 1) as f32;
     for (n, v) in x.iter_mut().enumerate() {
-        let w = 0.54 - 0.46 * (2.0 * PI * n as f32 / m).cos();
+        let w = HAMMING_A0 - HAMMING_A1 * (TAU * n as f32 / m).cos();
         *v *= w;
     }
 
     let r = autocorrelation(&x, order);
-    if r[0] <= 1e-9 {
+    if r[0] <= LPC.silence_energy {
         // Silent frame — return the trivial all-pass polynomial.
         let mut a = vec![0.0f32; order + 1];
         a[0] = 1.0;
@@ -433,7 +465,10 @@ pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; 
     let n = samples.len();
     // `!(x > 0.0)` (not `x <= 0.0`): NaN fails every comparison, so the
     // negated form routes NaN to the zero return instead of a NaN Goertzel.
-    if n < 32 || !(f0.is_finite() && f0 > 0.0) || !(sample_rate.is_finite() && sample_rate > 0.0) {
+    if n < HARMONICS.min_frame_samples
+        || !(f0.is_finite() && f0 > 0.0)
+        || !(sample_rate.is_finite() && sample_rate > 0.0)
+    {
         return amps;
     }
 
@@ -443,21 +478,21 @@ pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; 
     let mut windowed = vec![0.0f32; n];
     let mut wsum = 0.0f32;
     for (i, (w, &x)) in windowed.iter_mut().zip(samples).enumerate() {
-        let win = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+        let win = HANN_A0 - HANN_A0 * (TAU * i as f32 / m).cos();
         *w = x * win;
         wsum += win;
     }
-    let norm = 2.0 / wsum;
+    let norm = TWO / wsum;
 
-    let nyquist = sample_rate / 2.0;
+    let nyquist = sample_rate / TWO;
     for (k, amp) in amps.iter_mut().enumerate() {
         let freq = (k + 1) as f32 * f0;
         if freq >= nyquist {
             break;
         }
         // Goertzel recurrence at `freq`.
-        let omega = 2.0 * PI * freq / sample_rate;
-        let coeff = 2.0 * omega.cos();
+        let omega = TAU * freq / sample_rate;
+        let coeff = TWO * omega.cos();
         let (mut s1, mut s2) = (0.0f32, 0.0f32);
         for &x in &windowed {
             let s0 = x + coeff * s1 - s2;
@@ -480,12 +515,12 @@ pub fn harmonic_amplitudes(samples: &[f32], sample_rate: f32, f0: f32) -> [f32; 
 /// as a relative training signal, not a clinical instrument.
 pub fn hnr_db(samples: &[f32], sample_rate: f32, f0: f32) -> Option<f32> {
     let n = samples.len();
-    if f0 <= 0.0 || sample_rate <= 0.0 || n < 64 {
+    if f0 <= 0.0 || sample_rate <= 0.0 || n < HNR.min_frame_samples {
         return None;
     }
     let lag = sample_rate / f0;
     let lag_i = lag.round() as usize;
-    if lag_i < 2 || lag_i + 2 >= n {
+    if lag_i < HNR.min_period_samples || lag_i + HNR.period_margin_samples >= n {
         return None;
     }
 
@@ -499,25 +534,25 @@ pub fn hnr_db(samples: &[f32], sample_rate: f32, f0: f32) -> Option<f32> {
         sum / (n - l) as f32
     };
     let r0 = r_at(0);
-    if r0 <= 1e-12 {
+    if r0 <= HNR.energy_eps {
         return None;
     }
 
     // Parabolic vertex through the three lags around the period gives the
     // true (non-integer-lag) correlation peak height.
     let (y0, y1, y2) = (r_at(lag_i - 1), r_at(lag_i), r_at(lag_i + 1));
-    let denom = y0 - 2.0 * y1 + y2;
-    let peak = if denom.abs() < 1e-12 {
+    let denom = y0 - TWO * y1 + y2;
+    let peak = if denom.abs() < HNR.parabolic_flat_eps {
         y1
     } else {
-        y1 - (y0 - y2) * (y0 - y2) / (8.0 * denom)
+        y1 - (y0 - y2) * (y0 - y2) / (PARABOLIC_PEAK_DENOM * denom)
     };
 
-    let r = (peak / r0).clamp(-0.9999, 0.9999);
+    let r = (peak / r0).clamp(-HNR.r_clamp, HNR.r_clamp);
     if r <= 0.0 {
-        return Some(-40.0);
+        return Some(-HNR.db_limit);
     }
-    Some((10.0 * (r / (1.0 - r)).log10()).clamp(-40.0, 40.0))
+    Some((DB_PER_DECADE_POWER * (r / (1.0 - r)).log10()).clamp(-HNR.db_limit, HNR.db_limit))
 }
 
 /// H1–H2 in dB: the level difference between the first two harmonics, the
@@ -527,8 +562,9 @@ pub fn hnr_db(samples: &[f32], sample_rate: f32, f0: f32) -> Option<f32> {
 pub fn h1_h2_db(amps: &[f32]) -> Option<f32> {
     let (a1, a2) = (*amps.first()?, *amps.get(1)?);
     let max = amps.iter().cloned().fold(0.0f32, f32::max);
-    let floor = max * 10f32.powf(-48.0 / 20.0);
-    (max > 1e-6 && a1 > floor && a2 > floor).then(|| 20.0 * (a1 / a2).log10())
+    let floor = max * DB_LOG_BASE.powf(TIMBRE.relative_floor_db / DB_PER_DECADE_AMPLITUDE);
+    (max > TIMBRE.amp_eps && a1 > floor && a2 > floor)
+        .then(|| DB_PER_DECADE_AMPLITUDE * (a1 / a2).log10())
 }
 
 /// Cycle-to-cycle perturbation measures from one analysis frame.
@@ -550,11 +586,11 @@ pub struct CyclePerturbation {
 /// floor on measurable pitch: f0 ≥ ~5·sr/frame (≈ 112 Hz @ 44.1 k / 2048).
 pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<CyclePerturbation> {
     let n = samples.len();
-    if f0 <= 0.0 || sample_rate <= 0.0 || n < 64 {
+    if f0 <= 0.0 || sample_rate <= 0.0 || n < PERTURB.min_frame_samples {
         return None;
     }
     let period = sample_rate / f0;
-    if period < 8.0 {
+    if period < PERTURB.min_period_samples {
         return None;
     }
 
@@ -574,24 +610,24 @@ pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<
             return Some((best as f32, samples[best]));
         }
         let (y0, y1, y2) = (samples[best - 1], samples[best], samples[best + 1]);
-        let denom = y0 - 2.0 * y1 + y2;
-        if denom.abs() < 1e-12 {
+        let denom = y0 - TWO * y1 + y2;
+        if denom.abs() < PERTURB.parabolic_flat_eps {
             return Some((best as f32, y1));
         }
-        let delta = ((y0 - y2) / (2.0 * denom)).clamp(-0.5, 0.5);
-        let height = y1 - (y0 - y2) * delta / 4.0;
+        let delta = ((y0 - y2) / (TWO * denom)).clamp(-HALF, HALF);
+        let height = y1 - (y0 - y2) * delta / PARABOLIC_HEIGHT_DENOM;
         Some((best as f32 + delta, height))
     };
 
     // First mark: strongest sample in the first 1.5 periods; then march
     // forward one period at a time inside a ±30 % search window.
     let mut marks: Vec<(f32, f32)> = Vec::new();
-    let first = peak_in(0, (1.5 * period) as usize)?;
+    let first = peak_in(0, (PERTURB.first_search_periods * period) as usize)?;
     marks.push(first);
     loop {
         let prev = marks.last().unwrap().0;
-        let lo = (prev + 0.7 * period) as usize;
-        let hi = (prev + 1.3 * period).ceil() as usize;
+        let lo = (prev + PERTURB.search_window_lo * period) as usize;
+        let hi = (prev + PERTURB.search_window_hi * period).ceil() as usize;
         if hi > n {
             break;
         }
@@ -600,40 +636,46 @@ pub fn cycle_perturbation(samples: &[f32], sample_rate: f32, f0: f32) -> Option<
             None => break,
         }
     }
-    if marks.len() < 5 {
+    if marks.len() < PERTURB.min_cycles {
         return None;
     }
 
-    let periods: Vec<f32> = marks.windows(2).map(|w| w[1].0 - w[0].0).collect();
+    let periods: Vec<f32> = marks
+        .windows(ADJACENT_PAIR)
+        .map(|w| w[1].0 - w[0].0)
+        .collect();
     // Sanity: every interval near the YIN period, else the marks double-fired
     // or skipped (strong formants can do this) and the numbers would be junk.
     if periods
         .iter()
-        .any(|&t| t < 0.7 * period || t > 1.3 * period)
+        .any(|&t| t < PERTURB.search_window_lo * period || t > PERTURB.search_window_hi * period)
     {
         return None;
     }
 
     let mean_t = periods.iter().sum::<f32>() / periods.len() as f32;
-    let jitter_pct = periods.windows(2).map(|w| (w[0] - w[1]).abs()).sum::<f32>()
+    let jitter_pct = periods
+        .windows(ADJACENT_PAIR)
+        .map(|w| (w[0] - w[1]).abs())
+        .sum::<f32>()
         / (periods.len() - 1) as f32
         / mean_t
-        * 100.0;
+        * PERCENT;
     // Plausibility ceiling: aperiodic input yields peaks scattered uniformly
     // inside the search windows (~20-30 % "jitter") — the ±30 % interval
     // check can't catch that by construction. Severe pathology is ~2-3 %;
     // beyond 5 % the marks aren't tracking real glottal cycles.
-    if jitter_pct > 5.0 {
+    if jitter_pct > PERTURB.max_jitter_pct {
         return None;
     }
 
     let amps: Vec<f32> = marks.iter().map(|&(_, a)| a).collect();
-    if amps.iter().any(|&a| a <= 1e-6) {
+    if amps.iter().any(|&a| a <= PERTURB.amp_eps) {
         return None;
     }
     let shimmer_db = amps
-        .windows(2)
-        .map(|w| (20.0 * (w[1] / w[0]).log10()).abs())
+        .windows(ADJACENT_PAIR)
+        .map(|w| (DB_PER_DECADE_AMPLITUDE * (w[1] / w[0]).log10()).abs())
         .sum::<f32>()
         / (amps.len() - 1) as f32;
 
@@ -655,10 +697,10 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
     use rustfft::num_complex::Complex;
 
     let n = samples.len();
-    if n < 256 || sample_rate <= 0.0 {
+    if n < CPP.min_frame_samples || sample_rate <= 0.0 {
         return None;
     }
-    if samples.iter().map(|s| s * s).sum::<f32>() < 1e-9 {
+    if samples.iter().map(|s| s * s).sum::<f32>() < CPP.silence_energy {
         return None; // silence
     }
 
@@ -670,7 +712,7 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
         .iter()
         .enumerate()
         .map(|(i, &x)| {
-            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+            let w = HANN_A0 - HANN_A0 * (TAU * i as f32 / m).cos();
             Complex::new(x * w, 0.0)
         })
         .collect();
@@ -679,29 +721,36 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
     // dB power spectrum is real and even, so its FFT is the real cepstrum.
     let mut logspec: Vec<Complex<f32>> = buf
         .iter()
-        .map(|c| Complex::new(10.0 * (c.norm_sqr() + 1e-12).log10(), 0.0))
+        .map(|c| {
+            Complex::new(
+                DB_PER_DECADE_POWER * (c.norm_sqr() + CPP.log_floor).log10(),
+                0.0,
+            )
+        })
         .collect();
     fft.process(&mut logspec);
     let ceps_db: Vec<f32> = logspec
         .iter()
-        .map(|c| 10.0 * (c.norm_sqr() / (n as f32) / (n as f32) + 1e-12).log10())
+        .map(|c| {
+            DB_PER_DECADE_POWER * (c.norm_sqr() / (n as f32) / (n as f32) + CPP.log_floor).log10()
+        })
         .collect();
 
     // Voice pitch quefrency band: 60–500 Hz. If the frame is too short to
     // reach the 60 Hz end at this sample rate (e.g. 2048 samples at 96 kHz),
     // refuse rather than search a truncated band and report the prominence of
     // some spurious higher-pitch bin.
-    let q_lo = (sample_rate / 500.0).ceil() as usize;
-    let q_hi = (sample_rate / 60.0).floor() as usize;
-    if q_hi > n / 2 - 1 {
+    let q_lo = (sample_rate / CPP.f0_band_hi_hz).ceil() as usize;
+    let q_hi = (sample_rate / CPP.f0_band_lo_hz).floor() as usize;
+    if q_hi > n / TWO_USIZE - 1 {
         return None;
     }
-    if q_lo + 4 >= q_hi {
+    if q_lo + CPP.min_band_bins >= q_hi {
         return None;
     }
 
     // Regression baseline over the full analyzed quefrency range.
-    let range = q_lo..n / 2;
+    let range = q_lo..n / TWO_USIZE;
     let cnt = range.len() as f32;
     let mx = range.clone().map(|q| q as f32).sum::<f32>() / cnt;
     let my = range.clone().map(|q| ceps_db[q]).sum::<f32>() / cnt;
@@ -711,7 +760,7 @@ pub fn cpp_db(samples: &[f32], sample_rate: f32) -> Option<f32> {
         num += dx * (ceps_db[q] - my);
         den += dx * dx;
     }
-    if den < 1e-9 {
+    if den < CPP.regression_eps {
         return None;
     }
     let slope = num / den;
@@ -738,10 +787,10 @@ pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
     use rustfft::num_complex::Complex;
 
     let n = samples.len();
-    if n < 256 || sample_rate <= 0.0 {
+    if n < CENTROID.min_frame_samples || sample_rate <= 0.0 {
         return None;
     }
-    if samples.iter().map(|s| s * s).sum::<f32>() < 1e-9 {
+    if samples.iter().map(|s| s * s).sum::<f32>() < CENTROID.silence_energy {
         return None; // silence
     }
 
@@ -752,16 +801,16 @@ pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
         .iter()
         .enumerate()
         .map(|(i, &x)| {
-            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+            let w = HANN_A0 - HANN_A0 * (TAU * i as f32 / m).cos();
             Complex::new(x * w, 0.0)
         })
         .collect();
     fft.process(&mut buf);
 
     let bin_hz = sample_rate / n as f32;
-    let lo_bin = (80.0 / bin_hz).ceil() as usize;
-    let hi_bin = ((8000.0f32.min(sample_rate / 2.0)) / bin_hz).floor() as usize;
-    let hi_bin = hi_bin.min(n / 2);
+    let lo_bin = (CENTROID.band_lo_hz / bin_hz).ceil() as usize;
+    let hi_bin = ((CENTROID.band_hi_hz.min(sample_rate / TWO)) / bin_hz).floor() as usize;
+    let hi_bin = hi_bin.min(n / TWO_USIZE);
     if lo_bin >= hi_bin {
         return None;
     }
@@ -773,7 +822,7 @@ pub fn spectral_centroid(samples: &[f32], sample_rate: f32) -> Option<f32> {
         num += freq * amp;
         den += amp;
     }
-    (den > 1e-9).then(|| num / den)
+    (den > CENTROID.magnitude_eps).then(|| num / den)
 }
 
 // ── Musical mapping & timbre metrics ─────────────────────────────────────────
@@ -787,7 +836,7 @@ pub struct Note {
     pub cents: f32,
 }
 
-const NOTE_NAMES: [&str; 12] = [
+const NOTE_NAMES: [&str; SEMITONES_PER_OCTAVE_USIZE] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
 ];
 
@@ -797,13 +846,13 @@ pub fn freq_to_note(hz: f32) -> Option<Note> {
     if hz <= 0.0 || !hz.is_finite() {
         return None;
     }
-    let midi = 69.0 + 12.0 * (hz / 440.0).log2();
+    let midi = MIDI_A4 + SEMITONES_PER_OCTAVE * (hz / TUNING.a4_hz).log2();
     let nearest = midi.round();
-    let idx = (nearest as i32).rem_euclid(12) as usize;
+    let idx = (nearest as i32).rem_euclid(SEMITONES_PER_OCTAVE_I32) as usize;
     Some(Note {
         name: NOTE_NAMES[idx],
-        octave: (nearest as i32).div_euclid(12) - 1,
-        cents: (midi - nearest) * 100.0,
+        octave: (nearest as i32).div_euclid(SEMITONES_PER_OCTAVE_I32) - 1,
+        cents: (midi - nearest) * CENTS_PER_SEMITONE,
     })
 }
 
@@ -826,7 +875,7 @@ pub fn semitones_from(freq: f32, reference: f32) -> Option<f32> {
     if freq <= 0.0 || reference <= 0.0 || !freq.is_finite() || !reference.is_finite() {
         return None;
     }
-    Some(12.0 * (freq / reference).log2())
+    Some(SEMITONES_PER_OCTAVE * (freq / reference).log2())
 }
 
 /// Spectral tilt in dB/octave: least-squares slope of harmonic level (dB)
@@ -834,19 +883,19 @@ pub fn semitones_from(freq: f32, reference: f32) -> Option<f32> {
 /// dB/oct; a brighter, more pressed voice is shallower (closer to 0).
 pub fn spectral_tilt_db_per_octave(amps: &[f32]) -> Option<f32> {
     let max = amps.iter().cloned().fold(0.0f32, f32::max);
-    if max <= 1e-6 {
+    if max <= TIMBRE.amp_eps {
         return None;
     }
     // Only fit partials within 48 dB of the strongest one: bins below that are
     // numerical noise whose ~−100 dB levels would drag the slope toward −∞.
-    let floor = max * 10f32.powf(-48.0 / 20.0);
+    let floor = max * DB_LOG_BASE.powf(TIMBRE.relative_floor_db / DB_PER_DECADE_AMPLITUDE);
     let pts: Vec<(f32, f32)> = amps
         .iter()
         .enumerate()
         .filter(|&(_, &a)| a > floor)
-        .map(|(k, &a)| (((k + 1) as f32).log2(), 20.0 * a.log10()))
+        .map(|(k, &a)| (((k + 1) as f32).log2(), DB_PER_DECADE_AMPLITUDE * a.log10()))
         .collect();
-    if pts.len() < 2 {
+    if pts.len() < TIMBRE.tilt_min_points {
         return None;
     }
     let n = pts.len() as f32;
@@ -859,7 +908,7 @@ pub fn spectral_tilt_db_per_octave(amps: &[f32]) -> Option<f32> {
         num += (x - mx) * (y - my);
         den += (x - mx) * (x - mx);
     }
-    (den > 1e-9).then(|| num / den)
+    (den > TIMBRE.tilt_regression_eps).then(|| num / den)
 }
 
 /// Even/odd harmonic energy balance in dB over H2..=H16. H1 is excluded — it
@@ -867,15 +916,20 @@ pub fn spectral_tilt_db_per_octave(amps: &[f32]) -> Option<f32> {
 /// (fuller, rounder); negative = odd-heavy (hollower, clarinet-like).
 pub fn even_odd_balance_db(amps: &[f32]) -> Option<f32> {
     let (mut even, mut odd) = (0.0f32, 0.0f32);
-    for (k, &a) in amps.iter().enumerate().take(16).skip(1) {
+    for (k, &a) in amps
+        .iter()
+        .enumerate()
+        .take(TIMBRE.even_odd_partials)
+        .skip(1)
+    {
         let e = a * a;
-        if (k + 1).is_multiple_of(2) {
+        if (k + 1).is_multiple_of(TWO_USIZE) {
             even += e;
         } else {
             odd += e;
         }
     }
-    (even > 0.0 && odd > 0.0).then(|| 10.0 * (even / odd).log10())
+    (even > 0.0 && odd > 0.0).then(|| DB_PER_DECADE_POWER * (even / odd).log10())
 }
 
 /// Percentage of harmonic energy in the singer's-formant band (2.8–3.4 kHz) —
@@ -889,11 +943,13 @@ pub fn singers_formant_pct(amps: &[f32], f0: f32) -> Option<f32> {
     for (k, &a) in amps.iter().enumerate() {
         let e = a * a;
         total += e;
-        if (2_800.0..=3_400.0).contains(&((k + 1) as f32 * f0)) {
+        if (TIMBRE.singers_formant_lo_hz..=TIMBRE.singers_formant_hi_hz)
+            .contains(&((k + 1) as f32 * f0))
+        {
             band += e;
         }
     }
-    (total > 1e-12).then(|| band / total * 100.0)
+    (total > TIMBRE.energy_eps).then(|| band / total * PERCENT)
 }
 
 /// Rough vocal-range classification from mean fundamental frequency. Ported
@@ -903,15 +959,15 @@ pub fn voice_class(mean_f0: f32) -> &'static str {
     if mean_f0 <= 0.0 || !mean_f0.is_finite() {
         return "—";
     }
-    if mean_f0 < 130.0 {
+    if mean_f0 < CLASS.bass_max_hz {
         "Bass"
-    } else if mean_f0 < 175.0 {
+    } else if mean_f0 < CLASS.baritone_max_hz {
         "Baritone"
-    } else if mean_f0 < 220.0 {
+    } else if mean_f0 < CLASS.tenor_max_hz {
         "Tenor"
-    } else if mean_f0 < 290.0 {
+    } else if mean_f0 < CLASS.alto_max_hz {
         "Alto"
-    } else if mean_f0 < 370.0 {
+    } else if mean_f0 < CLASS.mezzo_max_hz {
         "Mezzo-Soprano"
     } else {
         "Soprano"
@@ -924,13 +980,13 @@ pub fn brightness_class(centroid_hz: f32) -> &'static str {
     if centroid_hz <= 0.0 || !centroid_hz.is_finite() {
         return "—";
     }
-    if centroid_hz < 1200.0 {
+    if centroid_hz < CLASS.dark_max_hz {
         "Dark"
-    } else if centroid_hz < 2200.0 {
+    } else if centroid_hz < CLASS.warm_max_hz {
         "Warm"
-    } else if centroid_hz < 3200.0 {
+    } else if centroid_hz < CLASS.balanced_max_hz {
         "Balanced"
-    } else if centroid_hz < 4400.0 {
+    } else if centroid_hz < CLASS.bright_max_hz {
         "Bright"
     } else {
         "Brilliant"
@@ -948,14 +1004,18 @@ pub fn brightness_class(centroid_hz: f32) -> &'static str {
 /// H2..H16 count toward the "strong harmonic" tally, matching the prototype.
 pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'static str {
     if let Some(db) = even_odd_db
-        && db < -6.0
+        && db < TIMBRE.hollow_even_odd_db
     {
         return "Hollow · odd-dominant";
     }
-    let strong = rel_amps.iter().skip(1).filter(|&&a| a > 0.25).count();
-    if strong >= 6 {
+    let strong = rel_amps
+        .iter()
+        .skip(1)
+        .filter(|&&a| a > TIMBRE.strong_partial_rel_amp)
+        .count();
+    if strong >= TIMBRE.rich_min_strong {
         "Rich · complex"
-    } else if strong <= 2 {
+    } else if strong <= TIMBRE.pure_max_strong {
         "Pure · flute-like"
     } else {
         "Balanced"
@@ -969,28 +1029,28 @@ pub fn timbre_description(rel_amps: &[f32], even_odd_db: Option<f32>) -> &'stati
 /// ambience loud enough to corrupt every harmonic measure taken from the
 /// frame, so the frame is demoted to unvoiced. Engineering floor; the
 /// measurement-grade threshold below is the cited one.
-pub const VOICED_MIN_SNR_DB: f32 = 15.0;
+pub const VOICED_MIN_SNR_DB: f32 = VOICING.voiced_min_snr_db;
 
 /// Minimum SNR (dB) for a frame to contribute *identity* data (voiceprint
 /// formants, VTL). The ASHA instrumental-assessment protocol (Patel et al.
 /// 2018, AJSLP 27:887) specifies at least 30 dB signal-to-noise for
 /// measurement-grade voice recording; frames below it may still display,
 /// but must not become part of who the app thinks the singer is.
-pub const IDENTITY_MIN_SNR_DB: f32 = 30.0;
+pub const IDENTITY_MIN_SNR_DB: f32 = VOICING.identity_min_snr_db;
 
 /// Ring capacity for ambient-floor tracking, in unvoiced frames (~6 s of
 /// non-phonation time at the ~21.5 Hz frame rate).
-const NOISE_RING_LEN: usize = 128;
+const NOISE_RING_LEN: usize = NOISE.ring_len;
 
 /// Minimum unvoiced frames observed before the floor is trusted (~1.5 s).
 /// Until then `snr_db` reports `None` and nothing is gated — a quiet room
 /// must not lock the app out while the tracker warms up.
-const NOISE_RING_MIN: usize = 32;
+const NOISE_RING_MIN: usize = NOISE.ring_min;
 
 /// Percentile of the ring taken as the floor. Low, so breaths, consonants
 /// and other loud-but-unvoiced moments of real speech do not drag the
 /// "ambient" estimate up toward the voice itself.
-const NOISE_FLOOR_PERCENTILE: f32 = 0.10;
+const NOISE_FLOOR_PERCENTILE: f32 = NOISE.floor_percentile;
 
 /// Ambient-noise floor tracker.
 ///
@@ -1069,7 +1129,7 @@ impl NoiseFloor {
         if !(frame_rms.is_finite() && frame_rms > 0.0) {
             return Some(0.0);
         }
-        Some(20.0 * (frame_rms / floor.max(1e-7)).log10())
+        Some(DB_PER_DECADE_AMPLITUDE * (frame_rms / floor.max(NOISE.floor_min_rms)).log10())
     }
 }
 
@@ -1078,28 +1138,28 @@ impl NoiseFloor {
 /// enough that "keep quiet for five seconds" is a reasonable ask. The
 /// clinical practice this mirrors — record the room before the voice — is
 /// part of the same ASHA protocol as the 30 dB SNR requirement.
-pub const CALIB_FRAMES: u32 = 100;
+pub const CALIB_FRAMES: u32 = CALIB.frames;
 
 /// Fractional f0 tolerance for matching a live detection against the
 /// calibrated interferer (±4%, roughly ±:two thirds of a semitone — wide
 /// enough for hum drift, far narrower than typical vibrato excursions).
-const INTERFERER_F0_TOL: f32 = 0.04;
+const INTERFERER_F0_TOL: f32 = CALIB.interferer_f0_tol;
 
 /// A frame whose RMS exceeds the calibrated interferer's level by this many
 /// dB is treated as the singer, even at the interferer's pitch: the gate
 /// must never forbid singing a note the refrigerator also hums.
-const INTERFERER_LEVEL_MARGIN_DB: f32 = 10.0;
+const INTERFERER_LEVEL_MARGIN_DB: f32 = CALIB.interferer_level_margin_db;
 
 /// Voiced fraction of the calibration window above which an *unstable*
 /// pitch means a voice (or TV) was talking during calibration — fail rather
 /// than fingerprint speech as "the room".
-const CALIB_VOICED_FAIL_FRACTION: f32 = 0.3;
+const CALIB_VOICED_FAIL_FRACTION: f32 = CALIB.voiced_fail_fraction;
 /// Voiced fraction above which a *stable* pitch is a real periodic
 /// interferer worth fingerprinting (mains hum, fan blade-pass).
-const CALIB_INTERFERER_MIN_FRACTION: f32 = 0.15;
+const CALIB_INTERFERER_MIN_FRACTION: f32 = CALIB.interferer_min_fraction;
 /// Relative f0 standard deviation separating machine hum (very stable)
 /// from anything vocal (wanders far more, even when trying not to).
-const CALIB_STABLE_REL_STD: f32 = 0.02;
+const CALIB_STABLE_REL_STD: f32 = CALIB.stable_rel_std;
 
 /// A stationary periodic interferer fingerprinted during calibration: the
 /// pitch YIN keeps finding in the "silent" room, and how loud it is.
@@ -1169,12 +1229,12 @@ impl RoomCalibrator {
     /// Finalizes the pass. Stable periodicity becomes a fingerprinted
     /// interferer; unstable periodicity fails the pass as a voice.
     pub fn finish(&self) -> Result<RoomCalibration, CalibrationFailure> {
-        if self.frames < CALIB_FRAMES / 2 || self.rms.is_empty() {
+        if self.frames < CALIB_FRAMES / CALIB.too_short_divisor || self.rms.is_empty() {
             return Err(CalibrationFailure::TooShort);
         }
         let mut sorted = self.rms.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let ambient_rms = sorted[sorted.len() / 2];
+        let ambient_rms = sorted[sorted.len() / TWO_USIZE];
 
         let voiced_frac = self.voiced_f0.len() as f32 / self.frames as f32;
         let interferer = if self.voiced_f0.is_empty() {
@@ -1188,7 +1248,7 @@ impl RoomCalibrator {
                 .map(|f| (f - mean) * (f - mean))
                 .sum::<f32>()
                 / n;
-            let rel_std = var.sqrt() / mean.max(1.0);
+            let rel_std = var.sqrt() / mean.max(CALIB.rel_std_min_mean_hz);
             if rel_std < CALIB_STABLE_REL_STD {
                 // Machine-stable pitch: a fingerprintable hum, if present
                 // often enough to matter.
@@ -1222,8 +1282,8 @@ pub fn interferer_match(f0_hz: f32, frame_rms: f32, interferer: &Interferer) -> 
     if !pitch_close {
         return false;
     }
-    let margin = 10f32.powf(INTERFERER_LEVEL_MARGIN_DB / 20.0);
-    frame_rms <= interferer.rms.max(1e-7) * margin
+    let margin = DB_LOG_BASE.powf(INTERFERER_LEVEL_MARGIN_DB / DB_PER_DECADE_AMPLITUDE);
+    frame_rms <= interferer.rms.max(CALIB.interferer_min_rms) * margin
 }
 
 /// RMS of one analysis frame.
@@ -1242,14 +1302,14 @@ pub fn frame_rms(samples: &[f32]) -> f32 {
 /// variability equals that of the nearest harmonic *regardless of the true
 /// F1* — the estimate re-encodes f0, and averaging over a capture does not
 /// remove the bias ("even a thousand tokens were not sufficient").
-pub const FORMANT_F0_IDENTITY_MAX_HZ: f32 = 200.0;
+pub const FORMANT_F0_IDENTITY_MAX_HZ: f32 = FORMANT.identity_f0_max_hz;
 
 /// Above this f0, formant estimates are not stored or displayed at all.
 /// Monsen & Engebretson (1983, JSHR 26:89): "the accuracy of both methods
 /// decreases greatly when fundamental frequency is 350 Hz or greater" — the
 /// threshold the singing-voice literature (Joliveau, Smith & Wolfe 2004,
 /// JASA 116:2434) adopts, en route to "essentially impossible" above 500 Hz.
-pub const FORMANT_F0_DISPLAY_MAX_HZ: f32 = 350.0;
+pub const FORMANT_F0_DISPLAY_MAX_HZ: f32 = FORMANT.display_f0_max_hz;
 
 /// Half-width of the harmonic-proximity suspect band, as a fraction of the
 /// harmonic's frequency. Boë, Sawallis, Badin & Schwartz (2023, Int. J.
@@ -1257,7 +1317,7 @@ pub const FORMANT_F0_DISPLAY_MAX_HZ: f32 = 350.0;
 /// 2·f0) as likely harmonic/formant confusions; Grawunder et al. (2023,
 /// Phil. Trans. R. Soc. B 378:20230319) adopted the same exclusion in a
 /// formal correction.
-pub const FORMANT_HARMONIC_SUSPECT_FRAC: f32 = 0.15;
+pub const FORMANT_HARMONIC_SUSPECT_FRAC: f32 = FORMANT.harmonic_suspect_frac;
 
 /// How far a frame's formant estimates can be trusted, judged from the f0 at
 /// which they were measured. LPC fits an envelope to a line spectrum: as f0
@@ -1283,7 +1343,7 @@ pub enum FormantGrade {
 ///
 /// `measured_f0` must be the f0 of the frame the LPC ran on — not the current
 /// frame's f0, which may differ when formants are held across unvoiced gaps.
-pub fn formant_grade(formants: &[Formant; 3], measured_f0: f32) -> FormantGrade {
+pub fn formant_grade(formants: &[Formant; N_FORMANTS], measured_f0: f32) -> FormantGrade {
     if !(measured_f0.is_finite() && measured_f0 > 0.0) {
         return FormantGrade::Reject;
     }
@@ -1295,7 +1355,12 @@ pub fn formant_grade(formants: &[Formant; 3], measured_f0: f32) -> FormantGrade 
     let near = |f: f32, harmonic: f32| -> bool {
         f > 0.0 && (f - harmonic).abs() <= FORMANT_HARMONIC_SUSPECT_FRAC * harmonic
     };
-    if near(formants[0].frequency, measured_f0) || near(formants[1].frequency, 2.0 * measured_f0) {
+    if near(formants[0].frequency, measured_f0)
+        || near(
+            formants[1].frequency,
+            FORMANT.f2_suspect_harmonic * measured_f0,
+        )
+    {
         return FormantGrade::Reject;
     }
     if measured_f0 <= FORMANT_F0_IDENTITY_MAX_HZ {
@@ -1323,8 +1388,9 @@ pub fn formant_grade(formants: &[Formant; 3], measured_f0: f32) -> FormantGrade 
 pub fn a2_a1_db(amps: &[f32]) -> Option<f32> {
     let (a1, a2) = (*amps.first()?, *amps.get(1)?);
     let max = amps.iter().cloned().fold(0.0f32, f32::max);
-    let floor = max * 10f32.powf(-48.0 / 20.0);
-    (max > 1e-6 && a1 > floor).then(|| 20.0 * (a2.max(floor) / a1).log10())
+    let floor = max * DB_LOG_BASE.powf(TIMBRE.relative_floor_db / DB_PER_DECADE_AMPLITUDE);
+    (max > TIMBRE.amp_eps && a1 > floor)
+        .then(|| DB_PER_DECADE_AMPLITUDE * (a2.max(floor) / a1).log10())
 }
 
 // ── Classical voiceprint & similarity ────────────────────────────────────────
@@ -1333,17 +1399,20 @@ pub fn a2_a1_db(amps: &[f32]) -> Option<f32> {
 /// feature, used to z-score before comparison so heterogeneous units (Hz vs
 /// dB/oct) contribute on a common scale. Approximate — good enough to weight
 /// the features sensibly, not a calibrated model.
-const VP_STATS: [(f32, f32); 6] = [
-    (500.0, 150.0),  // F1
-    (1500.0, 350.0), // F2
-    (2600.0, 400.0), // F3
-    (1800.0, 700.0), // centroid
-    (-9.0, 4.0),     // tilt dB/oct
-    // VTL, cm. Population stats from Story et al. 2018's adult cohort:
-    // male mean 17.6 (sd 0.89), female 15.6 (sd 1.14) — pooled across the
-    // sexes the spread is dominated by the between-sex gap, hence ~1.4.
-    (16.6, 1.4), // vocal tract length
-];
+///
+/// Order: F1, F2, F3, centroid, tilt dB/oct, VTL cm. The VTL population stats
+/// come from Story et al. 2018's adult cohort: male mean 17.6 (sd 0.89),
+/// female 15.6 (sd 1.14) — pooled across the sexes the spread is dominated by
+/// the between-sex gap, hence ~1.4. Values live in `VoiceprintConfig`.
+const VP_STATS: [(f32, f32); N_SCALAR_FEATURES] = {
+    let mut out = [(0.0f32, 0.0f32); N_SCALAR_FEATURES];
+    let mut i = 0;
+    while i < N_SCALAR_FEATURES {
+        out[i] = (VOICEPRINT.scalar_means[i], VOICEPRINT.scalar_stds[i]);
+        i += 1;
+    }
+    out
+};
 
 /// Build a pitch-invariant voiceprint from a capture's averaged features.
 /// `formants` are F1/F2/F3 (Hz), `profile` the mean relative harmonic
@@ -1354,12 +1423,12 @@ const VP_STATS: [(f32, f32); 6] = [
 /// "unmeasured" encodings — never substituted with plausible-looking values —
 /// and `voiceprint_similarity` skips them rather than scoring them.
 pub fn build_voiceprint(
-    formants: Option<[Formant; 3]>,
+    formants: Option<[Formant; N_FORMANTS]>,
     profile: &[f32],
     centroid_hz: Option<f32>,
     vtl_cm: Option<f32>,
 ) -> Voiceprint {
-    let mut p = [0.0f32; 16];
+    let mut p = [0.0f32; VOICEPRINT_PROFILE_LEN];
     for (slot, &v) in p.iter_mut().zip(profile) {
         *slot = v;
     }
@@ -1367,10 +1436,10 @@ pub fn build_voiceprint(
         [Formant {
             frequency: 0.0,
             bandwidth: 0.0,
-        }; 3],
+        }; N_FORMANTS],
     );
     Voiceprint {
-        formants: [f[0].frequency, f[1].frequency, f[2].frequency],
+        formants: f.map(|formant| formant.frequency),
         centroid_hz: centroid_hz.unwrap_or(0.0),
         tilt_db_oct: spectral_tilt_db_per_octave(&p),
         profile: p,
@@ -1401,18 +1470,20 @@ pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
     fn hz(v: f32) -> Option<f32> {
         (v.is_finite() && v > 0.0).then_some(v)
     }
+    let [a_f1, a_f2, a_f3] = a.formants;
+    let [b_f1, b_f2, b_f3] = b.formants;
     let a_scalars = [
-        hz(a.formants[0]),
-        hz(a.formants[1]),
-        hz(a.formants[2]),
+        hz(a_f1),
+        hz(a_f2),
+        hz(a_f3),
         hz(a.centroid_hz),
         a.tilt_db_oct.filter(|t| t.is_finite()),
         hz(a.vtl_cm),
     ];
     let b_scalars = [
-        hz(b.formants[0]),
-        hz(b.formants[1]),
-        hz(b.formants[2]),
+        hz(b_f1),
+        hz(b_f2),
+        hz(b_f3),
         hz(b.centroid_hz),
         b.tilt_db_oct.filter(|t| t.is_finite()),
         hz(b.vtl_cm),
@@ -1432,7 +1503,7 @@ pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
     }
     let scalar_sim = (compared > 0).then(|| {
         let rms_z = (sumsq / compared as f32).sqrt();
-        (-0.5 * rms_z * rms_z).exp()
+        (-HALF * rms_z * rms_z).exp()
     });
 
     // Timbre part: cosine of the (non-negative) harmonic profiles; degenerate
@@ -1441,21 +1512,23 @@ pub fn voiceprint_similarity(a: &Voiceprint, b: &Voiceprint) -> Option<f32> {
     let na: f32 = a.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.profile.iter().map(|x| x * x).sum::<f32>().sqrt();
     let timbre_sim =
-        (na > 1e-9 && nb > 1e-9 && dot.is_finite()).then(|| (dot / (na * nb)).clamp(0.0, 1.0));
+        (na > VOICEPRINT.profile_norm_eps && nb > VOICEPRINT.profile_norm_eps && dot.is_finite())
+            .then(|| (dot / (na * nb)).clamp(0.0, 1.0));
 
     // Weighted blend of whichever parts exist (0.6/0.4 when both do).
     let sim = match (scalar_sim, timbre_sim) {
-        (Some(s), Some(t)) => 0.6 * s + 0.4 * t,
+        (Some(s), Some(t)) => VOICEPRINT.scalar_weight * s + VOICEPRINT.timbre_weight * t,
         (Some(s), None) => s,
         (None, Some(t)) => t,
         (None, None) => return None,
     };
-    Some((sim * 100.0).clamp(0.0, 100.0))
+    Some((sim * PERCENT).clamp(0.0, PERCENT))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     fn sine(freq: f32, sample_rate: f32, n: usize) -> Vec<f32> {
         (0..n)

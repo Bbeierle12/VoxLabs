@@ -5,19 +5,24 @@
 //! AUDIO time regardless of thread scheduling. Nyquist ~10 Hz comfortably
 //! covers the 3–9 Hz vibrato band; faster tremor is out of scope.
 
+use crate::config::VibratoConfig;
+use crate::config::consts::{CENTS_PER_OCTAVE, HALF, HANN_A0, TWO};
 use crate::types::Vibrato;
 use std::f32::consts::TAU;
 
+/// Stage configuration (see `config::VibratoConfig` and `pipeline.toml`).
+const VIB: VibratoConfig = VibratoConfig::DEFAULT;
+
 /// Vibrato search band (Hz), sweep step, and reporting gates.
-const VIB_MIN_HZ: f32 = 3.0;
-const VIB_MAX_HZ: f32 = 9.0;
-const VIB_STEP_HZ: f32 = 0.25;
+const VIB_MIN_HZ: f32 = VIB.rate_min_hz;
+const VIB_MAX_HZ: f32 = VIB.rate_max_hz;
+const VIB_STEP_HZ: f32 = VIB.rate_step_hz;
 /// Rates this close to the band edges are likelier drift/noise than vibrato.
-const VIB_EDGE_HZ: f32 = 0.25;
+const VIB_EDGE_HZ: f32 = VIB.edge_margin_hz;
 /// Minimum fraction of contour variance the fitted sinusoid must explain.
-const VIB_MIN_EXPLAINED: f32 = 0.4;
+const VIB_MIN_EXPLAINED: f32 = VIB.min_explained;
 /// Minimum extent (± cents) worth calling vibrato rather than pitch jitter.
-const VIB_MIN_EXTENT: f32 = 8.0;
+const VIB_MIN_EXTENT: f32 = VIB.min_extent_cents;
 
 /// Rolling window of recent voiced f0 estimates (~2 s), with vibrato and
 /// steadiness estimation. Owned by the analysis loop; one `push` per frame.
@@ -38,11 +43,11 @@ impl F0Contour {
     pub fn new(contour_hz: f32) -> Self {
         Self {
             buf: Vec::new(),
-            cap: ((contour_hz * 2.0).round() as usize).max(8),
-            min_len: ((contour_hz).round() as usize).max(8),
+            cap: ((contour_hz * VIB.window_secs).round() as usize).max(VIB.min_buffer_samples),
+            min_len: ((contour_hz * VIB.min_secs).round() as usize).max(VIB.min_buffer_samples),
             contour_hz,
             unvoiced_run: 0,
-            max_gap: ((contour_hz * 0.25).round() as usize).max(1),
+            max_gap: ((contour_hz * VIB.max_gap_secs).round() as usize).max(1),
         }
     }
 
@@ -74,12 +79,12 @@ impl F0Contour {
         let cents: Vec<f32> = self
             .buf
             .iter()
-            .map(|f| 1200.0 * (f.ln() - mean_log) / std::f32::consts::LN_2)
+            .map(|f| CENTS_PER_OCTAVE * (f.ln() - mean_log) / std::f32::consts::LN_2)
             .collect();
         let d = detrend(&cents);
 
         let var = d.iter().map(|x| x * x).sum::<f32>() / n as f32;
-        if var < 1e-4 {
+        if var < VIB.flat_variance {
             // Dead-flat sustain: no vibrato, essentially perfect steadiness.
             return (None, Some(var.sqrt()));
         }
@@ -113,7 +118,7 @@ impl F0Contour {
 /// Least-squares removal of mean + linear trend.
 fn detrend(x: &[f32]) -> Vec<f32> {
     let n = x.len() as f32;
-    let mx = (n - 1.0) / 2.0;
+    let mx = (n - 1.0) / TWO;
     let my = x.iter().sum::<f32>() / n;
     let (mut num, mut den) = (0.0f32, 0.0f32);
     for (i, &y) in x.iter().enumerate() {
@@ -121,7 +126,11 @@ fn detrend(x: &[f32]) -> Vec<f32> {
         num += dx * (y - my);
         den += dx * dx;
     }
-    let slope = if den > 1e-9 { num / den } else { 0.0 };
+    let slope = if den > VIB.detrend_eps {
+        num / den
+    } else {
+        0.0
+    };
     x.iter()
         .enumerate()
         .map(|(i, &y)| y - (my + slope * (i as f32 - mx)))
@@ -134,12 +143,12 @@ fn dominant_rate(d: &[f32], fs: f32) -> f32 {
     let n = d.len();
     let m = (n - 1) as f32;
     let win: Vec<f32> = (0..n)
-        .map(|i| 0.5 - 0.5 * (TAU * i as f32 / m).cos())
+        .map(|i| HANN_A0 - HANN_A0 * (TAU * i as f32 / m).cos())
         .collect();
 
     let mut mags: Vec<(f32, f32)> = Vec::new();
     let mut f = VIB_MIN_HZ;
-    while f <= VIB_MAX_HZ + 1e-6 {
+    while f <= VIB_MAX_HZ + VIB.sweep_end_eps {
         let (mut re, mut im) = (0.0f32, 0.0f32);
         for (i, &x) in d.iter().enumerate() {
             let th = TAU * f * i as f32 / fs;
@@ -165,9 +174,9 @@ fn dominant_rate(d: &[f32], fs: f32) -> f32 {
     // Parabolic refinement between bins where neighbors exist.
     if best > 0 && best + 1 < mags.len() {
         let (y0, y1, y2) = (mags[best - 1].1, mags[best].1, mags[best + 1].1);
-        let denom = y0 - 2.0 * y1 + y2;
-        if denom.abs() > 1e-12 {
-            let delta = ((y0 - y2) / (2.0 * denom)).clamp(-0.5, 0.5);
+        let denom = y0 - TWO * y1 + y2;
+        if denom.abs() > VIB.parabolic_flat_eps {
+            let delta = ((y0 - y2) / (TWO * denom)).clamp(-HALF, HALF);
             return mags[best].0 + delta * VIB_STEP_HZ;
         }
     }
@@ -190,7 +199,7 @@ fn sinusoid_fit(d: &[f32], f_norm: f32) -> (f32, Vec<f32>) {
         ss += x * s;
     }
     let det = scc * sss - scs * scs;
-    if det.abs() < 1e-9 {
+    if det.abs() < VIB.fit_det_eps {
         return (0.0, d.to_vec());
     }
     let a = (sc * sss - ss * scs) / det;

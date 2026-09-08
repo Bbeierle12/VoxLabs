@@ -37,6 +37,8 @@ pub mod audio_file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capture_log;
 mod concurrency;
+// Stage configuration: every tunable number, mirrored in pipeline.toml.
+pub mod config;
 // In-app file import: a file through the capture pipeline. Cross-target
 // (inert on web).
 mod import;

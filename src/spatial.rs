@@ -46,54 +46,65 @@
 //!     test showed reverberation alone can trip it.
 //!   * Calibrations are per-session and die the moment the phone moves.
 
+use crate::config::SpatialConfig;
+use crate::config::consts::{
+    DB_PER_DECADE_POWER, EIGEN2_DISCRIMINANT_FACTOR, HALF_F64, HANN_A0, TWO_USIZE,
+};
 use rustfft::num_complex::Complex;
+use std::f32::consts::TAU;
 use std::sync::Mutex;
+
+/// Stage configuration (see `config::SpatialConfig` and `pipeline.toml`).
+const SPATIAL: SpatialConfig = SpatialConfig::DEFAULT;
+
+/// Microphone channels in the pair (`[L, R]`).
+pub const CHANNELS: usize = SPATIAL.channels;
 
 /// STFT frame length (samples). 2048 @ 48 kHz ≈ 43 ms — matches the analysis
 /// engine's frame scale; 23.4 Hz bins.
-pub const FFT_N: usize = 2048;
+pub const FFT_N: usize = SPATIAL.fft_n;
 /// STFT hop (samples). 50% overlap.
-pub const HOP: usize = 1024;
+pub const HOP: usize = SPATIAL.hop;
 /// Usable (non-quiet) frames a calibration accumulates (512 hops ≈ 11 s).
-pub const CALIB_FRAMES: usize = 512;
+pub const CALIB_FRAMES: usize = SPATIAL.calib_frames;
 /// Band used for calibration and scoring. Below ~200 Hz the phone's port
 /// roll-off and processed capture make the path unreliable; above ~8 kHz
 /// TV content is sparse (codec ceiling) and bins go uncalibrated anyway.
-pub const BAND_LO_HZ: f32 = 200.0;
-pub const BAND_HI_HZ: f32 = 8000.0;
+pub const BAND_LO_HZ: f32 = SPATIAL.band_lo_hz;
+pub const BAND_HI_HZ: f32 = SPATIAL.band_hi_hz;
 /// Frame RMS (dBFS, both channels) below which no score is computed —
 /// scoring silence would manufacture a number from noise.
-pub const QUIET_DBFS: f32 = -65.0;
+pub const QUIET_DBFS: f32 = SPATIAL.quiet_dbfs;
 /// EMA coefficient for displayed scores (per scored frame, ~21 ms).
-pub const SCORE_EMA_ALPHA: f32 = 0.1;
+pub const SCORE_EMA_ALPHA: f32 = SPATIAL.score_ema_alpha;
 /// A bin's calibration weight is its coherence γ²; below this it counts as
 /// uncovered for the band-coverage statistic.
-pub const COVERED_COHERENCE: f32 = 0.5;
+pub const COVERED_COHERENCE: f32 = SPATIAL.covered_coherence;
 /// Energy-weighted mean λ2/λ1 above which the calibration warns that more
 /// than one source — or heavy diffuse reverberation — was audible while it
 /// learned. Calibrated against the unit tests' geometry: a clean single
 /// path measures ≈ 0.01, two equal-power sources ≈ 0.26; the first field
 /// test measured 0.22 in a live room. The raw ratio is always displayed so
 /// a borderline pass is visible rather than silently blessed.
-pub const RANK_WARN: f32 = 0.2;
+pub const RANK_WARN: f32 = SPATIAL.rank_warn;
 /// During calibration, quiet frames don't count; if fewer than
 /// [`CALIB_FRAMES`] usable frames arrive in this many wall frames, the
 /// calibration fails loudly instead of finishing on junk.
-pub const CALIB_MAX_WALL_FACTOR: usize = 3;
+pub const CALIB_MAX_WALL_FACTOR: usize = SPATIAL.calib_max_wall_factor;
 /// Single-path display thresholds — visible in copy, not hidden.
-pub const SCORE_TV: f32 = 0.85;
-pub const SCORE_NOT_TV: f32 = 0.40;
+pub const SCORE_TV: f32 = SPATIAL.score_tv;
+pub const SCORE_NOT_TV: f32 = SPATIAL.score_not_tv;
 /// Single-path band coverage under which the score is labeled weak
 /// evidence (the first field test: coverage 1% still scored 0.91).
-pub const SINGLE_WEAK_COVERAGE: f32 = 0.10;
+pub const SINGLE_WEAK_COVERAGE: f32 = SPATIAL.single_weak_coverage;
 /// A bin separates the two paths when 1 − |ĥ_Tᴴĥ_U|² reaches this.
-pub const SEP_MIN: f32 = 0.2;
+pub const SEP_MIN: f32 = SPATIAL.sep_min;
 /// Fraction of band bins that must separate (with both coherences ≥
 /// [`COVERED_COHERENCE`]) before the contrast score counts as evidence.
-pub const DISC_MIN: f32 = 0.05;
+pub const DISC_MIN: f32 = SPATIAL.disc_min;
 /// Contrast display thresholds (score ∈ [−1, +1], + = TV-like).
-pub const CONTRAST_TV: f32 = 0.3;
-pub const CONTRAST_USER: f32 = -0.3;
+pub const CONTRAST_TV: f32 = SPATIAL.contrast_tv;
+pub const CONTRAST_USER: f32 = SPATIAL.contrast_user;
 
 /// Which path a calibration pass is learning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,7 +127,7 @@ pub struct PathCalibration {
     #[allow(dead_code)]
     pub bin_hi: usize,
     /// Normalized dominant eigenvector per band bin, `[L, R]` convention.
-    pub h: Vec<[Complex<f32>; 2]>,
+    pub h: Vec<[Complex<f32>; CHANNELS]>,
     /// Per-bin weight: magnitude-squared coherence γ² ∈ [0, 1].
     pub w: Vec<f32>,
     /// Fraction of band bins with γ² ≥ [`COVERED_COHERENCE`].
@@ -182,12 +193,12 @@ impl SpatialProcessor {
     pub fn new(sample_rate: f32) -> Self {
         let hz_per_bin = sample_rate / FFT_N as f32;
         let bin_lo = (BAND_LO_HZ / hz_per_bin).ceil() as usize;
-        let bin_hi = ((BAND_HI_HZ / hz_per_bin).floor() as usize).min(FFT_N / 2);
+        let bin_hi = ((BAND_HI_HZ / hz_per_bin).floor() as usize).min(FFT_N / TWO_USIZE);
         let n_bins = bin_hi - bin_lo + 1;
         let window: Vec<f32> = (0..FFT_N)
             .map(|i| {
                 let t = i as f32 / FFT_N as f32;
-                0.5 - 0.5 * (2.0 * std::f32::consts::PI * t).cos()
+                HANN_A0 - HANN_A0 * (TAU * t).cos()
             })
             .collect();
         Self {
@@ -195,8 +206,8 @@ impl SpatialProcessor {
             bin_lo,
             bin_hi,
             window,
-            acc_l: Vec::with_capacity(FFT_N * 2),
-            acc_r: Vec::with_capacity(FFT_N * 2),
+            acc_l: Vec::with_capacity(FFT_N * SPATIAL.accumulator_frames),
+            acc_r: Vec::with_capacity(FFT_N * SPATIAL.accumulator_frames),
             calibrating: None,
             calib_used: 0,
             calib_wall: 0,
@@ -284,7 +295,10 @@ impl SpatialProcessor {
             let (a, b) = (self.acc_l[i] as f64, self.acc_r[i] as f64);
             energy += a * a + b * b;
         }
-        let rms_db = 10.0 * (energy / (2 * FFT_N) as f64).max(1e-18).log10() as f32;
+        let rms_db = DB_PER_DECADE_POWER
+            * (energy / (CHANNELS * FFT_N) as f64)
+                .max(SPATIAL.energy_floor)
+                .log10() as f32;
         let quiet = rms_db < QUIET_DBFS;
 
         if let Some(target) = self.calibrating {
@@ -345,7 +359,7 @@ impl SpatialProcessor {
                 continue;
             }
             let w_t = tv.w[i] as f64;
-            if w_t > 1e-3 {
+            if w_t > SPATIAL.weight_eps {
                 let h = &tv.h[i];
                 let proj = h[0].conj() * y0 + h[1].conj() * y1;
                 let c_t = (proj.norm_sqr() as f64 / e).clamp(0.0, 1.0);
@@ -355,7 +369,7 @@ impl SpatialProcessor {
                     && !self.sep_w.is_empty()
                 {
                     let wj = self.sep_w[i] as f64;
-                    if wj > 1e-4 {
+                    if wj > SPATIAL.joint_weight_eps {
                         let hu = &u.h[i];
                         let proj_u = hu[0].conj() * y0 + hu[1].conj() * y1;
                         let c_u = (proj_u.norm_sqr() as f64 / e).clamp(0.0, 1.0);
@@ -365,7 +379,7 @@ impl SpatialProcessor {
                 }
             }
         }
-        if den <= 1e-12 {
+        if den <= SPATIAL.denominator_eps {
             return FrameOutcome::Quiet;
         }
         let single = (num / den) as f32;
@@ -375,7 +389,7 @@ impl SpatialProcessor {
         };
         self.single_ema = Some(single_ema);
 
-        let (contrast, contrast_ema) = if cden > 1e-12 {
+        let (contrast, contrast_ema) = if cden > SPATIAL.denominator_eps {
             let c = ((cnum / cden) as f32).clamp(-1.0, 1.0);
             let ema = match self.contrast_ema {
                 Some(prev) => prev + SCORE_EMA_ALPHA * (c - prev),
@@ -434,20 +448,24 @@ impl SpatialProcessor {
             let b = self.c22[i];
             let c = self.c12[i];
             let e = a + b;
-            let coh = (c.norm_sqr() / (a * b).max(1e-30)).clamp(0.0, 1.0) as f32;
-            let disc = ((a - b) * (a - b) + 4.0 * c.norm_sqr()).max(0.0).sqrt();
-            let l1 = 0.5 * (a + b + disc);
-            let l2 = (0.5 * (a + b - disc)).max(0.0);
+            let coh = (c.norm_sqr() / (a * b).max(SPATIAL.eigen_eps)).clamp(0.0, 1.0) as f32;
+            let disc = ((a - b) * (a - b) + EIGEN2_DISCRIMINANT_FACTOR * c.norm_sqr())
+                .max(0.0)
+                .sqrt();
+            let l1 = HALF_F64 * (a + b + disc);
+            let l2 = (HALF_F64 * (a + b - disc)).max(0.0);
             // Eigenvector of [[a, c], [c*, b]] for λ1: (a−λ1)v0 + c·v1 = 0
             // → v = [c, λ1−a]; degenerate c ≈ 0 falls back to an axis.
-            let v = if c.norm_sqr() > 1e-30 {
+            let v = if c.norm_sqr() > SPATIAL.eigen_eps {
                 [c, Complex::new(l1 - a, 0.0)]
             } else if a >= b {
                 [Complex::new(1.0, 0.0), Complex::new(0.0, 0.0)]
             } else {
                 [Complex::new(0.0, 0.0), Complex::new(1.0, 0.0)]
             };
-            let norm = (v[0].norm_sqr() + v[1].norm_sqr()).sqrt().max(1e-30);
+            let norm = (v[0].norm_sqr() + v[1].norm_sqr())
+                .sqrt()
+                .max(SPATIAL.eigen_eps);
             h.push([
                 Complex::new((v[0].re / norm) as f32, (v[0].im / norm) as f32),
                 Complex::new((v[1].re / norm) as f32, (v[1].im / norm) as f32),
@@ -458,7 +476,7 @@ impl SpatialProcessor {
             }
             e_sum += e;
             q_sum += e * coh as f64;
-            r_sum += e * if l1 > 1e-30 { l2 / l1 } else { 0.0 };
+            r_sum += e * if l1 > SPATIAL.eigen_eps { l2 / l1 } else { 0.0 };
         }
         let quality = if e_sum > 0.0 {
             (q_sum / e_sum) as f32
@@ -520,7 +538,7 @@ impl SpatialProcessor {
         }
         self.sep_w = sep_w;
         self.disc_coverage = Some(disc as f32 / n_bins as f32);
-        self.mean_sep = Some(if sep_den > 1e-12 {
+        self.mean_sep = Some(if sep_den > SPATIAL.denominator_eps {
             (sep_sum / sep_den) as f32
         } else {
             0.0

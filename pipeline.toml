@@ -1,0 +1,673 @@
+# VoxLabs pipeline configuration — Live Model mode (the only mode until
+# Phase 1 adds per-mode files). Plan v3 §4: const defaults in code plus this
+# one file; no env vars, no runtime override system.
+#
+# Every table below is one stage's `*Config` struct in src/config/; every key
+# is one field, and the value here MUST equal the field's `DEFAULT` in code —
+# `cargo test config::` (pipeline_toml_matches_code_defaults) fails otherwise.
+# Change a number in both places, or regenerate this file from the structs.
+#
+# Each key's comment states its purpose and valid range. Definitional
+# constants (the 2 in 2πf, the 20 in 20·log10, 12 semitones per octave) are
+# not settings and are not here; see src/config/consts.rs. Published data
+# tables (the Story 2018 tract bases) live in src/tract_data.rs.
+
+
+# StreamConfig: Frame geometry shared by `frame::FrameAnalyzer` and the desktop
+# `analysis::AnalysisEngine`.
+[stream]
+# Mono samples per analysis frame (2048 @ 48 kHz = 42.7 ms). Must hold
+# `yin.window + sample_rate / yin.f0_min_hz`. Range: power of two,
+# 1024..=8192; the GPU shaders are sized from it.
+frame_samples = 2048
+# Length of the GPU difference-function / prefix-sum buffers, in lags: a power
+# of two, ≤ frame_samples − yin.window, ≥ sample_rate / yin.f0_min_hz.
+# `yin_scan.wgsl`'s SCAN_LEN must match. Range: exactly 1024 unless the
+# shaders change.
+gpu_diff_len = 1024
+# Workgroup size of the GPU difference pass (`yin_diff.wgsl`). Range: exactly
+# 64 unless the shader changes.
+gpu_diff_workgroup = 64
+
+# YinConfig: YIN fundamental-frequency estimator (de Cheveigné & Kawahara 2002),
+# shared by the CPU reference path and the desktop GPU path.
+[yin]
+# Analysis window length in samples: the number of samples compared per lag in
+# the difference function. The analysis frame must be at least this plus the
+# maximum search lag. Range: 256..=frame/2; the GPU shader sizes its buffers
+# from this, so change both.
+window = 1024
+# Lowest fundamental searched, Hz. Sets the maximum lag (`sample_rate /
+# f0_min_hz`). Range: 20.0..=200.0.
+f0_min_hz = 50.0
+# Highest fundamental searched, Hz. Sets the minimum lag. Range:
+# f0_min_hz..=sample_rate/4.
+f0_max_hz = 1000.0
+# Absolute threshold on the cumulative-mean-normalized difference: the first
+# dip below it is the period. Range: 0.05..=0.3 (the paper's 0.1; higher
+# accepts weaker periodicity).
+threshold = 0.12
+# Smallest maximum lag worth searching, in samples; below it the frame is "too
+# short to analyze". Range: 2..=8.
+min_max_lag = 3
+# Smallest minimum lag, in samples (f0 cannot exceed sample_rate/2). Range:
+# exactly 2 unless the search bounds change.
+min_tau = 2
+# Smallest usable window, in samples. Range: 2..=16.
+min_window = 2
+# `|s0 − 2·s1 + s2|` below this is a flat neighbourhood and the parabolic lag
+# refinement is skipped. Range: 1e-9..=1e-3.
+parabolic_flat_eps = 1e-6
+
+# VoicingConfig: Voicing decision on top of YIN: confidence and range gates,
+# then the SNR and calibrated-hum gates.
+[voicing]
+# YIN confidence (`1 − d'(τ)`) a frame must exceed to be voiced. Range:
+# 0.2..=0.8.
+min_confidence = 0.4
+# Lowest f0 accepted as voice, Hz. Range: yin.f0_min_hz..=100.0.
+f0_min_hz = 50.0
+# Highest f0 accepted as voice, Hz. Range: 500.0..=yin.f0_max_hz.
+f0_max_hz = 1000.0
+# Minimum frame-over-floor SNR (dB) for a YIN-voiced frame to count as voice
+# at all; below it the frame is demoted to unvoiced. Engineering floor. Range:
+# 6.0..=25.0.
+voiced_min_snr_db = 15.0
+# Minimum SNR (dB) for a frame to contribute identity data (voiceprint
+# formants, VTL): the ASHA measurement-grade floor (Patel et al. 2018). Range:
+# 20.0..=40.0.
+identity_min_snr_db = 30.0
+
+# NoiseFloorConfig: Ambient-noise floor tracker (`math::NoiseFloor`): learns the
+# room from frames the pitch detector calls unvoiced.
+[noise_floor]
+# Ring capacity in unvoiced frames (~6 s at ~21.5 frames/s). Range: 32..=1024;
+# must be ≥ ring_min.
+ring_len = 128
+# Unvoiced frames observed before the floor is trusted (~1.5 s). Until then no
+# SNR is reported and nothing is gated. Range: 8..=ring_len.
+ring_min = 32
+# Percentile of the ring taken as the floor — low, so breaths and consonants
+# do not drag it toward the voice. Range: 0.02..=0.5.
+floor_percentile = 0.10
+# Smallest floor used in the SNR division (linear RMS), so digital silence
+# yields a large finite SNR, not infinity. Range: 1e-9..=1e-5.
+floor_min_rms = 1e-7
+
+# RoomCalibrationConfig: One room-calibration pass (`math::RoomCalibrator`) and
+# the calibrated-interferer gate.
+[room_calibration]
+# Frames in one pass (~4.6 s at ~21.5 frames/s): long enough for a stable
+# level and hum-pitch estimate. Range: 40..=400.
+frames = 100
+# A pass with fewer than `frames / too_short_divisor` frames is rejected as
+# too short. Range: 1..=4.
+too_short_divisor = 2
+# Fractional f0 tolerance for matching a live detection against the calibrated
+# interferer (±4 % ≈ two thirds of a semitone). Range: 0.01..=0.1.
+interferer_f0_tol = 0.04
+# A frame louder than the calibrated interferer by this many dB is the singer,
+# even at the hum's pitch. Range: 3.0..=20.0.
+interferer_level_margin_db = 10.0
+# Smallest interferer level used in the match (linear RMS). Range:
+# 1e-9..=1e-5.
+interferer_min_rms = 1e-7
+# Voiced fraction of the window above which an *unstable* pitch means someone
+# was talking — the pass fails. Range: 0.1..=0.6.
+voiced_fail_fraction = 0.3
+# Voiced fraction above which a *stable* pitch is fingerprinted as a real
+# periodic interferer. Range: 0.05..=voiced_fail_fraction.
+interferer_min_fraction = 0.15
+# Relative f0 standard deviation separating machine hum (below) from anything
+# vocal (above). Range: 0.005..=0.05.
+stable_rel_std = 0.02
+# Smallest mean f0 (Hz) used as the relative-std denominator. Range:
+# 0.1..=10.0.
+rel_std_min_mean_hz = 1.0
+
+# LpcConfig: Linear-prediction front-end: decimation to the formant band, pre-
+# emphasis, Hamming window, autocorrelation, Levinson-Durbin.
+[lpc]
+# Target sample rate after decimation, Hz; the decimation factor is
+# `round(sample_rate / this)`. ~11 kHz keeps 0–5.5 kHz, where the formants
+# are. Range: 8000.0..=16000.0.
+decimation_target_hz = 11_025.0
+# LPC order rule: `order = order_base + fs_dec / order_hz_per_pole`, clamped
+# to [order_min, order_max]. This is the base term. Range: 0..=4.
+order_base = 2
+# Hertz of decimated bandwidth per prediction pole ("2 + fs/1000"). Range:
+# 500.0..=2000.0.
+order_hz_per_pole = 1000.0
+# Lower clamp on the LPC order. Range: 4..=order_max.
+order_min = 8
+# Upper clamp on the LPC order. Range: order_min..=32.
+order_max = 20
+# Pre-emphasis coefficient `y[n] = x[n] − α·x[n−1]`, flattening the −12 dB/oct
+# glottal tilt. Range: 0.9..=0.99.
+preemphasis = 0.97
+# Anti-alias lowpass cutoff before decimation, as a fraction of the *new*
+# Nyquist (0.45 ≈ 90 % of it). Range: 0.3..=0.5.
+decimation_cutoff_of_nyquist = 0.45
+# Windowed-sinc lowpass length in taps (odd). Range: 15..=63.
+decimation_fir_taps = 31
+# A sinc argument closer to zero than this takes the limit value. Range:
+# 1e-9..=1e-3.
+sinc_center_eps = 1e-6
+# FIR DC gain below this is left unnormalized (degenerate cutoff). Range:
+# 1e-12..=1e-6.
+fir_gain_eps = 1e-9
+# Zero-lag autocorrelation at or below this is a silent frame and yields the
+# all-pass polynomial. Range: 1e-12..=1e-6.
+silence_energy = 1e-9
+# Levinson-Durbin stops when the prediction error falls below this (degenerate
+# frame). Range: 1e-12..=1e-6.
+levinson_error_floor = 1e-9
+
+# FormantConfig: Formant extraction from the LPC polynomial's roots, plus the
+# reliability grades applied to the result.
+[formants]
+# Aberth root-finder iteration cap. Range: 20..=200.
+aberth_max_iterations = 50
+# Aberth convergence tolerance. Range: 1e-12..=1e-6.
+aberth_epsilon = 1e-9
+# Lowest pole frequency accepted as a formant, Hz. Range: 50.0..=150.0.
+band_lo_hz = 90.0
+# Highest pole frequency accepted as a formant, Hz; the spectrogram view's
+# ceiling matches it. Range: 3500.0..=decimated Nyquist.
+band_hi_hz = 5000.0
+# Poles wider than this (Hz) are not formants. Range: 200.0..=1000.0.
+max_bandwidth_hz = 500.0
+# Fewest polynomial coefficients that can hold a complex pole pair. Range:
+# exactly 3.
+min_coefficients = 3
+# Spectral envelope held before the first voiced frame and through unvoiced
+# gaps — frequencies, Hz (F1, F2, F3). Range: rising, inside [band_lo_hz,
+# band_hi_hz].
+default_frequencies_hz = [500.0, 1500.0, 2500.0]
+# Bandwidths, Hz, of the held default envelope. Range: 40.0..=300.0.
+default_bandwidths_hz = [80.0, 120.0, 160.0]
+# Above this measured f0, formants are excluded from identity features (Chen,
+# Whalen & Shadle 2019). Range: 150.0..=250.0.
+identity_f0_max_hz = 200.0
+# Above this measured f0, formants are neither stored nor shown (Monsen &
+# Engebretson 1983). Range: identity_f0_max_hz..=500.0.
+display_f0_max_hz = 350.0
+# Half-width of the harmonic-proximity suspect band as a fraction of the
+# harmonic (Boë et al. 2023: ±15 %). Range: 0.05..=0.25.
+harmonic_suspect_frac = 0.15
+# F2 is checked against this multiple of f0 (the second harmonic). Range:
+# exactly 2.
+f2_suspect_harmonic = 2.0
+
+# HarmonicsConfig: Harmonic amplitudes at k·f0 by Hann-windowed Goertzel
+# evaluation.
+[harmonics]
+# Frames shorter than this (samples) return all-zero amplitudes. Range:
+# 16..=256.
+min_frame_samples = 32
+
+# HnrConfig: Harmonics-to-noise ratio (Boersma/Praat style autocorrelation).
+[hnr]
+# Frames shorter than this (samples) are not measured. Range: 32..=512.
+min_frame_samples = 64
+# Pitch period in samples must be at least this (else no lag neighbourhood
+# exists). Range: exactly 2.
+min_period_samples = 2
+# The period plus this margin must fit in the frame, so the parabolic
+# neighbours `lag ± 1` are in bounds. Range: exactly 2.
+period_margin_samples = 2
+# Zero-lag autocorrelation at or below this is silence. Range: 1e-15..=1e-9.
+energy_eps = 1e-12
+# `|y0 − 2·y1 + y2|` below this skips the parabolic peak refinement. Range:
+# 1e-15..=1e-9.
+parabolic_flat_eps = 1e-12
+# Normalized correlation is clamped to ±this before the log mapping so `r / (1
+# − r)` stays finite. Range: 0.99..=0.999999.
+r_clamp = 0.9999
+# Output is clamped to ±this many dB; a non-positive correlation reports the
+# negative limit. Range: 20.0..=60.0.
+db_limit = 40.0
+
+# PerturbationConfig: Jitter and shimmer from peak-picked cycle marks.
+[perturbation]
+# Frames shorter than this (samples) are not measured. Range: 32..=512.
+min_frame_samples = 64
+# Periods shorter than this (samples) are too short to mark. Range:
+# 4.0..=16.0.
+min_period_samples = 8.0
+# The first mark is the strongest sample within this many periods from the
+# frame start. Range: 1.0..=2.0.
+first_search_periods = 1.5
+# Each next mark is sought from this fraction of a period after the previous
+# one (−30 %). Range: 0.5..=0.9.
+search_window_lo = 0.7
+# …to this fraction (+30 %); intervals outside the window reject the frame.
+# Range: 1.1..=1.5.
+search_window_hi = 1.3
+# Fewest marks (cycles) for a measurement. Range: 3..=10.
+min_cycles = 5
+# Jitter above this percentage means the marks are not tracking real glottal
+# cycles (severe pathology is ~2–3 %). Range: 2.0..=10.0.
+max_jitter_pct = 5.0
+# A mark whose height is at or below this is unusable for shimmer. Range:
+# 1e-9..=1e-3.
+amp_eps = 1e-6
+# `|y0 − 2·y1 + y2|` below this skips sub-sample refinement of a mark. Range:
+# 1e-15..=1e-9.
+parabolic_flat_eps = 1e-12
+
+# CppConfig: Cepstral peak prominence (Hillenbrand-style).
+[cpp]
+# Frames shorter than this (samples) are not measured. Range: 128..=1024.
+min_frame_samples = 256
+# Frame energy (sum of squares) below this is silence. Range: 1e-12..=1e-6.
+silence_energy = 1e-9
+# Added to power before `log10` so silent bins stay finite (dB floor of −120).
+# Range: 1e-15..=1e-9.
+log_floor = 1e-12
+# Low edge of the voice-pitch quefrency band, Hz (long quefrency). Range:
+# 40.0..=100.0.
+f0_band_lo_hz = 60.0
+# High edge of the quefrency band, Hz (short quefrency). Range: 300.0..=800.0.
+f0_band_hi_hz = 500.0
+# The band must span at least this many quefrency bins. Range: 2..=16.
+min_band_bins = 4
+# Regression denominator below this is degenerate. Range: 1e-12..=1e-6.
+regression_eps = 1e-9
+
+# CentroidConfig: Spectral centroid ("brightness") over the full spectrum.
+[centroid]
+# Frames shorter than this (samples) are not measured. Range: 128..=1024.
+min_frame_samples = 256
+# Frame energy (sum of squares) below this is silence. Range: 1e-12..=1e-6.
+silence_energy = 1e-9
+# Low edge of the analysed band, Hz. Range: 20.0..=200.0.
+band_lo_hz = 80.0
+# High edge of the analysed band, Hz (capped at Nyquist). The brightness
+# thresholds were tuned against this band. Range: 4000.0..=16000.0.
+band_hi_hz = 8000.0
+# Total magnitude below this yields no centroid. Range: 1e-12..=1e-6.
+magnitude_eps = 1e-9
+
+# TimbreConfig: Harmonic-shape measures: H1–H2, A2/A1, tilt, even/odd balance,
+# singer's-formant share, and the plain-language timbre label.
+[timbre]
+# Partials more than this many dB below the strongest are numerical noise and
+# are excluded (H1–H2 refuses; tilt drops them; A2/A1 floors A2 here). Range:
+# -80.0..=-30.0.
+relative_floor_db = -48.0
+# Strongest partial at or below this (linear) is silence. Range: 1e-9..=1e-3.
+amp_eps = 1e-6
+# Fewest partials above the floor for a tilt fit. Range: exactly 2.
+tilt_min_points = 2
+# Tilt regression denominator below this is degenerate. Range: 1e-12..=1e-6.
+tilt_regression_eps = 1e-9
+# Partials H2..=this take part in the even/odd balance. Range: 4..=32.
+even_odd_partials = 16
+# Singer's-formant band, low edge, Hz. Range: 2000.0..=3000.0.
+singers_formant_lo_hz = 2_800.0
+# Singer's-formant band, high edge, Hz. Range: 3000.0..=4000.0.
+singers_formant_hi_hz = 3_400.0
+# Total harmonic energy below this yields no singer's-formant share. Range:
+# 1e-15..=1e-9.
+energy_eps = 1e-12
+# Even/odd balance below this many dB reads "hollow". Range: -12.0..=-3.0.
+hollow_even_odd_db = -6.0
+# A partial above this fraction of the strongest counts as strong. Range:
+# 0.1..=0.5.
+strong_partial_rel_amp = 0.25
+# At least this many strong partials reads "rich". Range: 4..=10.
+rich_min_strong = 6
+# At most this many strong partials reads "pure". Range: 0..=3.
+pure_max_strong = 2
+
+# VoiceClassConfig: Coarse voice-range and brightness labels (Personal Harmonic
+# Identifier prototype thresholds).
+[voice_class]
+# Mean f0 below this is "Bass", Hz. Range: 100.0..=150.0.
+bass_max_hz = 130.0
+# …below this "Baritone". Range: bass_max_hz..=200.0.
+baritone_max_hz = 175.0
+# …below this "Tenor". Range: baritone_max_hz..=250.0.
+tenor_max_hz = 220.0
+# …below this "Alto". Range: tenor_max_hz..=320.0.
+alto_max_hz = 290.0
+# …below this "Mezzo-Soprano", else "Soprano". Range: alto_max_hz..=420.0.
+mezzo_max_hz = 370.0
+# Centroid below this is "Dark", Hz. Range: 800.0..=1600.0.
+dark_max_hz = 1200.0
+# …below this "Warm". Range: dark_max_hz..=2600.0.
+warm_max_hz = 2200.0
+# …below this "Balanced". Range: warm_max_hz..=3600.0.
+balanced_max_hz = 3200.0
+# …below this "Bright", else "Brilliant". Range: balanced_max_hz..=5000.0.
+bright_max_hz = 4400.0
+
+# TuningConfig: Musical reference tuning.
+[tuning]
+# Frequency of A4, Hz — the anchor of every note name and semitone distance.
+# Range: 415.0..=466.0 (concert pitch conventions).
+a4_hz = 440.0
+
+# VoiceprintConfig: Pitch-invariant voiceprint and its similarity score.
+[voiceprint]
+# Rough adult-voice population mean of each scalar feature, in feature order
+# (Hz, Hz, Hz, Hz, dB/oct, cm). Range: physiological.
+scalar_means = [500.0, 1500.0, 2600.0, 1800.0, -9.0, 16.6]
+# Population standard deviation of each scalar feature, same order; z-scoring
+# divisor. VTL: Story 2018's adult cohort pooled across the sexes. Range: > 0.
+scalar_stds = [150.0, 350.0, 400.0, 700.0, 4.0, 1.4]
+# Weight of the scalar (resonance/brightness) part when both parts are
+# measurable. Range: 0.0..=1.0; timbre_weight = 1 − this.
+scalar_weight = 0.6
+# Weight of the timbre (harmonic-profile cosine) part. Range: 0.0..=1.0.
+timbre_weight = 0.4
+# A harmonic profile whose norm is at or below this is unmeasured. Range:
+# 1e-12..=1e-6.
+profile_norm_eps = 1e-9
+
+# VibratoConfig: Vibrato detection and sustain steadiness over the recent f0
+# contour (`metrics::F0Contour`).
+[vibrato]
+# Low edge of the vibrato rate search band, Hz. Range: 2.0..=5.0.
+rate_min_hz = 3.0
+# High edge of the search band, Hz (contour Nyquist is ~10 Hz). Range:
+# 6.0..=10.0.
+rate_max_hz = 9.0
+# DFT sweep step across the band, Hz. Range: 0.05..=0.5.
+rate_step_hz = 0.25
+# Rates within this of a band edge are drift/noise, not vibrato. Range:
+# 0.0..=1.0.
+edge_margin_hz = 0.25
+# Minimum fraction of contour variance the fitted sinusoid must explain.
+# Range: 0.2..=0.8.
+min_explained = 0.4
+# Minimum extent (± cents) to call vibrato rather than jitter. Range:
+# 3.0..=20.0.
+min_extent_cents = 8.0
+# Rolling window of voiced contour, seconds. Range: 1.0..=4.0.
+window_secs = 2.0
+# Continuous voicing required before anything is reported, seconds. Range:
+# 0.5..=window_secs.
+min_secs = 1.0
+# Unvoiced gap tolerated before the window resets, seconds. Range: 0.1..=0.5.
+max_gap_secs = 0.25
+# Floor on the window and minimum lengths, in contour samples, so a very low
+# contour rate still yields a usable buffer. Range: 4..=16.
+min_buffer_samples = 8
+# Contour variance (cents²) below this is a dead-flat sustain: no vibrato,
+# steadiness = its RMS. Range: 1e-6..=1e-2.
+flat_variance = 1e-4
+# Slack added to the band's top edge so the sweep's last step is not lost to
+# rounding. Range: 1e-9..=1e-3.
+sweep_end_eps = 1e-6
+# `|y0 − 2·y1 + y2|` below this skips parabolic rate refinement. Range:
+# 1e-15..=1e-9.
+parabolic_flat_eps = 1e-12
+# Detrend regression denominator below this is degenerate. Range:
+# 1e-12..=1e-6.
+detrend_eps = 1e-9
+# Sinusoid-fit normal-equation determinant below this is singular. Range:
+# 1e-12..=1e-6.
+fit_det_eps = 1e-9
+
+# SpectrogramConfig: Hop-based STFT feeding the scrolling waterfall
+# (`spectrogram.rs`).
+[spectrogram]
+# FFT window length, samples; matches the analysis frame so the loop can feed
+# the same slices. Range: power of two, 512..=8192.
+fft_size = 2048
+# Samples advanced between frames (512 → four frames per 2048-sample analysis
+# frame). Range: 64..=fft_size.
+hop = 512
+# Magnitude floor (dB) reported for silent / empty bins. Range:
+# -160.0..=-60.0.
+db_floor = -120.0
+# Smallest magnitude passed to `log10` (−240 dB). Range: 1e-15..=1e-9.
+magnitude_floor = 1e-12
+
+# ResampleConfig: Windowed-sinc resampler used when an imported file's rate
+# differs from the analysis rate (`audio_file::resample`).
+[resample]
+# Rates closer than this (Hz) are treated as equal: no resampling. Range:
+# 0.0..=1.0.
+same_rate_tol_hz = 0.5
+# Lowpass cutoff as a fraction of the lower of the two rates (0.45 ≈ 90 % of
+# the new Nyquist). Range: 0.3..=0.5.
+cutoff_of_rate = 0.45
+# Half-length of the sinc kernel, in input samples on each side. Range:
+# 8..=128.
+half_taps = 32
+# A sinc argument closer to zero than this takes the limit value. Range:
+# 1e-9..=1e-3.
+sinc_center_eps = 1e-6
+
+# SynthesisConfig: Additive stereo oscillator bank driven by the measured
+# profile.
+[synthesis]
+# Parameter glide time constant, ms (one-pole smoothing of f0 and formants
+# toward their targets). Range: 5.0..=200.0.
+glide_ms = 20.0
+# Initial spectral-envelope target — formant frequencies, Hz. Range: rising,
+# 200.0..=4000.0.
+default_frequencies_hz = [500.0, 1500.0, 2500.0]
+# Bandwidths, Hz, of the initial envelope. Range: 20.0..=300.0.
+default_bandwidths_hz = [50.0, 100.0, 150.0]
+# Initial f0 target, Hz. Range: 50.0..=500.0.
+default_f0_hz = 150.0
+# Harmonics rendered until the UI says otherwise. Range: 1..=MAX_PARTIALS.
+default_harmonic_count = 5
+# Right-channel detune added to every partial, Hz (binaural beat). Range:
+# 0.0..=20.0.
+default_delta_f_hz = 6.0
+# Measured f0 at or below this is refused as a target. Range: 10.0..=50.0.
+min_target_f0_hz = 20.0
+# Scales the resonance denominator in the bandpass approximation so the peak
+# gain stays bounded. Range: 1.0..=50.0.
+resonance_scale = 10.0
+# Corner of the glottal roll-off `1 / (1 + f / this)`, Hz (≈ −12 dB/oct above
+# it). Range: 50.0..=300.0.
+rolloff_corner_hz = 100.0
+# Gain floor added under the formant sum so partials between formants are not
+# silent. Range: 0.0..=0.5.
+base_gain = 0.1
+# Partials whose envelope gain is below this are skipped. Range: 1e-6..=1e-2.
+amp_cutoff = 0.0001
+# Output scale after normalization (0.5 = −6 dB headroom). Range: 0.1..=1.0.
+headroom = 0.5
+
+# FachConfig: The "Fach, Measured" quantities: FHE bands, singer's-formant
+# cluster, LTAS bands, tessitura, turnover, dominant harmonic, register events.
+[fach]
+# Singer's-formant analysis band for male voices, Hz [lo, hi] (Müller 2022).
+# Range: lo < hi within 1500.0..=5000.0.
+fhe_band_male_hz = [2000.0, 3600.0]
+# Singer's-formant analysis band for female voices, Hz [lo, hi]. Range: lo <
+# hi within 1500.0..=6000.0.
+fhe_band_female_hz = [2300.0, 4500.0]
+# Cluster search window, low edge, Hz. Range: 1800.0..=2600.0.
+cluster_lo_hz = 2200.0
+# Cluster search window, high edge, Hz. Range: cluster_lo_hz..=4000.0.
+cluster_hi_hz = 3400.0
+# The valley below the cluster is sought from here up, Hz. Range:
+# 800.0..=cluster_lo_hz.
+cluster_valley_from_hz = 1500.0
+# The −3 dB width walk stops at this frequency, Hz. Range:
+# cluster_hi_hz..=8000.0.
+cluster_width_ceil_hz = 5000.0
+# Width is measured this many dB down from the cluster peak. Range: 1.0..=6.0.
+cluster_width_db = 3.0
+# A cluster peak at or below this level (dB re linear power 1) is silence, no
+# cluster. Range: -200.0..=-100.0.
+cluster_silent_peak_db = -170.0
+# ISO third-octave band centres, Hz. Range: the standard series.
+third_octave_centers_hz = [100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0, 2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0]
+# Turnover hysteresis: A2/A1 must sit at or beyond ±this (dB) to count as
+# below/above, so a wobble around 0 dB fires once. Range: 1.0..=6.0.
+turnover_hysteresis_db = 3.0
+# Register event: minimum f0 jump between consecutive voiced frames,
+# semitones. Range: 1.0..=4.0.
+register_min_jump_st = 2.0
+# Register event: |ΔH1–H2| that counts as a source change, dB. Range:
+# 2.0..=8.0.
+register_h1h2_delta_db = 4.0
+# Register event: CPP drop that counts as a source change, dB. Range:
+# 1.0..=4.0.
+register_cpp_drop_db = 2.0
+# Register event: jitter that counts as a source change, %. Range: 0.5..=3.0.
+register_jitter_pct = 1.5
+# Frames shorter than this (samples) yield no power spectrum. Range:
+# 128..=1024.
+min_frame_samples = 256
+# Frame energy (sum of squares) below this is silence. Range: 1e-15..=1e-9.
+silence_energy = 1e-12
+# Band power (linear, f64 sum) at or below this is empty. Range:
+# 1e-24..=1e-12.
+band_energy_eps = 1e-18
+# Smallest mean power passed to `log10` in the third-octave levels (f64
+# accumulator; −180 dB). Range: 1e-24..=1e-12.
+ltas_power_floor = 1e-18
+# Smallest power passed to `log10` in the cluster statistics (f32; −180 dB).
+# Range: 1e-24..=1e-12.
+power_floor = 1e-18
+# Fewest voiced frames for a tessitura. Range: 5..=50.
+tessitura_min_frames = 10
+# The tessitura's reported percentiles: p10, p25, p50, p75, p90. Range:
+# exactly these unless the struct's fields change.
+tessitura_percentiles = [10.0, 25.0, 50.0, 75.0, 90.0]
+# Robust low extreme percentile. Range: 0.0..=10.0.
+tessitura_extreme_lo_pct = 2.0
+# Robust high extreme percentile. Range: 90.0..=100.0.
+tessitura_extreme_hi_pct = 98.0
+# Harmonics considered for the dominant-harmonic measure (H1..=Hn). Range:
+# 2..=4.
+dominant_harmonic_candidates = 3
+# `|r − r_prev|` below this treats a sign change as a midpoint crossing
+# (turnover interpolation). Range: 1e-9..=1e-3.
+turnover_flat_eps = 1e-6
+
+# SpatialConfig: Two-channel relative-transfer-path learning and contrastive
+# scoring.
+[spatial]
+# STFT frame length, samples (2048 @ 48 kHz ≈ 43 ms, 23.4 Hz bins). Range:
+# power of two, 1024..=8192.
+fft_n = 2048
+# STFT hop, samples (50 % overlap). Range: fft_n/4..=fft_n.
+hop = 1024
+# Microphone channels in the pair. Range: exactly 2.
+channels = 2
+# Accumulator capacity, in frames, reserved per channel. Range: 1..=8.
+accumulator_frames = 2
+# Usable (non-quiet) frames a calibration accumulates (512 hops ≈ 11 s).
+# Range: 64..=2048.
+calib_frames = 512
+# Low edge of the calibrated/scored band, Hz (port roll-off below). Range:
+# 100.0..=400.0.
+band_lo_hz = 200.0
+# High edge of the band, Hz (TV content is sparse above the codec ceiling).
+# Range: 4000.0..=Nyquist.
+band_hi_hz = 8000.0
+# Frame RMS (dBFS, both channels) below which no score is computed. Range:
+# -90.0..=-40.0.
+quiet_dbfs = -65.0
+# Smallest mean-square passed to `log10` in the quiet gate. Range:
+# 1e-24..=1e-12.
+energy_floor = 1e-18
+# EMA coefficient for displayed scores (per scored frame, ~21 ms). Range:
+# 0.01..=0.5.
+score_ema_alpha = 0.1
+# A bin with coherence γ² below this is uncovered. Range: 0.2..=0.8.
+covered_coherence = 0.5
+# Energy-weighted mean λ2/λ1 above which the calibration warns of a second
+# source or heavy reverberation. Range: 0.05..=0.5.
+rank_warn = 0.2
+# Calibration fails if fewer than calib_frames usable frames arrive in
+# calib_frames × this many wall frames. Range: 2..=10.
+calib_max_wall_factor = 3
+# Single-path score at or above this reads "TV". Range: 0.6..=0.95.
+score_tv = 0.85
+# Single-path score at or below this reads "not TV". Range: 0.1..=score_tv.
+score_not_tv = 0.40
+# Single-path band coverage under which the score is weak evidence. Range:
+# 0.01..=0.5.
+single_weak_coverage = 0.10
+# A bin separates the paths when 1 − |ĥ_Tᴴĥ_U|² reaches this. Range:
+# 0.05..=0.5.
+sep_min = 0.2
+# Fraction of band bins that must separate before the contrast score counts as
+# evidence. Range: 0.01..=0.3.
+disc_min = 0.05
+# Contrast at or above this reads "TV-like". Range: 0.1..=0.8.
+contrast_tv = 0.3
+# Contrast at or below this reads "you-like". Range: -0.8..=-0.1.
+contrast_user = -0.3
+# TV-path weight below which a bin is skipped in scoring. Range: 1e-6..=1e-1.
+weight_eps = 1e-3
+# Joint (separation) weight below which a bin is skipped in the contrast
+# score. Range: 1e-6..=1e-2.
+joint_weight_eps = 1e-4
+# Weighted-energy denominator below which no score is reported. Range:
+# 1e-15..=1e-9.
+denominator_eps = 1e-12
+# Covariance / eigenvector norm floor (f64), guarding divisions in the closed-
+# form 2×2 eigen-decomposition. Range: 1e-40..=1e-20.
+eigen_eps = 1e-30
+
+# TractConfig: Area synthesis, lossless chain-matrix resonance solver, (q1, q2)
+# inversion grid, and the uniform-tube VTL estimator.
+[tract]
+# Speed of sound, cm/s at vocal-tract temperature — the value Story's own
+# resonance calculations use. Range: 33_000.0..=36_000.0.
+speed_of_sound_cm_s = 35_000.0
+# Resonance search band, low edge, Hz (below any adult fR1). Range:
+# 50.0..=200.0.
+sweep_lo_hz = 100.0
+# Resonance search band, high edge, Hz (covers fR3, keeps the plane-wave
+# assumption honest). Range: 3000.0..=5000.0.
+sweep_hi_hz = 4_000.0
+# Sweep step for bracketing sign changes of the chain-matrix D term, Hz; far
+# below the closest in-band resonance spacing. Range: 5.0..=50.0.
+sweep_step_hz = 20.0
+# Bisection refinements per bracketed root (interval shrinks 2^−n). Range:
+# 10..=40.
+bisect_iters = 30
+# Resonances the solver returns (fR1..fR3). Range: exactly 3.
+n_resonances = 3
+# Diameter clamp, cm, before squaring — a negative mode sum would square into
+# a spurious open passage. Range: 0.01..=0.2.
+min_diameter_cm = 0.05
+# (q1, q2) inversion-grid span: Story 2018 Table II's published range plus
+# margin. q1 low edge. Range: -7.0..=-5.1.
+q1_min = -5.6
+# q1 high edge. Range: 3.86..=6.0.
+q1_max = 4.4
+# q2 low edge. Range: -4.0..=-2.69.
+q2_min = -3.1
+# q2 high edge. Range: 2.22..=4.0.
+q2_max = 2.7
+# Inversion-grid resolution per axis at runtime (41 × 41 = 1681 forward
+# solves, once on a background thread). Range: grid_min_n..=81.
+grid_n = 41
+# Fewest nodes per axis a grid may be built with (the node spacing divides by
+# n − 1). Range: exactly 2.
+grid_min_n = 2
+# Reject an inversion whose nearest node is farther than this in the
+# normalized formant metric (a few grid cells). Range: 1.0..=10.0.
+invert_max_dist = 4.0
+# F1 distance normalization, Hz (≈ in-band node spacing). Range: 50.0..=300.0.
+invert_f1_scale_hz = 150.0
+# F2 distance normalization, Hz. Range: 100.0..=600.0.
+invert_f2_scale_hz = 300.0
+# Added to a node's distance in the inverse-distance weights so an exact hit
+# does not divide by zero. Range: 1e-6..=1e-1.
+idw_eps = 1e-3
+# VTL sanity bounds, cm: below this is not adult anatomy. Range: 6.0..=10.0.
+vtl_min_cm = 8.0
+# VTL upper bound, cm. Range: 19.0..=25.0.
+vtl_max_cm = 22.0
+# Weight of the F2-derived length in the VTL estimate (F3 gets the rest;
+# higher formants carry more anatomy per hertz). Range: 0.0..=0.5.
+vtl_weight_f2 = 0.3
+# Weight of the F3-derived length. Range: 0.5..=1.0; with vtl_weight_f2 sums
+# to 1.
+vtl_weight_f3 = 0.7

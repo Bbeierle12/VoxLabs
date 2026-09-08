@@ -182,13 +182,17 @@ pub fn decode(path: &Path) -> anyhow::Result<Decoded> {
 /// Windowed-sinc resampler (Hann window, 32 taps each side, cutoff at
 /// 0.45 × the lower rate). Identity when the rates already match.
 pub fn resample(x: &[f32], sr_in: f32, sr_out: f32) -> Vec<f32> {
-    if (sr_in - sr_out).abs() < 0.5 || x.is_empty() {
+    use crate::config::ResampleConfig;
+    use crate::config::consts::{HANN_A0, TWO};
+    const RESAMPLE: ResampleConfig = ResampleConfig::DEFAULT;
+
+    if (sr_in - sr_out).abs() < RESAMPLE.same_rate_tol_hz || x.is_empty() {
         return x.to_vec();
     }
     let ratio = sr_out as f64 / sr_in as f64;
     let n_out = (x.len() as f64 * ratio).floor() as usize;
-    let fc = 0.45 * sr_in.min(sr_out) / sr_in; // cycles per input sample
-    let taps: isize = 32;
+    let fc = RESAMPLE.cutoff_of_rate * sr_in.min(sr_out) / sr_in; // cycles per input sample
+    let taps: isize = RESAMPLE.half_taps;
     let mut out = Vec::with_capacity(n_out);
     for i in 0..n_out {
         let t = i as f64 / ratio;
@@ -201,14 +205,14 @@ pub fn resample(x: &[f32], sr_in: f32, sr_out: f32) -> Vec<f32> {
                 continue;
             }
             let d = k as f32 - frac; // sample offset from t
-            let arg = 2.0 * fc * d;
-            let sinc = if arg.abs() < 1e-6 {
+            let arg = TWO * fc * d;
+            let sinc = if arg.abs() < RESAMPLE.sinc_center_eps {
                 1.0
             } else {
                 (std::f32::consts::PI * arg).sin() / (std::f32::consts::PI * arg)
             };
-            let w = 0.5 + 0.5 * (std::f32::consts::PI * d / taps as f32).cos();
-            acc += x[idx as usize] * 2.0 * fc * sinc * w;
+            let w = HANN_A0 + HANN_A0 * (std::f32::consts::PI * d / taps as f32).cos();
+            acc += x[idx as usize] * TWO * fc * sinc * w;
         }
         out.push(acc);
     }

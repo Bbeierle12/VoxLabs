@@ -1,7 +1,7 @@
 //! `voxlab` — the Fach Lab study harness.
 //!
 //! Decodes audio files and runs them through the SAME per-frame pipeline
-//! the phone runs (`voice_harmonic_engine::frame::FrameAnalyzer`), plus the
+//! the phone runs (`vox_core::frame::FrameAnalyzer`), plus the
 //! voice-part measurements in `fach`, and writes three tables:
 //!
 //!   frames.csv — one row per 2048-sample analysis frame
@@ -25,12 +25,12 @@ mod lab {
     use std::io::Write;
     use std::path::{Path, PathBuf};
 
-    use voice_harmonic_engine::audio_file::{self, resample};
-    use voice_harmonic_engine::fach::{self, Ltas, RegisterDetector, TurnoverTracker};
-    use voice_harmonic_engine::frame::{ANALYSIS_FRAME, FrameAnalyzer};
-    use voice_harmonic_engine::math;
-    use voice_harmonic_engine::tract;
-    use voice_harmonic_engine::types::VocalProfile;
+    use vox_core::audio_file::{self, resample};
+    use vox_core::fach::{self, Ltas, RegisterDetector, TurnoverTracker};
+    use vox_core::frame::{ANALYSIS_FRAME, FrameAnalyzer};
+    use vox_core::math;
+    use vox_core::tract;
+    use vox_core::types::VocalProfile;
 
     pub const DEFAULT_SR: f32 = 48_000.0;
     /// Sustained-note segmentation: minimum length and pitch tolerance.

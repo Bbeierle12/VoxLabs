@@ -8,20 +8,25 @@
 //! most recent frame available for the UI to sample each repaint. It runs on
 //! the non-real-time analysis thread, never in an audio callback.
 
+use crate::config::SpectrogramConfig;
+use crate::config::consts::{DB_PER_DECADE_AMPLITUDE, HANN_A0, TWO_USIZE};
 use rustfft::{Fft, FftPlanner, num_complex::Complex};
-use std::f32::consts::PI;
+use std::f32::consts::TAU;
 use std::sync::Arc;
+
+/// Stage configuration (see `config::SpectrogramConfig` and `pipeline.toml`).
+const SPEC: SpectrogramConfig = SpectrogramConfig::DEFAULT;
 
 /// FFT window length. 2048 matches `analysis::ANALYSIS_FRAME`, so the analysis
 /// loop can feed the engine the same frame slices it feeds YIN.
-pub const FFT_SIZE: usize = 2048;
+pub const FFT_SIZE: usize = SPEC.fft_size;
 /// Samples advanced between frames. 512 → four magnitude frames per 2048-sample
 /// analysis frame, so the waterfall stays fresh regardless of the YIN cadence.
-pub const HOP: usize = 512;
+pub const HOP: usize = SPEC.hop;
 /// One-sided magnitude bin count for a real signal: `FFT_SIZE / 2 + 1`.
-pub const N_BINS: usize = FFT_SIZE / 2 + 1;
+pub const N_BINS: usize = FFT_SIZE / TWO_USIZE + 1;
 /// Magnitude floor (dB) reported for silent / empty bins.
-pub const DB_FLOOR: f32 = -120.0;
+pub const DB_FLOOR: f32 = SPEC.db_floor;
 
 pub struct Spectrogram {
     fft: Arc<dyn Fft<f32>>,
@@ -81,7 +86,8 @@ impl Spectrogram {
         let scale = 1.0 / n as f32;
         for (bin, c) in self.scratch.iter().take(N_BINS).enumerate() {
             let mag = c.norm() * scale;
-            self.magnitudes_db[bin] = 20.0 * mag.max(1e-12).log10();
+            self.magnitudes_db[bin] =
+                DB_PER_DECADE_AMPLITUDE * mag.max(SPEC.magnitude_floor).log10();
         }
     }
 
@@ -96,13 +102,14 @@ fn hann_window(n: usize) -> Vec<f32> {
     }
     let m = (n - 1) as f32;
     (0..n)
-        .map(|i| 0.5 * (1.0 - (2.0 * PI * i as f32 / m).cos()))
+        .map(|i| HANN_A0 * (1.0 - (TAU * i as f32 / m).cos()))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     const SR: f32 = 48_000.0;
 

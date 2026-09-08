@@ -32,7 +32,11 @@ impl AudioEngine {
         let output_config = output_device.default_output_config()?.config();
 
         let sample_rate = output_config.sample_rate as f32;
-        let mut osc_bank = OscillatorBank::new(sample_rate, 20.0); // 20ms parameter glide
+        // Parameter glide from the synthesis stage config (pipeline.toml).
+        let mut osc_bank = OscillatorBank::new(
+            sample_rate,
+            crate::config::SynthesisConfig::DEFAULT.glide_ms,
+        );
 
         let channels = output_config.channels as usize;
         let in_channels = input_config.channels as usize;
