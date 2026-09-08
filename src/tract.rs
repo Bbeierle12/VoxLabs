@@ -4,54 +4,57 @@
 //! in [`crate::tract_data`]; read that header before changing any claim this
 //! module's consumers make.
 
-pub use crate::tract_data::{ADULT_FEMALE, ADULT_MALE, N_SECTIONS, TractBasis};
+pub use crate::tract_data::{ADULT_FEMALE, ADULT_MALE, N_SECTIONS, TractBasis, VOWEL_ANCHORS};
 
-use crate::tract_data::{
-    MIN_DIAMETER_CM, RES_BISECT_ITERS, RES_SWEEP_HI_HZ, RES_SWEEP_LO_HZ, RES_SWEEP_STEP_HZ,
-    SPEED_OF_SOUND_CM_S,
-};
+use crate::config::TractConfig;
+use crate::config::consts::{HALF, QUARTER_WAVE_DENOM, QUARTER_WAVE_ODD_MULTIPLES, TWO};
+use std::f32::consts::TAU;
 
-/// Corner-vowel anchors for display, from Story 2018 Table II — the model's
-/// own landmarks (one speaker's vowels), drawn as context in the log map,
-/// never as targets for this singer.
-pub const VOWEL_ANCHORS: [(&str, f32, f32); 5] = [
-    ("i", -5.10, 0.88),
-    ("æ", 0.66, 2.22),
-    ("ɑ", 3.86, 1.35),
-    ("o", 0.00, -2.69),
-    ("u", -3.48, -1.70),
-];
+/// Stage configuration (see `config::TractConfig` and `pipeline.toml`).
+const TRACT: TractConfig = TractConfig::DEFAULT;
+
+/// Speed of sound, cm/s at vocal-tract temperature (Story's own value).
+pub(crate) const SPEED_OF_SOUND_CM_S: f32 = TRACT.speed_of_sound_cm_s;
+/// Resonance search band and bracketing step, Hz; bisection refinements.
+const RES_SWEEP_LO_HZ: f32 = TRACT.sweep_lo_hz;
+const RES_SWEEP_HI_HZ: f32 = TRACT.sweep_hi_hz;
+const RES_SWEEP_STEP_HZ: f32 = TRACT.sweep_step_hz;
+const RES_BISECT_ITERS: usize = TRACT.bisect_iters;
+/// Resonances the solver returns (fR1..fR3).
+pub const N_RESONANCES: usize = TRACT.n_resonances;
+/// Diameter clamp (cm) before squaring — see `TractConfig::min_diameter_cm`.
+const MIN_DIAMETER_CM: f32 = TRACT.min_diameter_cm;
 
 /// Published (q1, q2) span (Story 2018, Table II: q1 in [-5.10, 3.86], q2 in
 /// [-2.69, 2.22]) plus margin, so the grid covers the whole vowel space
 /// without extrapolating far beyond what the PCA saw.
-pub const Q1_MIN: f32 = -5.6;
-pub const Q1_MAX: f32 = 4.4;
-pub const Q2_MIN: f32 = -3.1;
-pub const Q2_MAX: f32 = 2.7;
+pub const Q1_MIN: f32 = TRACT.q1_min;
+pub const Q1_MAX: f32 = TRACT.q1_max;
+pub const Q2_MIN: f32 = TRACT.q2_min;
+pub const Q2_MAX: f32 = TRACT.q2_max;
 
 /// Inversion-grid resolution per axis at runtime (41 x 41 = 1681 forward
 /// solves, built once on a background thread).
-pub const GRID_N: usize = 41;
+pub const GRID_N: usize = TRACT.grid_n;
 
 /// Reject an inversion whose nearest grid node is farther than this in the
 /// normalized formant metric of [`TractGrid::invert`] — the measured pair
 /// lies outside the model's vowel space (or is a bad estimate), and snapping
 /// it to the nearest edge would draw a confident wrong shape. Display
 /// convention, sized at a few grid cells.
-const INVERT_MAX_DIST: f32 = 4.0;
+const INVERT_MAX_DIST: f32 = TRACT.invert_max_dist;
 
 /// Formant-distance normalization (Hz) for the inversion metric: roughly the
 /// in-band spacing of grid nodes along each axis, so one "unit" of distance
 /// is comparable in F1 and F2.
-const INVERT_F1_SCALE_HZ: f32 = 150.0;
-const INVERT_F2_SCALE_HZ: f32 = 300.0;
+const INVERT_F1_SCALE_HZ: f32 = TRACT.invert_f1_scale_hz;
+const INVERT_F2_SCALE_HZ: f32 = TRACT.invert_f2_scale_hz;
 
 /// VTL sanity bounds, cm. Outside published human range (infant ~8, tall
 /// adult male ~19-20; Story 2018 cohort spans 8.45-18.8) the estimate is a
 /// measurement artifact, not anatomy.
-const VTL_MIN_CM: f32 = 8.0;
-const VTL_MAX_CM: f32 = 22.0;
+const VTL_MIN_CM: f32 = TRACT.vtl_min_cm;
+const VTL_MAX_CM: f32 = TRACT.vtl_max_cm;
 
 /// Diameter function D(i) = Omega + q1*phi1 + q2*phi2, cm, clamped positive.
 /// This is what the pseudo-midsagittal display renders directly (Story
@@ -77,7 +80,7 @@ pub fn area_function(basis: &TractBasis, q1: f32, q2: f32) -> [f32; N_SECTIONS] 
 /// needs, and the loss models that fix bandwidths move the frequencies by
 /// far less than the measurement error of the formants being inverted.
 /// Returns `None` if fewer than three zeros lie in the sweep band.
-pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; 3]> {
+pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; N_RESONANCES]> {
     if !(vtl_cm.is_finite() && vtl_cm > 0.0) {
         return None;
     }
@@ -89,7 +92,7 @@ pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; 3]> {
     // can be bracketed by sign change. Characteristic impedance enters only
     // as 1/A ratios — the common rho*c factor cancels in D's zeros.
     let d_term = |f: f32| -> f32 {
-        let theta = 2.0 * std::f32::consts::PI * f * seg_len / SPEED_OF_SOUND_CM_S;
+        let theta = TAU * f * seg_len / SPEED_OF_SOUND_CM_S;
         let (sin_t, cos_t) = theta.sin_cos();
         // Running product T, glottis -> lips: T = [[a, jb], [jc, d]].
         let (mut a, mut b, mut c, mut d) = (1.0f32, 0.0f32, 0.0f32, 1.0f32);
@@ -105,19 +108,19 @@ pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; 3]> {
         d
     };
 
-    let mut roots = [0.0f32; 3];
+    let mut roots = [0.0f32; N_RESONANCES];
     let mut found = 0;
     let mut f_prev = RES_SWEEP_LO_HZ;
     let mut d_prev = d_term(f_prev);
     let mut f = f_prev + RES_SWEEP_STEP_HZ;
-    while f <= RES_SWEEP_HI_HZ && found < 3 {
+    while f <= RES_SWEEP_HI_HZ && found < N_RESONANCES {
         let d_now = d_term(f);
         if d_prev == 0.0 || d_prev.signum() != d_now.signum() {
             // Bracketed: bisect.
             let (mut lo, mut hi) = (f_prev, f);
             let mut d_lo = d_prev;
             for _ in 0..RES_BISECT_ITERS {
-                let mid = 0.5 * (lo + hi);
+                let mid = HALF * (lo + hi);
                 let d_mid = d_term(mid);
                 if d_lo.signum() != d_mid.signum() {
                     hi = mid;
@@ -126,14 +129,14 @@ pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; 3]> {
                     d_lo = d_mid;
                 }
             }
-            roots[found] = 0.5 * (lo + hi);
+            roots[found] = HALF * (lo + hi);
             found += 1;
         }
         f_prev = f;
         d_prev = d_now;
         f += RES_SWEEP_STEP_HZ;
     }
-    (found == 3).then_some(roots)
+    (found == N_RESONANCES).then_some(roots)
 }
 
 /// Precomputed forward map over the (q1, q2) plane: resonances (fR1, fR2) at
@@ -157,7 +160,7 @@ impl TractGrid {
     /// the runtime resolution this is ~1700 solves — sub-second in release,
     /// done once off the UI thread.
     pub fn build(basis: &TractBasis, n1: usize, n2: usize) -> Self {
-        assert!(n1 >= 2 && n2 >= 2);
+        assert!(n1 >= TRACT.grid_min_n && n2 >= TRACT.grid_min_n);
         let mut f1 = vec![0.0f32; n1 * n2];
         let mut f2 = vec![0.0f32; n1 * n2];
         for i in 0..n1 {
@@ -222,7 +225,7 @@ impl TractGrid {
                 if !d.is_finite() {
                     continue;
                 }
-                let w = 1.0 / (d + 1e-3);
+                let w = 1.0 / (d + TRACT.idw_eps);
                 wq1 += w * Self::q_at(Q1_MIN, Q1_MAX, self.n1, i as usize);
                 wq2 += w * Self::q_at(Q2_MIN, Q2_MAX, self.n2, j as usize);
                 wsum += w;
@@ -246,10 +249,12 @@ pub fn vtl_from_formants(f2_hz: f32, f3_hz: f32) -> Option<f32> {
     if !(f2_hz.is_finite() && f3_hz.is_finite() && f2_hz > 0.0 && f3_hz > 0.0) {
         return None;
     }
-    const W_F2: f32 = 0.3;
-    const W_F3: f32 = 0.7;
-    let l2 = 3.0 * SPEED_OF_SOUND_CM_S / (4.0 * f2_hz);
-    let l3 = 5.0 * SPEED_OF_SOUND_CM_S / (4.0 * f3_hz);
+    const W_F2: f32 = TRACT.vtl_weight_f2;
+    const W_F3: f32 = TRACT.vtl_weight_f3;
+    // F2 is the second closed–open mode (3c/4L), F3 the third (5c/4L).
+    let [_, odd_f2, odd_f3] = QUARTER_WAVE_ODD_MULTIPLES;
+    let l2 = odd_f2 * SPEED_OF_SOUND_CM_S / (QUARTER_WAVE_DENOM * f2_hz);
+    let l3 = odd_f3 * SPEED_OF_SOUND_CM_S / (QUARTER_WAVE_DENOM * f3_hz);
     let l = W_F2 * l2 + W_F3 * l3;
     (VTL_MIN_CM..=VTL_MAX_CM).contains(&l).then_some(l)
 }
@@ -260,7 +265,7 @@ pub fn vtl_from_formants(f2_hz: f32, f3_hz: f32) -> Option<f32> {
 /// from MRI rather than by length-warping.
 pub fn basis_for_vtl(vtl_cm: Option<f32>) -> &'static TractBasis {
     match vtl_cm {
-        Some(l) if l < (15.53 + 17.6) / 2.0 => &ADULT_FEMALE,
+        Some(l) if l < (ADULT_FEMALE.vtl_cm + ADULT_MALE.vtl_cm) / TWO => &ADULT_FEMALE,
         _ => &ADULT_MALE,
     }
 }

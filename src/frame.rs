@@ -13,37 +13,31 @@
 //! the Android loop, which seeds the floor and interferer through the two
 //! setters here), spectrogram/scope feeds, and telemetry heartbeats.
 
+use crate::config::{FormantConfig, LpcConfig, StreamConfig, VoicingConfig};
 use crate::math;
-use crate::types::{Formant, MAX_PARTIALS, VocalProfile, VoiceMetrics};
+use crate::types::{Formant, MAX_PARTIALS, N_FORMANTS, VocalProfile, VoiceMetrics};
+
+// Stage configuration (see `config` and `pipeline.toml`).
+const STREAM: StreamConfig = StreamConfig::DEFAULT;
+const VOICING: VoicingConfig = VoicingConfig::DEFAULT;
+const LPC: LpcConfig = LpcConfig::DEFAULT;
+const FORMANT: FormantConfig = FormantConfig::DEFAULT;
 
 /// Analysis frame length in samples, on every CPU consumer. 2048 at 48 kHz
 /// is 42.7 ms.
-pub const ANALYSIS_FRAME: usize = 2048;
+pub const ANALYSIS_FRAME: usize = STREAM.frame_samples;
 
 /// Spectral envelope held before the first voiced frame and through
 /// unvoiced gaps, so synthesis never collapses. Mirrors
 /// `analysis::DEFAULT_FORMANTS` on the desktop GPU path.
-pub const DEFAULT_FORMANTS: [Formant; 3] = [
-    Formant {
-        frequency: 500.0,
-        bandwidth: 80.0,
-    },
-    Formant {
-        frequency: 1500.0,
-        bandwidth: 120.0,
-    },
-    Formant {
-        frequency: 2500.0,
-        bandwidth: 160.0,
-    },
-];
+pub const DEFAULT_FORMANTS: [Formant; N_FORMANTS] = FORMANT.default_formants();
 
 /// YIN confidence below which a frame is unvoiced, and the f0 range the
 /// engine accepts at all (the study harness reports frames outside it as
 /// unvoiced, exactly as the phone does).
-pub const YIN_MIN_CONFIDENCE: f32 = 0.4;
-pub const F0_MIN_HZ: f32 = 50.0;
-pub const F0_MAX_HZ: f32 = 1000.0;
+pub const YIN_MIN_CONFIDENCE: f32 = VOICING.min_confidence;
+pub const F0_MIN_HZ: f32 = VOICING.f0_min_hz;
+pub const F0_MAX_HZ: f32 = VOICING.f0_max_hz;
 
 /// Everything one frame produced, plus the raw facts the caller needs for
 /// its own bookkeeping (calibration wants the pre-gate periodicity).
@@ -60,7 +54,7 @@ pub struct FrameResult {
 /// the learned noise floor, and the calibrated interferer.
 pub struct FrameAnalyzer {
     sample_rate: f32,
-    last_formants: [Formant; 3],
+    last_formants: [Formant; N_FORMANTS],
     /// f0 of the frame `last_formants` was measured on (0.0 = never), so the
     /// formant-reliability gate judges by measurement conditions.
     last_formants_f0: f32,
@@ -135,12 +129,13 @@ impl FrameAnalyzer {
 
         // --- Formants via LPC on a decimated signal (voiced frames only) ---
         if voiced {
-            let m = ((sample_rate / 11_025.0).round() as usize).max(1);
+            let m = ((sample_rate / LPC.decimation_target_hz).round() as usize).max(1);
             let fs_dec = sample_rate / m as f32;
-            let order = (2 + (fs_dec / 1000.0) as usize).clamp(8, 20);
+            let order = (LPC.order_base + (fs_dec / LPC.order_hz_per_pole) as usize)
+                .clamp(LPC.order_min, LPC.order_max);
 
             let decimated = math::decimate(frame, m);
-            let lpc = math::lpc_coefficients(&decimated, order, 0.97);
+            let lpc = math::lpc_coefficients(&decimated, order, LPC.preemphasis);
             let measured = math::formants_from_lpc(&lpc, fs_dec);
             if measured[0].frequency > 0.0 {
                 self.last_formants = measured;

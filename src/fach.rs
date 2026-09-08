@@ -32,32 +32,40 @@
 //! soprano vs alto at 68–74 %). These numbers are evidence to be shown with
 //! their overlap, never a label to be printed.
 
+use crate::config::consts::{
+    DB_PER_DECADE_POWER, HALF, HALF_F64, HANN_A0, MEDIAN_PERCENTILE, MIDI_A4, PERCENT,
+    SEMITONES_PER_OCTAVE, SEMITONES_PER_OCTAVE_I32, SEMITONES_PER_OCTAVE_USIZE,
+    THIRD_OCTAVE_HALF_BAND_EXP, TWO, TWO_USIZE,
+};
+use crate::config::fach::N_THIRD_OCTAVE_BANDS;
+use crate::config::{FachConfig, TuningConfig};
 use crate::math;
 use rustfft::num_complex::Complex;
-use std::f32::consts::PI;
+use std::f32::consts::TAU;
+
+/// Stage configuration (see `config::FachConfig` and `pipeline.toml`).
+const FACH: FachConfig = FachConfig::DEFAULT;
+const TUNING: TuningConfig = TuningConfig::DEFAULT;
 
 /// Singer's-formant analysis bands (Hz), male and female (Müller 2022).
-pub const FHE_BAND_MALE: (f32, f32) = (2000.0, 3600.0);
-pub const FHE_BAND_FEMALE: (f32, f32) = (2300.0, 4500.0);
+pub const FHE_BAND_MALE: (f32, f32) = (FACH.fhe_band_male_hz[0], FACH.fhe_band_male_hz[1]);
+pub const FHE_BAND_FEMALE: (f32, f32) = (FACH.fhe_band_female_hz[0], FACH.fhe_band_female_hz[1]);
 /// Cluster search window (Hz) and the floor below which the valley is sought.
-pub const CLUSTER_LO_HZ: f32 = 2200.0;
-pub const CLUSTER_HI_HZ: f32 = 3400.0;
-pub const CLUSTER_VALLEY_FROM_HZ: f32 = 1500.0;
-pub const CLUSTER_WIDTH_CEIL_HZ: f32 = 5000.0;
+pub const CLUSTER_LO_HZ: f32 = FACH.cluster_lo_hz;
+pub const CLUSTER_HI_HZ: f32 = FACH.cluster_hi_hz;
+pub const CLUSTER_VALLEY_FROM_HZ: f32 = FACH.cluster_valley_from_hz;
+pub const CLUSTER_WIDTH_CEIL_HZ: f32 = FACH.cluster_width_ceil_hz;
 /// ISO third-octave band centres, 100 Hz – 8 kHz.
-pub const THIRD_OCTAVE_CENTERS: [f32; 20] = [
-    100.0, 125.0, 160.0, 200.0, 250.0, 315.0, 400.0, 500.0, 630.0, 800.0, 1000.0, 1250.0, 1600.0,
-    2000.0, 2500.0, 3150.0, 4000.0, 5000.0, 6300.0, 8000.0,
-];
+pub const THIRD_OCTAVE_CENTERS: [f32; N_THIRD_OCTAVE_BANDS] = FACH.third_octave_centers_hz;
 /// Turnover hysteresis: A2/A1 must sit at or beyond ±this to count as
 /// "below" / "above", so a value wobbling around 0 dB fires once.
-pub const TURNOVER_HYSTERESIS_DB: f32 = 3.0;
+pub const TURNOVER_HYSTERESIS_DB: f32 = FACH.turnover_hysteresis_db;
 /// Register-event heuristics: minimum f0 jump between consecutive voiced
 /// frames, and the accompanying source-change thresholds.
-pub const REGISTER_MIN_JUMP_ST: f32 = 2.0;
-pub const REGISTER_H1H2_DELTA_DB: f32 = 4.0;
-pub const REGISTER_CPP_DROP_DB: f32 = 2.0;
-pub const REGISTER_JITTER_PCT: f32 = 1.5;
+pub const REGISTER_MIN_JUMP_ST: f32 = FACH.register_min_jump_st;
+pub const REGISTER_H1H2_DELTA_DB: f32 = FACH.register_h1h2_delta_db;
+pub const REGISTER_CPP_DROP_DB: f32 = FACH.register_cpp_drop_db;
+pub const REGISTER_JITTER_PCT: f32 = FACH.register_jitter_pct;
 
 // ─── Power spectrum ─────────────────────────────────────────────────────────
 
@@ -77,10 +85,10 @@ impl PowerSpectrum {
 /// Hann-windowed one-sided power spectrum. `None` for tiny or silent frames.
 pub fn power_spectrum(frame: &[f32], sample_rate: f32) -> Option<PowerSpectrum> {
     let n = frame.len();
-    if n < 256 || sample_rate <= 0.0 {
+    if n < FACH.min_frame_samples || sample_rate <= 0.0 {
         return None;
     }
-    if frame.iter().map(|s| s * s).sum::<f32>() < 1e-12 {
+    if frame.iter().map(|s| s * s).sum::<f32>() < FACH.silence_energy {
         return None;
     }
     let fft = math::fft_forward(n);
@@ -89,12 +97,12 @@ pub fn power_spectrum(frame: &[f32], sample_rate: f32) -> Option<PowerSpectrum> 
         .iter()
         .enumerate()
         .map(|(i, &x)| {
-            let w = 0.5 - 0.5 * (2.0 * PI * i as f32 / m).cos();
+            let w = HANN_A0 - HANN_A0 * (TAU * i as f32 / m).cos();
             Complex::new(x * w, 0.0)
         })
         .collect();
     fft.process(&mut buf);
-    let power: Vec<f32> = buf[..=n / 2].iter().map(|c| c.norm_sqr()).collect();
+    let power: Vec<f32> = buf[..=n / TWO_USIZE].iter().map(|c| c.norm_sqr()).collect();
     Some(PowerSpectrum {
         bin_hz: sample_rate / n as f32,
         power,
@@ -121,21 +129,21 @@ pub fn band_half_energy(ps: &PowerSpectrum, lo_hz: f32, hi_hz: f32) -> Option<Ba
         return None;
     }
     let total: f64 = ps.power[lo..=hi].iter().map(|&p| p as f64).sum();
-    if total <= 1e-18 {
+    if total <= FACH.band_energy_eps {
         return None;
     }
     let mut acc = 0.0f64;
     let mut fhe = hi_hz;
     for (i, &p) in ps.power[lo..=hi].iter().enumerate() {
         let next = acc + p as f64;
-        if next >= total * 0.5 {
+        if next >= total * HALF_F64 {
             // Interpolate inside the crossing bin.
             let frac = if p > 0.0 {
-                ((total * 0.5 - acc) / p as f64) as f32
+                ((total * HALF_F64 - acc) / p as f64) as f32
             } else {
-                0.5
+                HALF
             };
-            fhe = ((lo + i) as f32 + frac - 0.5) * ps.bin_hz;
+            fhe = ((lo + i) as f32 + frac - HALF) * ps.bin_hz;
             break;
         }
         acc = next;
@@ -202,12 +210,12 @@ impl Ltas {
 
     /// ISO third-octave band levels in dB, mean-normalized across bands (so
     /// a flat gain change cancels). `None` before any frame.
-    pub fn third_octave_db(&self) -> Option<[f32; 20]> {
+    pub fn third_octave_db(&self) -> Option<[f32; N_THIRD_OCTAVE_BANDS]> {
         let mean = self.mean_power()?;
-        let mut out = [0.0f32; 20];
+        let mut out = [0.0f32; N_THIRD_OCTAVE_BANDS];
         for (k, &fc) in THIRD_OCTAVE_CENTERS.iter().enumerate() {
-            let lo = fc / 2f32.powf(1.0 / 6.0);
-            let hi = fc * 2f32.powf(1.0 / 6.0);
+            let lo = fc / TWO.powf(THIRD_OCTAVE_HALF_BAND_EXP);
+            let hi = fc * TWO.powf(THIRD_OCTAVE_HALF_BAND_EXP);
             let b0 = ((lo / self.bin_hz).ceil() as usize).min(mean.len().saturating_sub(1));
             let b1 = ((hi / self.bin_hz).floor() as usize).min(mean.len().saturating_sub(1));
             let p: f64 = if b1 >= b0 {
@@ -215,7 +223,7 @@ impl Ltas {
             } else {
                 mean[b0] as f64
             };
-            out[k] = 10.0 * (p.max(1e-18)).log10() as f32;
+            out[k] = DB_PER_DECADE_POWER * (p.max(FACH.ltas_power_floor)).log10() as f32;
         }
         let avg = out.iter().sum::<f32>() / out.len() as f32;
         for v in out.iter_mut() {
@@ -250,7 +258,7 @@ pub fn smooth_power(mean_power: &[f32], bin_hz: f32, half_width_hz: f32) -> Vec<
     if n == 0 || bin_hz <= 0.0 {
         return Vec::new();
     }
-    let r = ((0.5 * half_width_hz / bin_hz).round() as usize).min(n);
+    let r = ((HALF * half_width_hz / bin_hz).round() as usize).min(n);
     if r == 0 {
         return mean_power.to_vec();
     }
@@ -282,7 +290,7 @@ pub fn cluster_stats(mean_power: &[f32], bin_hz: f32) -> Option<ClusterStats> {
     }
     let db: Vec<f32> = mean_power
         .iter()
-        .map(|&p| 10.0 * p.max(1e-18).log10())
+        .map(|&p| DB_PER_DECADE_POWER * p.max(FACH.power_floor).log10())
         .collect();
     let bin = |hz: f32| ((hz / bin_hz).round() as usize).min(db.len() - 1);
     let (lo, hi) = (bin(CLUSTER_LO_HZ), bin(CLUSTER_HI_HZ));
@@ -299,7 +307,7 @@ pub fn cluster_stats(mean_power: &[f32], bin_hz: f32) -> Option<ClusterStats> {
                     if v > bv { (lo + i, v) } else { (bi, bv) }
                 },
             );
-    if peak_db <= -170.0 {
+    if peak_db <= FACH.cluster_silent_peak_db {
         return None;
     }
     let valley_from = bin(CLUSTER_VALLEY_FROM_HZ);
@@ -309,7 +317,7 @@ pub fn cluster_stats(mean_power: &[f32], bin_hz: f32) -> Option<ClusterStats> {
         .fold(f32::MAX, f32::min);
     // −3 dB width: walk out from the peak while level ≥ peak − 3.
     let ceil = bin(CLUSTER_WIDTH_CEIL_HZ);
-    let thr = peak_db - 3.0;
+    let thr = peak_db - FACH.cluster_width_db;
     let mut left = peak_i;
     while left > valley_from && db[left - 1] >= thr {
         left -= 1;
@@ -345,7 +353,7 @@ pub fn percentile(sorted: &[f32], pct: f32) -> Option<f32> {
     if sorted.is_empty() {
         return None;
     }
-    let pos = (pct / 100.0).clamp(0.0, 1.0) * (sorted.len() - 1) as f32;
+    let pos = (pct / PERCENT).clamp(0.0, 1.0) * (sorted.len() - 1) as f32;
     let i = pos.floor() as usize;
     let frac = pos - i as f32;
     let a = sorted[i];
@@ -360,7 +368,7 @@ pub fn median(v: &[f32]) -> Option<f32> {
         return None;
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    percentile(&s, 50.0)
+    percentile(&s, MEDIAN_PERCENTILE)
 }
 
 /// Duration-weighted (one value per voiced frame) f0 percentiles.
@@ -370,38 +378,43 @@ pub fn tessitura(f0s: &[f32]) -> Option<Tessitura> {
         .cloned()
         .filter(|&f| f > 0.0 && f.is_finite())
         .collect();
-    if s.len() < 10 {
+    if s.len() < FACH.tessitura_min_frames {
         return None;
     }
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let [q10, q25, q50, q75, q90] = FACH.tessitura_percentiles;
     Some(Tessitura {
-        p10: percentile(&s, 10.0)?,
-        p25: percentile(&s, 25.0)?,
-        p50: percentile(&s, 50.0)?,
-        p75: percentile(&s, 75.0)?,
-        p90: percentile(&s, 90.0)?,
-        lo: percentile(&s, 2.0)?,
-        hi: percentile(&s, 98.0)?,
+        p10: percentile(&s, q10)?,
+        p25: percentile(&s, q25)?,
+        p50: percentile(&s, q50)?,
+        p75: percentile(&s, q75)?,
+        p90: percentile(&s, q90)?,
+        lo: percentile(&s, FACH.tessitura_extreme_lo_pct)?,
+        hi: percentile(&s, FACH.tessitura_extreme_hi_pct)?,
         n: s.len(),
     })
 }
 
 /// MIDI-style semitone number (A4 = 69).
 pub fn hz_to_semitone(hz: f32) -> f32 {
-    69.0 + 12.0 * (hz / 440.0).log2()
+    MIDI_A4 + SEMITONES_PER_OCTAVE * (hz / TUNING.a4_hz).log2()
 }
 
 /// Scientific pitch name of the nearest semitone, e.g. "C4", "F#4".
 pub fn note_name(hz: f32) -> String {
-    const NAMES: [&str; 12] = [
+    const NAMES: [&str; SEMITONES_PER_OCTAVE_USIZE] = [
         "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
     ];
     if hz <= 0.0 || !hz.is_finite() {
         return "—".into();
     }
     let st = hz_to_semitone(hz).round() as i32;
-    let octave = st.div_euclid(12) - 1;
-    format!("{}{}", NAMES[st.rem_euclid(12) as usize], octave)
+    let octave = st.div_euclid(SEMITONES_PER_OCTAVE_I32) - 1;
+    format!(
+        "{}{}",
+        NAMES[st.rem_euclid(SEMITONES_PER_OCTAVE_I32) as usize],
+        octave
+    )
 }
 
 // ─── Turnover (acoustic passaggio) ──────────────────────────────────────────
@@ -459,10 +472,10 @@ impl TurnoverTracker {
         if let Some((pf0, pr)) = self.prev
             && (pr < 0.0) != (r < 0.0)
         {
-            let t = if (r - pr).abs() > 1e-6 {
+            let t = if (r - pr).abs() > FACH.turnover_flat_eps {
                 ((0.0 - pr) / (r - pr)).clamp(0.0, 1.0)
             } else {
-                0.5
+                HALF
             };
             self.pending = Some(TurnoverEvent {
                 f0_hz: pf0 + t * (f0 - pf0),
@@ -500,7 +513,11 @@ impl TurnoverTracker {
 
 /// Which of H1, H2, H3 is strongest (1-based). `None` when all are zero.
 pub fn dominant_harmonic(amps: &[f32]) -> Option<u8> {
-    let top: Vec<f32> = amps.iter().take(3).cloned().collect();
+    let top: Vec<f32> = amps
+        .iter()
+        .take(FACH.dominant_harmonic_candidates)
+        .cloned()
+        .collect();
     if top.iter().all(|&a| a <= 0.0) {
         return None;
     }
@@ -593,6 +610,7 @@ impl RegisterDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f32::consts::PI;
 
     const SR: f32 = 48_000.0;
     const N: usize = 2048;

@@ -1,7 +1,10 @@
-use crate::types::{Formant, MAX_PARTIALS, VocalProfile};
-use std::f32::consts::PI;
+use crate::config::SynthesisConfig;
+use crate::config::consts::{MILLIS_PER_SECOND, SQUARED};
+use crate::types::{Formant, MAX_PARTIALS, N_FORMANTS, VocalProfile};
+use std::f32::consts::TAU;
 
-const TAU: f32 = 2.0 * PI;
+/// Stage configuration (see `config::SynthesisConfig` and `pipeline.toml`).
+const SYNTH: SynthesisConfig = SynthesisConfig::DEFAULT;
 
 pub struct OscillatorBank {
     sample_rate: f32,
@@ -12,11 +15,11 @@ pub struct OscillatorBank {
 
     // Targets (From Profile)
     target_f0: f32,
-    target_formants: [Formant; 3],
+    target_formants: [Formant; N_FORMANTS],
 
     // Smoothed values
     current_f0: f32,
-    current_formants: [Formant; 3],
+    current_formants: [Formant; N_FORMANTS],
 
     // Phases
     phase_l: [f32; MAX_PARTIALS],
@@ -28,31 +31,18 @@ pub struct OscillatorBank {
 
 impl OscillatorBank {
     pub fn new(sample_rate: f32, tau_glide_ms: f32) -> Self {
-        let tau_sec = tau_glide_ms / 1000.0;
+        let tau_sec = tau_glide_ms / MILLIS_PER_SECOND;
         let alpha = 1.0 - (-1.0 / (tau_sec * sample_rate)).exp();
 
-        let default_formants = [
-            Formant {
-                frequency: 500.0,
-                bandwidth: 50.0,
-            },
-            Formant {
-                frequency: 1500.0,
-                bandwidth: 100.0,
-            },
-            Formant {
-                frequency: 2500.0,
-                bandwidth: 150.0,
-            },
-        ];
+        let default_formants = SYNTH.default_formants();
 
         Self {
             sample_rate,
-            harmonic_count: 5,
-            delta_f: 6.0,
-            target_f0: 150.0,
+            harmonic_count: SYNTH.default_harmonic_count,
+            delta_f: SYNTH.default_delta_f_hz,
+            target_f0: SYNTH.default_f0_hz,
             target_formants: default_formants,
-            current_f0: 150.0,
+            current_f0: SYNTH.default_f0_hz,
             current_formants: default_formants,
             phase_l: [0.0; MAX_PARTIALS],
             phase_r: [0.0; MAX_PARTIALS],
@@ -78,7 +68,7 @@ impl OscillatorBank {
     /// guards), but this is the real-time audio callback, so it does not
     /// assume that.
     pub fn set_profile(&mut self, profile: &VocalProfile) {
-        if profile.valid && profile.f0.is_finite() && profile.f0 > 20.0 {
+        if profile.valid && profile.f0.is_finite() && profile.f0 > SYNTH.min_target_f0_hz {
             self.target_f0 = profile.f0;
             for (target, measured) in self.target_formants.iter_mut().zip(&profile.formants) {
                 if measured.frequency.is_finite() && measured.bandwidth.is_finite() {
@@ -90,20 +80,21 @@ impl OscillatorBank {
 
     // A simple resonance curve to approximate a formant filter
     #[inline(always)]
-    fn evaluate_formants(freq: f32, formants: &[Formant; 3]) -> f32 {
+    fn evaluate_formants(freq: f32, formants: &[Formant; N_FORMANTS]) -> f32 {
         let mut gain = 0.0;
         for f in formants {
             if f.frequency > 0.0 && f.bandwidth > 0.0 {
                 // Simple bandpass magnitude approximation
                 let q = f.frequency / f.bandwidth;
                 let omega = freq / f.frequency;
-                let denom = ((1.0 - omega * omega).powi(2) + (omega / q).powi(2)).sqrt();
-                gain += 1.0 / (1.0 + denom * 10.0); // scaled to avoid blowing up
+                let denom =
+                    ((1.0 - omega * omega).powi(SQUARED) + (omega / q).powi(SQUARED)).sqrt();
+                gain += 1.0 / (1.0 + denom * SYNTH.resonance_scale); // scaled to avoid blowing up
             }
         }
         // Base glottal rolloff (-12dB/octave roughly)
-        let rolloff = 1.0 / (1.0 + freq / 100.0);
-        (gain + 0.1) * rolloff
+        let rolloff = 1.0 / (1.0 + freq / SYNTH.rolloff_corner_hz);
+        (gain + SYNTH.base_gain) * rolloff
     }
 
     #[inline(always)]
@@ -111,7 +102,7 @@ impl OscillatorBank {
         // 1. Smooth target parameters
         self.current_f0 += self.alpha * (self.target_f0 - self.current_f0);
 
-        for i in 0..3 {
+        for i in 0..N_FORMANTS {
             self.current_formants[i].frequency += self.alpha
                 * (self.target_formants[i].frequency - self.current_formants[i].frequency);
             self.current_formants[i].bandwidth += self.alpha
@@ -134,7 +125,7 @@ impl OscillatorBank {
             // Amplitude based on spectral envelope at f_l
             let amp = Self::evaluate_formants(f_l, &self.current_formants);
 
-            if amp < 0.0001 {
+            if amp < SYNTH.amp_cutoff {
                 continue;
             }
 
@@ -165,7 +156,7 @@ impl OscillatorBank {
             out_r /= total_amp;
         }
 
-        (out_l * 0.5, out_r * 0.5) // -6dB headroom
+        (out_l * SYNTH.headroom, out_r * SYNTH.headroom) // -6dB headroom
     }
 }
 

@@ -28,30 +28,24 @@
 //! 2007), and formants determine only part of the shape (Mermelstein 1967;
 //! Sondhi 1979).
 
+//!
+//! This module is DATA: the published tables, transcribed. The solver and
+//! inversion parameters (speed of sound, sweep band, clamps, grid) are
+//! stage configuration in `config::TractConfig` / `pipeline.toml`.
+
 /// Number of area elements, glottis (1) to lips (44). Fixed by the dataset.
 pub const N_SECTIONS: usize = 44;
 
-/// Speed of sound used throughout, cm/s at vocal-tract temperature -- the
-/// value Story's own resonance calculations use.
-pub(crate) const SPEED_OF_SOUND_CM_S: f32 = 35_000.0;
-
-/// Resonance search band, Hz. 100 Hz sits below any adult fR1; 4 kHz covers
-/// fR3 for every basis and keeps the plane-wave assumption honest (cross
-/// modes start ~4-5 kHz).
-pub(crate) const RES_SWEEP_LO_HZ: f32 = 100.0;
-pub(crate) const RES_SWEEP_HI_HZ: f32 = 4_000.0;
-/// Sweep step for bracketing sign changes of the lossless chain-matrix D
-/// term. 20 Hz is far below the closest resonance spacing this model
-/// produces in-band.
-pub(crate) const RES_SWEEP_STEP_HZ: f32 = 20.0;
-/// Bisection refinements per bracketed root (interval shrinks 2^-30).
-pub(crate) const RES_BISECT_ITERS: usize = 30;
-
-/// Diameters are clamped here (cm) before squaring: at extreme (q1, q2) the
-/// linear mode sum can go negative, which would silently square into a
-/// spurious *open* passage. Story clips to a small positive area for the
-/// same reason.
-pub(crate) const MIN_DIAMETER_CM: f32 = 0.05;
+/// Corner-vowel anchors for display, from Story 2018 Table II — the model's
+/// own landmarks (one speaker's vowels), drawn as context in the log map,
+/// never as targets for this singer.
+pub const VOWEL_ANCHORS: [(&str, f32, f32); 5] = [
+    ("i", -5.10, 0.88),
+    ("æ", 0.66, 2.22),
+    ("ɑ", 3.86, 1.35),
+    ("o", 0.00, -2.69),
+    ("u", -3.48, -1.70),
+];
 
 /// One anatomical basis: neutral diameter function, two modes, and the
 /// tract length the elements imply.

@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Formants tracked per frame: F1, F2, F3.
+pub const N_FORMANTS: usize = 3;
+/// Harmonics in the voiceprint's mean relative profile (H1..H16).
+pub const VOICEPRINT_PROFILE_LEN: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Formant {
     pub frequency: f32,
@@ -25,7 +30,7 @@ pub struct Voiceprint {
     /// F1, F2, F3 in Hz. `0.0` = unresolved — kept as the on-disk encoding so
     /// archives saved before tilt became optional still load; scoring treats
     /// non-positive/non-finite entries as unmeasured, never as data.
-    pub formants: [f32; 3],
+    pub formants: [f32; N_FORMANTS],
     /// Spectral centroid (Hz); `0.0` = unmeasured (same convention as formants).
     pub centroid_hz: f32,
     /// Spectral tilt (dB/octave); `None` = unmeasured. Older archives stored a
@@ -33,7 +38,7 @@ pub struct Voiceprint {
     /// deserializes as `Some` and is scored as-is.
     pub tilt_db_oct: Option<f32>,
     /// Mean relative harmonic profile, H1..H16 (normalized to the strongest).
-    pub profile: [f32; 16],
+    pub profile: [f32; VOICEPRINT_PROFILE_LEN],
     /// Estimated vocal tract length (cm); `0.0` = unmeasured (same on-disk
     /// convention as `formants`, and `serde(default)` so archives written
     /// before this field existed still load). The one *anatomical* identity
@@ -83,7 +88,7 @@ pub const MAX_PARTIALS: usize = 32;
 #[derive(Debug, Clone, Copy)]
 pub struct VocalProfile {
     pub f0: f32,
-    pub formants: [Formant; 3], // F1, F2, F3
+    pub formants: [Formant; N_FORMANTS],
     /// f0 of the frame `formants` was actually measured on (they are held
     /// across unvoiced gaps, so it can differ from `f0`). `0.0` = never
     /// measured — the engine-default envelope. This is what formant
@@ -106,7 +111,7 @@ impl Default for VocalProfile {
             formants: [Formant {
                 frequency: 0.0,
                 bandwidth: 0.0,
-            }; 3],
+            }; N_FORMANTS],
             formants_f0: 0.0,
             partial_amplitudes: [0.0; MAX_PARTIALS],
             metrics: VoiceMetrics::default(),

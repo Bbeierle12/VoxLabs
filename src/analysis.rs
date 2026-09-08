@@ -1,10 +1,17 @@
-use crate::types::{Formant, VocalProfile};
+use crate::config::{FormantConfig, LpcConfig, StreamConfig, VoicingConfig};
+use crate::types::{Formant, N_FORMANTS, VocalProfile};
 use triple_buffer::Input;
+
+// Stage configuration (see `config` and `pipeline.toml`).
+const STREAM: StreamConfig = StreamConfig::DEFAULT;
+const VOICING: VoicingConfig = VoicingConfig::DEFAULT;
+const LPC: LpcConfig = LpcConfig::DEFAULT;
+const FORMANT: FormantConfig = FormantConfig::DEFAULT;
 
 /// Number of mono samples per analysis frame. Sized so the YIN difference
 /// function has room for its full lag range: window (`YIN_WINDOW`) plus the
 /// maximum search lag must fit inside one frame. 2048 @ 44.1 kHz ≈ 46 ms.
-pub const ANALYSIS_FRAME: usize = 2048;
+pub const ANALYSIS_FRAME: usize = STREAM.frame_samples;
 
 /// Length of the GPU difference-function / prefix-sum buffers, in lags.
 ///
@@ -13,24 +20,11 @@ pub const ANALYSIS_FRAME: usize = 2048;
 /// YIN_WINDOW` so every `x[j+tau]` stays in-bounds, and ≥ `sample_rate /
 /// F0_MIN` (~883 @ 44.1 kHz / 50 Hz) so it covers the whole pitch search range.
 /// 1024 satisfies all three.
-pub const DIFF_LEN: usize = 1024;
+pub const DIFF_LEN: usize = STREAM.gpu_diff_len;
 
 /// Fallback spectral envelope used before the first voiced frame is analyzed,
 /// and held through unvoiced gaps so the synthesis envelope never collapses.
-const DEFAULT_FORMANTS: [Formant; 3] = [
-    Formant {
-        frequency: 500.0,
-        bandwidth: 80.0,
-    },
-    Formant {
-        frequency: 1500.0,
-        bandwidth: 120.0,
-    },
-    Formant {
-        frequency: 2500.0,
-        bandwidth: 160.0,
-    },
-];
+const DEFAULT_FORMANTS: [Formant; N_FORMANTS] = FORMANT.default_formants();
 
 /// GPU side of the YIN pitch detector. Two compute passes per frame:
 ///   1. `yin_diff.wgsl`  — difference function `d(tau)` (the O(window × lags)
@@ -198,7 +192,7 @@ impl GpuYin {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
             pass.set_pipeline(&self.diff_pipeline);
             pass.set_bind_group(0, &self.diff_bind_group, &[]);
-            pass.dispatch_workgroups((DIFF_LEN as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups((DIFF_LEN as u32).div_ceil(STREAM.gpu_diff_workgroup), 1, 1);
         }
         // Pass 2: inclusive prefix-sum, single workgroup.
         {
@@ -254,7 +248,7 @@ pub struct AnalysisEngine {
     profile_tx: Input<VocalProfile>,
     ui_profile_tx: Input<VocalProfile>,
     /// Last successfully measured formants, held across unvoiced frames.
-    last_formants: [Formant; 3],
+    last_formants: [Formant; N_FORMANTS],
     /// f0 of the frame `last_formants` was measured on (0.0 = never).
     last_formants_f0: f32,
     /// Ambient-floor tracker for the SNR voicing gate; learns from unvoiced
@@ -334,7 +328,12 @@ impl AnalysisEngine {
             }
         };
         let (f0, yin_voiced) = match pitch {
-            Some(p) if p.confidence > 0.4 && (50.0..=1000.0).contains(&p.f0) => (p.f0, true),
+            Some(p)
+                if p.confidence > VOICING.min_confidence
+                    && (VOICING.f0_min_hz..=VOICING.f0_max_hz).contains(&p.f0) =>
+            {
+                (p.f0, true)
+            }
             _ => (0.0, false),
         };
 
@@ -398,12 +397,13 @@ impl AnalysisEngine {
         if voiced {
             // Decimate so LPC spends its poles on the 0..~5.5 kHz formant band
             // rather than the full 22 kHz, where a low order can't resolve them.
-            let m = ((sample_rate / 11_025.0).round() as usize).max(1);
+            let m = ((sample_rate / LPC.decimation_target_hz).round() as usize).max(1);
             let fs_dec = sample_rate / m as f32;
-            let order = (2 + (fs_dec / 1000.0) as usize).clamp(8, 20);
+            let order = (LPC.order_base + (fs_dec / LPC.order_hz_per_pole) as usize)
+                .clamp(LPC.order_min, LPC.order_max);
 
             let decimated = crate::math::decimate(audio_in, m);
-            let lpc = crate::math::lpc_coefficients(&decimated, order, 0.97);
+            let lpc = crate::math::lpc_coefficients(&decimated, order, LPC.preemphasis);
             let measured = crate::math::formants_from_lpc(&lpc, fs_dec);
 
             // Accept only if we actually resolved at least F1.
