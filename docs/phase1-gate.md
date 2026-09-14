@@ -35,7 +35,10 @@ adb shell pm grant org.voxlabs.core android.permission.RECORD_AUDIO
 ```
 
 Use the release build for the numbers. The debug build runs the same
-pipeline but unoptimized, and its hop times are not the gate's.
+pipeline but unoptimized, and its hop times are not the gate's. For the
+`org.voxlabs.core.dev` / "VoxLabs (dev)" variant D18 names, patch `package`
+and `label` in `Cargo.toml` before building and revert after, as
+`docs/STATUS.md` §5 describes; the `pm grant` line then takes the `.dev` id.
 
 ## The ten-minute run
 
