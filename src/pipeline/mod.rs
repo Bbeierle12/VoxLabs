@@ -20,6 +20,7 @@
 //! the web target has no analysis thread yet (Phase 5b).
 
 pub mod builder;
+pub mod consumers;
 pub mod definition;
 pub mod stage;
 pub mod stages;

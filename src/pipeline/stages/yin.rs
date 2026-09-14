@@ -47,6 +47,8 @@ impl Stage for YinStage {
                 confidence: p.confidence,
                 voiced: p.confidence > self.voicing.min_confidence
                     && (self.voicing.f0_min_hz..=self.voicing.f0_max_hz).contains(&p.f0),
+                snr_db: None,
+                rejected: false,
             },
             None => F0Track::default(),
         };
@@ -103,6 +105,7 @@ mod tests {
             hz: 1.0,
             confidence: 1.0,
             voiced: true,
+            ..Default::default()
         };
         s.process(&frame, &mut out).unwrap();
         assert!(!out.voiced);

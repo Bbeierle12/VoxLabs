@@ -4,7 +4,7 @@
 
 use crate::config::FormantConfig;
 use crate::tract::{self, ADULT_FEMALE, ADULT_MALE, N_SECTIONS, TractBasis};
-use crate::types::{Formant, N_FORMANTS};
+use crate::types::{Formant, MAX_PARTIALS, N_FORMANTS, VoiceMetrics};
 
 use super::stage::StageError;
 
@@ -101,6 +101,57 @@ pub struct F0Track {
     pub hz: f32,
     pub confidence: f32,
     pub voiced: bool,
+    /// Frame SNR over the learned ambient floor, dB, once the `voicing`
+    /// stage has run; `None` from the raw estimator or while the floor
+    /// warms up. A frame property, present on unvoiced frames too.
+    pub snr_db: Option<f32>,
+    /// The estimator found a period the SNR/hum gates rejected: there IS
+    /// a periodic source, but the room is too loud to measure it honestly.
+    pub rejected: bool,
+}
+
+/// One-sided magnitude spectrum of the current frame (Hann-windowed FFT
+/// over the whole frame), in linear magnitude and dB.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spectrum {
+    pub magnitude: Vec<f32>,
+    pub magnitudes_db: Vec<f32>,
+    /// Hz per bin (`sample_rate / fft_size`).
+    pub bin_hz: f32,
+    pub fft_size: usize,
+    pub frame_index: u64,
+}
+
+impl Spectrum {
+    pub fn preallocated(fft_size: usize, sample_rate: f32, db_floor: f32) -> Self {
+        let bins = fft_size / crate::config::consts::TWO_USIZE + 1;
+        Self {
+            magnitude: vec![0.0; bins],
+            magnitudes_db: vec![db_floor; bins],
+            bin_hz: sample_rate / fft_size as f32,
+            fft_size,
+            frame_index: 0,
+        }
+    }
+}
+
+/// Measured amplitude of each harmonic k·f0 (linear peak); zeroed when
+/// the frame is unvoiced.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HarmonicSeries {
+    pub amplitudes: [f32; MAX_PARTIALS],
+    pub f0_hz: f32,
+    pub voiced: bool,
+}
+
+impl Default for HarmonicSeries {
+    fn default() -> Self {
+        Self {
+            amplitudes: [0.0; MAX_PARTIALS],
+            f0_hz: 0.0,
+            voiced: false,
+        }
+    }
 }
 
 /// Formants for one frame. Held across unvoiced frames exactly as the
@@ -234,7 +285,10 @@ impl AreaFunction {
 #[derive(Clone, Debug)]
 pub enum Wire {
     AudioFrame(AudioFrame),
+    Spectrum(Spectrum),
     F0Track(F0Track),
+    HarmonicSeries(HarmonicSeries),
+    VoiceMetrics(VoiceMetrics),
     FormantTrack(FormantTrack),
     TractParams(TractParams),
     AreaFunction(AreaFunction),
@@ -244,7 +298,10 @@ impl Wire {
     pub fn wire_type(&self) -> WireType {
         match self {
             Wire::AudioFrame(_) => WireType::AudioFrame,
+            Wire::Spectrum(_) => WireType::Spectrum,
             Wire::F0Track(_) => WireType::F0Track,
+            Wire::HarmonicSeries(_) => WireType::HarmonicSeries,
+            Wire::VoiceMetrics(_) => WireType::VoiceMetrics,
             Wire::FormantTrack(_) => WireType::FormantTrack,
             Wire::TractParams(_) => WireType::TractParams,
             Wire::AreaFunction(_) => WireType::AreaFunction,
@@ -263,13 +320,20 @@ impl Wire {
             WireType::AudioFrame => {
                 Wire::AudioFrame(AudioFrame::preallocated(frame_samples, sample_rate))
             }
+            WireType::Spectrum => Wire::Spectrum(Spectrum::preallocated(
+                frame_samples,
+                sample_rate,
+                crate::config::SpectrogramConfig::DEFAULT.db_floor,
+            )),
             WireType::F0Track => Wire::F0Track(F0Track::default()),
+            WireType::HarmonicSeries => Wire::HarmonicSeries(HarmonicSeries::default()),
+            WireType::VoiceMetrics => Wire::VoiceMetrics(VoiceMetrics::default()),
             WireType::FormantTrack => Wire::FormantTrack(FormantTrack::held_default(formants)),
             WireType::TractParams => Wire::TractParams(TractParams::default()),
             WireType::AreaFunction => Wire::AreaFunction(AreaFunction::neutral(BasisId::AdultMale)),
             other => {
                 return Err(StageError::Init(format!(
-                    "no Phase-1 payload for wire type {other}; no stage produces it yet"
+                    "no payload for wire type {other}; no stage produces it yet"
                 )));
             }
         })
@@ -303,7 +367,10 @@ macro_rules! wire_value {
     };
 }
 wire_value!(AudioFrame);
+wire_value!(Spectrum);
 wire_value!(F0Track);
+wire_value!(HarmonicSeries);
+wire_value!(VoiceMetrics);
 wire_value!(FormantTrack);
 wire_value!(TractParams);
 wire_value!(AreaFunction);
@@ -344,5 +411,16 @@ impl<'a, A: WireValue, B: WireValue> FromWires<'a> for (&'a A, &'a B) {
     const TYPES: &'static [WireType] = &[A::TYPE, B::TYPE];
     fn from_wires(wires: &'a [Wire], idx: &[usize]) -> Result<Self, StageError> {
         Ok((take::<A>(wires, idx, 0)?, take::<B>(wires, idx, 1)?))
+    }
+}
+
+impl<'a, A: WireValue, B: WireValue, C: WireValue> FromWires<'a> for (&'a A, &'a B, &'a C) {
+    const TYPES: &'static [WireType] = &[A::TYPE, B::TYPE, C::TYPE];
+    fn from_wires(wires: &'a [Wire], idx: &[usize]) -> Result<Self, StageError> {
+        Ok((
+            take::<A>(wires, idx, 0)?,
+            take::<B>(wires, idx, 1)?,
+            take::<C>(wires, idx, 2)?,
+        ))
     }
 }

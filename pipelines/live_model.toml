@@ -10,7 +10,7 @@ name = "live_model"
 
 # Every stage output the shell shows in its debug panel; `tract` also drives
 # the tube view.
-taps = ["yin", "lpc", "inverse", "tract"]
+taps = ["yin", "voicing", "lpc", "harmonics", "metrics", "contour", "inverse", "tract", "stft"]
 
 # Stream format (D14: hop 1024 is canonical for the whole pipeline). The
 # shell substitutes the device's real sample rate before building; frame
@@ -25,7 +25,7 @@ hop = 1024
 # Idle sleep between ring-buffer drains, ms. Range: 1..=10.
 poll_ms = 5
 # Tap channel depth, messages. A full channel drops and counts. Range: 8..=256.
-tap_capacity = 64
+tap_capacity = 256
 # Timing summary to the log every this many hops (512 hops ≈ 11 s at hop
 # 1024 / 48 kHz). Range: 47..=4700.
 report_every_hops = 512
@@ -38,9 +38,10 @@ mic_to_render_max_ms = 100.0
 # The shell waits this long for the worker's init (two 41×41 grid builds)
 # before opening audio anyway, ms. Range: 500..=10000.
 init_timeout_ms = 4000
-# Not-yet-wrapped per-frame work (harmonics, metrics, gates, spectrogram)
-# runs every this many hops: 2 keeps the pre-pipeline 2048-sample cadence,
-# so those numbers are unchanged until Phase 2 wraps them. Range: 1..=4.
+# The frame-cadence consumers (room-calibration pass, raw-capture export)
+# run every this many hops: 2 is one 2048-sample frame at hop 1024, so the
+# calibration's frame count and the capture file layout are unchanged.
+# Range: 1..=4.
 legacy_frame_every_hops = 2
 # Drained-but-unconsumed audio the re-framer reserves, in frames; more than
 # this in flight means the worker is behind and allocates. Range: 1..=8.
@@ -52,9 +53,26 @@ pending_capacity_frames = 2
 name = "yin"
 backend = "yin_cpu"
 
+# The SNR and calibrated-hum gates: periodicity alone is not voice.
+[[stage]]
+name = "voicing"
+backend = "snr_hum"
+
 [[stage]]
 name = "lpc"
 backend = "lpc_levinson"
+
+[[stage]]
+name = "harmonics"
+backend = "goertzel"
+
+[[stage]]
+name = "metrics"
+backend = "classic"
+
+[[stage]]
+name = "contour"
+backend = "f0_contour"
 
 [[stage]]
 name = "inverse"
@@ -63,6 +81,12 @@ backend = "grid_story"
 [[stage]]
 name = "tract"
 backend = "story_two_mode"
+
+# The waterfall reads this tap; at hop 1024 over a 2048 frame that is 50 %
+# overlap (D14).
+[[stage]]
+name = "stft"
+backend = "rustfft"
 
 # Parameter overrides on top of pipeline.toml, e.g.
 #   [params.tract]

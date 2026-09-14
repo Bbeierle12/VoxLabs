@@ -151,6 +151,7 @@ mod tests {
             hz: 120.0,
             confidence: 0.9,
             voiced: true,
+            ..Default::default()
         };
         for (name, q1, q2) in [("i", -5.10, 0.88), ("ɑ", 3.86, 1.35), ("u", -3.48, -1.70)] {
             let areas = tract::area_function(&ADULT_MALE, q1, q2);
@@ -193,6 +194,7 @@ mod tests {
             hz: 400.0,
             confidence: 0.9,
             voiced: true,
+            ..Default::default()
         };
         s.process((&voiced, &track([700.0, 1200.0, 2500.0], 400.0)), &mut out)
             .unwrap();
@@ -206,6 +208,7 @@ mod tests {
             hz: 120.0,
             confidence: 0.9,
             voiced: true,
+            ..Default::default()
         };
         let mut out = TractParams::default();
         s.process((&voiced, &track([3000.0, 600.0, 2500.0], 250.0)), &mut out)

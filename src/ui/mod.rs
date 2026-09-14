@@ -20,6 +20,9 @@
 mod app;
 mod capture;
 mod detail;
+// The console's page and metrics feed are native; the web build keeps the
+// stub and the shared header.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod diagnostics;
 mod files;
 mod gauges;

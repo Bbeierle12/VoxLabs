@@ -72,6 +72,9 @@ pub mod fach;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod device_probe;
 pub mod math;
+// The room as calibration learned it (floor seed, hum), shared between the
+// calibration pass and the `voicing` stage.
+pub mod room;
 // TV-path spatial calibration + live path-consistency scoring. The math is
 // cross-target and unit-tested; the continuous two-channel capture thread
 // is Android-only (same dead-code shape as device_probe on desktop).
@@ -81,9 +84,8 @@ mod spatial;
 // all targets (ui uses it); each entry point supplies the store path (or None
 // on web, which has no disk).
 mod persist;
-// f0-contour metrics (vibrato/steadiness): used by the desktop and Android
-// analysis loops; the web target has no analysis thread yet.
-#[cfg(not(target_arch = "wasm32"))]
+// f0-contour metrics (vibrato/steadiness): the `contour` stage's kernel.
+// Pure math, every target.
 pub mod metrics;
 // The shared per-frame CPU pipeline (Android loop + the `voxlab` study
 // harness). Public so the harness binary can drive it.
@@ -92,8 +94,11 @@ pub mod frame;
 // Scrolling-spectrogram STFT. Compiled on all targets (its consts size the
 // UI's waterfall buffers); the engine itself is driven only by the desktop
 // and Android analysis loops.
-#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+// The reference STFT (the `stft` stage's contract); only the desktop GPU
+// engine still runs it live (Phase 5c retires that).
+#[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
 mod spectrogram;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod synthesis;
 // Story two-mode vocal tract model: runtime (tract) + published basis data
 // (tract_data). Compiled on all targets — pure math, no threads or I/O.

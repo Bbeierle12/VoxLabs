@@ -8,12 +8,12 @@
 //!
 //! Two deliberate de-risking choices for this first on-device build:
 //!   1. **CPU DSP only.** Analysis runs through the pipeline runner
-//!      (`pipeline::runner`, Plan v3 Phase 1): YIN, LPC, the grid inverse and
-//!      the Story tract as stages, with the not-yet-wrapped per-frame work
-//!      (gates, harmonics, metrics, spectrogram, room calibration) in a hop
-//!      observer at its old 2048-sample cadence (see [`LegacyTail`]). It
-//!      never constructs the wgpu `GpuYin` compute path, so a missing or
-//!      limited Vulkan driver can't break launch.
+//!      (`pipeline::runner`, Plan v3): every kernel is a stage of
+//!      `live_model.toml`, and the UI's profile, waterfall, scope, room
+//!      calibration and capture export are tap consumers on the hop hook
+//!      (see [`WireConsumers`]). It never constructs the wgpu `GpuYin`
+//!      compute path, so a missing or limited Vulkan driver can't break
+//!      launch.
 //!   2. **glow (GLES/EGL) renderer**, not wgpu/Vulkan — forced via
 //!      `NativeOptions.renderer`.
 //!
@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 use triple_buffer::Input;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::frame::{ANALYSIS_FRAME, FrameAnalyzer};
+use crate::frame::ANALYSIS_FRAME;
 
 /// Fallback microphone rate when the input device can't be queried yet (e.g.
 /// `RECORD_AUDIO` not granted at launch). 48 kHz is the near-universal Android
@@ -185,9 +185,9 @@ fn android_main(app: AndroidApp) {
         Ok(def) => {
             let format = def.format(Some(input_sample_rate));
             if format.frame_samples != ANALYSIS_FRAME {
-                // The legacy tail's analyzer is built around ANALYSIS_FRAME
-                // (its contour rate, its noise-floor timing); a mode file
-                // that changes the frame must wait for Phase 2 to wrap it.
+                // The capture export and the calibration pass count
+                // ANALYSIS_FRAME-sample frames; a mode file that changes
+                // the frame changes the study's file layout, so refuse.
                 log::error!(
                     "live_model.toml frame_samples {} != ANALYSIS_FRAME {}; refusing to start",
                     format.frame_samples,
@@ -196,14 +196,12 @@ fn android_main(app: AndroidApp) {
                 telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
                 (None, None)
             } else {
-                let tail = LegacyTail {
-                    analyzer: FrameAnalyzer::new(input_sample_rate),
+                let tail = WireConsumers {
                     profile_tx,
                     ui_profile_tx,
                     spectrum_tx,
                     scope_tx,
                     telemetry: telemetry_for_runner.clone(),
-                    spectrogram: crate::spectrogram::Spectrogram::new(),
                     calibrator: crate::math::RoomCalibrator::new(),
                     every: def.runner.legacy_frame_every_hops,
                 };
@@ -468,81 +466,80 @@ fn query_input_sample_rate() -> Option<f32> {
     Some(config.config().sample_rate as f32)
 }
 
-/// The per-frame work Phase 1 does not wrap yet, run as a runner hop
-/// observer every `every` hops — with hop 1024 and `every` 2 that is one
-/// call per 2048 new samples on the frame ending there, exactly the frames
-/// the pre-pipeline loop analyzed, so every number this publishes (gates,
-/// harmonics, metrics, spectrogram, calibration) is unchanged. YIN and LPC
-/// run twice per such frame until Phase 2 wraps the rest and the analyzer
-/// takes its pitch and formants from the wires.
-struct LegacyTail {
-    analyzer: FrameAnalyzer,
+/// The tap consumers on the worker's hop hook: the profile the UI and the
+/// synthesis reads, assembled from the wires (`pipeline::consumers`); the
+/// waterfall from the `stft` tap; the oscilloscope from the frame; the
+/// room-calibration pass (fed the pre-gate periodicity, since a
+/// calibrating room with a voice in it must fail); the raw-capture
+/// export. Every stage now runs once per hop; the calibration pass and
+/// the capture mirror keep the frame cadence (`every` hops) so their
+/// frame counts and file layout are unchanged.
+struct WireConsumers {
     profile_tx: Input<VocalProfile>,
     ui_profile_tx: Input<VocalProfile>,
     spectrum_tx: Input<Vec<f32>>,
     scope_tx: Input<Vec<f32>>,
     telemetry: Arc<Telemetry>,
-    spectrogram: crate::spectrogram::Spectrogram,
     calibrator: crate::math::RoomCalibrator,
     every: u64,
 }
 
-impl HopObserver for LegacyTail {
-    fn on_hop(&mut self, frame: &AudioFrame, _wires: &[Wire], hop: u64) {
-        if hop % self.every != 0 {
-            return;
-        }
+impl HopObserver for WireConsumers {
+    fn on_hop(&mut self, frame: &AudioFrame, wires: &[Wire], hop: u64) {
+        use crate::pipeline::consumers::{first, latest, profile_from_wires};
+        use crate::pipeline::types::{F0Track, Spectrum};
         let samples = &frame.samples;
+        let frame_cadence = hop.is_multiple_of(self.every);
 
-        // Mirror the frame to the capture export (no-op unless a capture
-        // is armed) before anything else sees it.
-        crate::capture_log::push(samples);
-        let result = self.analyzer.analyze(samples);
+        if frame_cadence {
+            // Mirror the frame to the capture export (no-op unless a
+            // capture is armed), one whole frame per `every` hops.
+            crate::capture_log::push(samples);
 
-        // Room calibration pass, mirroring the desktop engine. It wants the
-        // pre-gate periodicity (a calibrating room with a voice in it must
-        // fail), which the analyzer reports alongside the gated profile.
-        let (calibrating, calib_done) = self.telemetry.take_calibration_frame();
-        if calibrating {
-            self.calibrator.push(result.rms, result.yin_f0);
-            if calib_done {
-                match self.calibrator.finish() {
-                    Ok(cal) => {
-                        self.analyzer.seed_floor(cal.ambient_rms);
-                        self.analyzer.set_interferer(cal.interferer);
-                        self.telemetry.set_calibration_result(Some((
-                            cal.ambient_rms,
-                            cal.interferer.map(|i| (i.f0_hz, i.rms)),
-                        )));
-                        crate::diagnostics::runtime::record_calibration(
-                            crate::diagnostics::room_calibration_report(
+            let (calibrating, calib_done) = self.telemetry.take_calibration_frame();
+            if calibrating {
+                let rms = crate::math::frame_rms(samples);
+                // The estimator's own verdict, before the gates.
+                let raw: Option<&F0Track> = first(wires);
+                let yin_f0 = raw.filter(|t| t.voiced).map(|t| t.hz);
+                self.calibrator.push(rms, yin_f0);
+                if calib_done {
+                    match self.calibrator.finish() {
+                        Ok(cal) => {
+                            crate::room::set_calibration(cal.ambient_rms, cal.interferer);
+                            self.telemetry.set_calibration_result(Some((
                                 cal.ambient_rms,
-                                cal.interferer.map(|i| i.f0_hz),
-                            ),
-                        );
-                        log::info!(
-                            "room calibrated: ambient rms {:.5}, interferer {:?}",
-                            cal.ambient_rms,
-                            cal.interferer
-                        );
+                                cal.interferer.map(|i| (i.f0_hz, i.rms)),
+                            )));
+                            crate::diagnostics::runtime::record_calibration(
+                                crate::diagnostics::room_calibration_report(
+                                    cal.ambient_rms,
+                                    cal.interferer.map(|i| i.f0_hz),
+                                ),
+                            );
+                            log::info!(
+                                "room calibrated: ambient rms {:.5}, interferer {:?}",
+                                cal.ambient_rms,
+                                cal.interferer
+                            );
+                        }
+                        Err(e) => {
+                            log::warn!("room calibration failed: {e:?}");
+                            self.telemetry.set_calibration_result(None);
+                        }
                     }
-                    Err(e) => {
-                        log::warn!("room calibration failed: {e:?}");
-                        self.telemetry.set_calibration_result(None);
-                    }
+                    self.calibrator = crate::math::RoomCalibrator::new();
                 }
-                self.calibrator = crate::math::RoomCalibrator::new();
             }
         }
 
-        let profile = result.profile;
-        self.profile_tx.write(profile);
-        self.ui_profile_tx.write(profile);
-
-        // Spectrogram + oscilloscope feeds, mirroring the desktop path.
-        self.spectrogram.process_block(samples);
-        self.spectrum_tx
-            .write(self.spectrogram.magnitudes_db().to_vec());
+        if let Some(profile) = profile_from_wires(wires) {
+            self.profile_tx.write(profile);
+            self.ui_profile_tx.write(profile);
+        }
+        if let Some(spectrum) = latest::<Spectrum>(wires) {
+            self.spectrum_tx.write(spectrum.magnitudes_db.clone());
+        }
         self.scope_tx.write(samples.to_vec());
 
         // Heartbeat for the UI's staleness watch.

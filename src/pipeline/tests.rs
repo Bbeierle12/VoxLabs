@@ -17,6 +17,19 @@ use super::types::{AudioFrame, Wire, WireType};
 
 use super::contract::{SR, vowel};
 
+/// The Live Model's stages, in mode-file order.
+const STAGE_NAMES: [&str; 9] = [
+    "yin",
+    "voicing",
+    "lpc",
+    "harmonics",
+    "metrics",
+    "contour",
+    "inverse",
+    "tract",
+    "stft",
+];
+
 fn live_model_coarse() -> PipelineDefinition {
     super::contract::live_model_coarse().expect("live_model.toml with a grid override")
 }
@@ -27,35 +40,40 @@ fn live_model_definition_loads_and_builds() {
     assert_eq!(def.name, "live_model");
     assert_eq!(def.format.hop, 1024, "D14: hop 1024 is canonical");
     let names: Vec<&str> = def.stages.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["yin", "lpc", "inverse", "tract"]);
+    assert_eq!(names, STAGE_NAMES);
     let coarse = live_model_coarse();
     let p = build(&coarse, coarse.format(Some(SR))).expect("build");
-    assert_eq!(p.stages.len(), 4);
+    assert_eq!(p.stages.len(), STAGE_NAMES.len());
     assert_eq!(
         p.wires.len(),
-        5,
+        STAGE_NAMES.len() + 1,
         "source + one wire per stage, preallocated"
     );
-    assert_eq!(p.taps, vec![0, 1, 2, 3]);
+    assert_eq!(p.taps, (0..STAGE_NAMES.len()).collect::<Vec<_>>());
     let types: Vec<WireType> = p.wires.iter().map(Wire::wire_type).collect();
     assert_eq!(
         types,
         [
             WireType::AudioFrame,
             WireType::F0Track,
+            WireType::F0Track,
             WireType::FormantTrack,
+            WireType::HarmonicSeries,
+            WireType::VoiceMetrics,
+            WireType::VoiceMetrics,
             WireType::TractParams,
-            WireType::AreaFunction
+            WireType::AreaFunction,
+            WireType::Spectrum,
         ]
     );
 }
 
 #[test]
 fn wiring_a_wrong_type_fails_at_build_with_the_adapter_chain() {
-    // yin → tract, skipping lpc and inverse: tract needs TractParams.
+    // Skipping lpc and inverse: tract needs TractParams.
     let mut def = live_model_coarse();
-    def.stages.remove(2);
-    def.stages.remove(1);
+    def.stages
+        .retain(|s| s.name != "lpc" && s.name != "inverse");
     def.taps = vec!["yin".into(), "tract".into()];
     let err = build(&def, def.format(Some(SR)))
         .err()
@@ -116,7 +134,7 @@ fn unknown_backends_taps_and_param_keys_fail_loud() {
     assert!(err.to_string().contains("grid_size"), "{err}");
 
     // A runner limit missing from the mode file is a load error, not a default.
-    let text = PipelineDefinition::LIVE_MODEL.replace("tap_capacity = 64\n", "");
+    let text = PipelineDefinition::LIVE_MODEL.replace("tap_capacity = 256\n", "");
     assert!(PipelineDefinition::from_toml(&text).is_err());
 }
 
@@ -125,7 +143,7 @@ struct CountingObserver(Arc<std::sync::Mutex<Vec<u64>>>);
 impl HopObserver for CountingObserver {
     fn on_hop(&mut self, frame: &AudioFrame, wires: &[Wire], hop: u64) {
         assert_eq!(frame.frame_index, hop);
-        assert_eq!(wires.len(), 5);
+        assert_eq!(wires.len(), STAGE_NAMES.len() + 1);
         self.0.lock().unwrap().push(hop);
     }
 }
@@ -190,7 +208,12 @@ fn runner_reframes_to_hop_produces_every_tap_and_the_tube_moves() {
     // Every tap carried a live value on every hop, none dropped.
     msgs.extend(shell.taps.drain());
     assert_eq!(shell.stats.tap_drops.load(Ordering::Relaxed), 0);
-    assert_eq!(msgs.len() as u64, expected_hops * 4, "4 taps per hop");
+    let n_taps = shell.stages.len() as u64;
+    assert_eq!(
+        msgs.len() as u64,
+        expected_hops * n_taps,
+        "one tap per stage per hop"
+    );
     let seen: Vec<u64> = hops_seen.lock().unwrap().clone();
     assert_eq!(seen.len() as u64, expected_hops, "observer ran every hop");
 
@@ -198,25 +221,25 @@ fn runner_reframes_to_hop_produces_every_tap_and_the_tube_moves() {
     // valid on the steady vowel. Tract: the tube moved between the vowels.
     let mid_i = (SR as usize / format.hop / 2) as u64; // half a second into /i/
     let mid_a = expected_hops - mid_i;
-    let at = |hop: u64, stage: usize| -> &Wire {
+    let at = |hop: u64, stage: &str| -> &Wire {
         &msgs
             .iter()
-            .find(|m| m.hop == hop && m.stage == stage)
+            .find(|m| m.hop == hop && &*m.stage_name == stage)
             .expect("tap present")
             .value
     };
-    let Wire::F0Track(f0) = at(mid_i, 0) else {
+    let Wire::F0Track(f0) = at(mid_i, "voicing") else {
         panic!()
     };
     assert!(f0.voiced && (f0.hz - 120.0).abs() < 3.0, "{f0:?}");
-    let Wire::FormantTrack(ft) = at(mid_i, 1) else {
+    let Wire::FormantTrack(ft) = at(mid_i, "lpc") else {
         panic!()
     };
     assert!(ft.fresh && ft.formants[0].frequency > 0.0, "{ft:?}");
-    let Wire::TractParams(tp_i) = at(mid_i, 2) else {
+    let Wire::TractParams(tp_i) = at(mid_i, "inverse") else {
         panic!()
     };
-    let Wire::TractParams(tp_a) = at(mid_a, 2) else {
+    let Wire::TractParams(tp_a) = at(mid_a, "inverse") else {
         panic!()
     };
     assert!(
@@ -227,10 +250,10 @@ fn runner_reframes_to_hop_produces_every_tap_and_the_tube_moves() {
         tp_a.q1 > tp_i.q1,
         "/ɑ/ is the high-q1 vowel: {tp_i:?} vs {tp_a:?}"
     );
-    let Wire::AreaFunction(af_i) = at(mid_i, 3) else {
+    let Wire::AreaFunction(af_i) = at(mid_i, "tract") else {
         panic!()
     };
-    let Wire::AreaFunction(af_a) = at(mid_a, 3) else {
+    let Wire::AreaFunction(af_a) = at(mid_a, "tract") else {
         panic!()
     };
     assert!(af_i.live && af_a.live);
@@ -254,7 +277,7 @@ fn runner_reframes_to_hop_produces_every_tap_and_the_tube_moves() {
 #[test]
 fn a_build_failure_is_reported_not_swallowed() {
     let mut def = live_model_coarse();
-    def.stages.remove(1);
+    def.stages.retain(|s| s.name != "lpc");
     let (rx_tx, rx) = rtrb::RingBuffer::<f32>::new(16);
     drop(rx_tx);
     let (mut runner, shell) = Runner::spawn(
@@ -295,5 +318,5 @@ fn wires_are_preallocated_and_stable_across_hops() {
         _ => unreachable!(),
     };
     assert_eq!(cap_before, cap_after);
-    assert_eq!(p.wires.len(), 5);
+    assert_eq!(p.wires.len(), STAGE_NAMES.len() + 1);
 }

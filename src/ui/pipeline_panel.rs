@@ -238,11 +238,53 @@ fn describe_tap(w: &Wire) -> String {
     match w {
         Wire::AudioFrame(f) => format!("{} samples · frame {}", f.samples.len(), f.frame_index),
         Wire::F0Track(t) => format!(
-            "{:.1} Hz · confidence {:.2} · {}",
+            "{:.1} Hz · confidence {:.2} · {}{}",
             t.hz,
             t.confidence,
-            if t.voiced { "VOICED" } else { "unvoiced" }
+            if t.voiced {
+                "VOICED"
+            } else if t.rejected {
+                "REJECTED (noisy)"
+            } else {
+                "unvoiced"
+            },
+            t.snr_db
+                .map(|s| format!(" · SNR {s:.0} dB"))
+                .unwrap_or_default()
         ),
+        Wire::Spectrum(s) => {
+            let peak = s
+                .magnitude
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as f32 * s.bin_hz)
+                .unwrap_or(0.0);
+            format!(
+                "{} bins · {:.1} Hz/bin · peak {peak:.0} Hz",
+                s.magnitude.len(),
+                s.bin_hz
+            )
+        }
+        Wire::HarmonicSeries(h) => format!(
+            "H1 {:.3} · H2 {:.3} · H3 {:.3} · {}",
+            h.amplitudes[0],
+            h.amplitudes[1],
+            h.amplitudes[2],
+            if h.voiced { "VOICED" } else { "silent" }
+        ),
+        Wire::VoiceMetrics(m) => {
+            let f = |v: Option<f32>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
+            format!(
+                "HNR {} · H1-H2 {} · CPP {} · jitter {} % · shimmer {} · centroid {}",
+                f(m.hnr_db),
+                f(m.h1_h2_db),
+                f(m.cpp_db),
+                f(m.jitter_pct),
+                f(m.shimmer_db),
+                f(m.centroid_hz)
+            )
+        }
         Wire::FormantTrack(t) => format!(
             "F1 {:.0} · F2 {:.0} · F3 {:.0} Hz · measured at {:.0} Hz · {}",
             t.formants[0].frequency,

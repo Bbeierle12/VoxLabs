@@ -125,10 +125,11 @@ pub fn definition_builds() -> Result<String, String> {
     let def = PipelineDefinition::live_model().map_err(|e| e.to_string())?;
     check("hop (D14)", def.format.hop, 1024)?;
     let coarse = live_model_coarse()?;
+    let n = coarse.stages.len();
     let p = build(&coarse, coarse.format(Some(SR))).map_err(|e| e.to_string())?;
-    check("stages", p.stages.len(), 4)?;
-    check("wires", p.wires.len(), 5)?;
-    check("taps", p.taps.clone(), vec![0, 1, 2, 3])?;
+    check("stages", p.stages.len(), n)?;
+    check("wires", p.wires.len(), n + 1)?;
+    check("taps", p.taps.clone(), (0..n).collect::<Vec<_>>())?;
     let types: Vec<WireType> = p.wires.iter().map(Wire::wire_type).collect();
     check(
         "wire types",
@@ -136,9 +137,14 @@ pub fn definition_builds() -> Result<String, String> {
         vec![
             WireType::AudioFrame,
             WireType::F0Track,
+            WireType::F0Track,
             WireType::FormantTrack,
+            WireType::HarmonicSeries,
+            WireType::VoiceMetrics,
+            WireType::VoiceMetrics,
             WireType::TractParams,
             WireType::AreaFunction,
+            WireType::Spectrum,
         ],
     )?;
     Ok(format!(
@@ -151,8 +157,8 @@ pub fn definition_builds() -> Result<String, String> {
 
 pub fn wrong_wiring_names_adapters() -> Result<String, String> {
     let mut def = live_model_coarse()?;
-    def.stages.remove(2);
-    def.stages.remove(1);
+    def.stages
+        .retain(|s| s.name != "lpc" && s.name != "inverse");
     def.taps = vec!["yin".into(), "tract".into()];
     let err = match build(&def, def.format(Some(SR))) {
         Ok(_) => return Err("yin → tract built; it must be refused".into()),
@@ -268,6 +274,7 @@ pub fn inverse_round_trips_vowels() -> Result<String, String> {
         hz: 120.0,
         confidence: 0.9,
         voiced: true,
+        ..Default::default()
     };
     let mut names = Vec::new();
     for (name, q1, q2) in [("i", -5.10, 0.88), ("ɑ", 3.86, 1.35), ("u", -3.48, -1.70)] {
@@ -396,30 +403,34 @@ pub fn runner_reframes_and_tube_moves() -> Result<String, String> {
         shell.stats.tap_drops.load(Ordering::Relaxed),
         0,
     )?;
-    check("taps per hop", msgs.len() as u64, expected_hops * 4)?;
+    let n_taps = shell.stages.len() as u64;
+    check("taps per hop", msgs.len() as u64, expected_hops * n_taps)?;
     let mid_i = (SR as usize / format.hop / 2) as u64;
     let mid_a = expected_hops - mid_i;
-    let at = |hop: u64, stage: usize| -> Result<&Wire, String> {
+    let at = |hop: u64, stage: &str| -> Result<&Wire, String> {
         msgs.iter()
-            .find(|m| m.hop == hop && m.stage == stage)
+            .find(|m| m.hop == hop && &*m.stage_name == stage)
             .map(|m| &m.value)
             .ok_or_else(|| format!("no tap for hop {hop} stage {stage}"))
     };
-    let Wire::F0Track(f0) = at(mid_i, 0)? else {
-        return Err("tap 0 is not F0Track".into());
+    let Wire::F0Track(f0) = at(mid_i, "voicing")? else {
+        return Err("voicing tap is not F0Track".into());
     };
     if !(f0.voiced && (f0.hz - 120.0).abs() < 3.0) {
         return Err(format!("f0 tap on /i/: {f0:?}"));
     }
-    let (Wire::TractParams(tp_i), Wire::TractParams(tp_a)) = (at(mid_i, 2)?, at(mid_a, 2)?) else {
-        return Err("tap 2 is not TractParams".into());
+    let (Wire::TractParams(tp_i), Wire::TractParams(tp_a)) =
+        (at(mid_i, "inverse")?, at(mid_a, "inverse")?)
+    else {
+        return Err("inverse tap is not TractParams".into());
     };
     if !(tp_i.valid && tp_a.valid && tp_a.q1 > tp_i.q1) {
         return Err(format!("inverse on the two vowels: {tp_i:?} vs {tp_a:?}"));
     }
-    let (Wire::AreaFunction(af_i), Wire::AreaFunction(af_a)) = (at(mid_i, 3)?, at(mid_a, 3)?)
+    let (Wire::AreaFunction(af_i), Wire::AreaFunction(af_a)) =
+        (at(mid_i, "tract")?, at(mid_a, "tract")?)
     else {
-        return Err("tap 3 is not AreaFunction".into());
+        return Err("tract tap is not AreaFunction".into());
     };
     if !(af_i.live && af_a.live) || af_i.diameters_cm == af_a.diameters_cm {
         return Err("the tube did not move between the vowels".into());
