@@ -110,6 +110,9 @@ fn retire_previous_generation() {
         Ok(mut slot) => slot.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
+    if engine.is_some() {
+        crate::diagnostics::runtime::update_synthesizer_active(false);
+    }
     drop(engine);
 
     // The spatial (TV-path) capture thread holds its own AudioRecord; it
@@ -140,6 +143,18 @@ fn retire_previous_generation() {
 fn android_main(app: AndroidApp) {
     install_logger();
     log::info!("android_main: starting VoxLabs");
+
+    // The Engineering Console's session log lives in the app's private
+    // files dir; open it first so everything below can report into it.
+    if let Some(files) = app.internal_data_path() {
+        match crate::diagnostics::runtime::initialize(&files) {
+            Ok(()) => crate::diagnostics::install_panic_hook(),
+            Err(e) => log::error!("diagnostics store did not open: {e}"),
+        }
+    }
+    crate::diagnostics::runtime::update_renderer_mode(
+        crate::diagnostics::runtime::renderer_mode_name(),
+    );
 
     // Before anything is constructed: whatever a previous launch left running
     // in this process must be gone. See the module docs on re-entry.
@@ -337,6 +352,7 @@ fn start_audio_when_permitted(
     if crate::permission::has_record_audio() {
         telemetry.set_mic_permission(MicPermission::Granted);
         telemetry.set_mic_request(MicRequest::NotNeeded);
+        crate::diagnostics::runtime::update_microphone_granted(true);
         log::info!("RECORD_AUDIO already granted; opening audio");
         open_audio(
             profile_rx,
@@ -351,6 +367,7 @@ fn start_audio_when_permitted(
     }
     telemetry.set_mic_permission(MicPermission::NotGranted);
     telemetry.set_audio_unavailable(true);
+    crate::diagnostics::runtime::update_microphone_granted(false);
     log::info!("RECORD_AUDIO not granted yet; asking the user");
     if crate::permission::request_record_audio() {
         telemetry.set_mic_request(MicRequest::Raised);
@@ -366,6 +383,7 @@ fn start_audio_when_permitted(
             thread::sleep(PERMISSION_POLL);
             if crate::permission::has_record_audio() {
                 telemetry.set_mic_permission(MicPermission::Granted);
+                crate::diagnostics::runtime::update_microphone_granted(true);
                 log::info!("RECORD_AUDIO granted; opening audio");
                 open_audio(
                     profile_rx,
@@ -430,11 +448,13 @@ fn open_audio(
                 return;
             }
             telemetry.set_audio_unavailable(false);
+            crate::diagnostics::runtime::update_synthesizer_active(true);
             log::info!("audio engine running");
         }
         Err(e) => {
             log::error!("audio engine failed to start: {e:?}; UI will run without audio");
             telemetry.set_audio_unavailable(true);
+            crate::diagnostics::runtime::update_synthesizer_active(false);
         }
     }
 }
@@ -494,6 +514,12 @@ impl HopObserver for LegacyTail {
                             cal.ambient_rms,
                             cal.interferer.map(|i| (i.f0_hz, i.rms)),
                         )));
+                        crate::diagnostics::runtime::record_calibration(
+                            crate::diagnostics::room_calibration_report(
+                                cal.ambient_rms,
+                                cal.interferer.map(|i| i.f0_hz),
+                            ),
+                        );
                         log::info!(
                             "room calibrated: ambient rms {:.5}, interferer {:?}",
                             cal.ambient_rms,

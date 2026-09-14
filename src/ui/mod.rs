@@ -122,6 +122,9 @@ enum Screen {
     /// Everything DETERMINISTIC about the space lives here — fans, HVAC, the
     /// TV's hardware hum. Program audio is out of scope by design.
     Room,
+    /// The Engineering Console (see `diagnostics`), opened from the
+    /// DIAGNOSTICS chip in every header; not in the tab bar.
+    Diagnostics,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -312,6 +315,8 @@ pub struct DashboardApp {
     /// (Android; see `pipeline_panel`). None on desktop until Phase 5c.
     #[cfg(not(target_arch = "wasm32"))]
     pipeline: Option<pipeline_panel::PipelineShell>,
+    /// Engineering Console state (see `diagnostics`).
+    console: diagnostics::Console,
 }
 
 impl eframe::App for DashboardApp {
@@ -341,6 +346,7 @@ impl eframe::App for DashboardApp {
         } else {
             self.ingest_profile(live, fresh);
         }
+        self.feed_diagnostics();
         // Display smoothing for the digit readouts; reset when the value goes
         // away so stale numbers never linger.
         let smooth = |disp: &mut Option<f32>, v: Option<f32>| match (disp.as_mut(), v) {
@@ -395,6 +401,9 @@ impl eframe::App for DashboardApp {
                     // Android renders edge-to-edge under the system bars and
                     // eframe exposes no safe-area insets, so pad past them.
                     ui.add_space(TOP_INSET);
+                    // The overlay line and the DIAGNOSTICS chip, above
+                    // every screen but the console itself.
+                    self.console_header(ui);
                     // Engine health (analysis unavailable/stopped/stalled, cpal
                     // stream errors) is live state, so this banner is not
                     // dismissible — it clears itself when the condition does.
@@ -416,6 +425,7 @@ impl eframe::App for DashboardApp {
                         Screen::Sessions => self.screen_sessions(ui),
                         Screen::Detail => self.screen_detail(ui),
                         Screen::Room => self.screen_room(ui),
+                        Screen::Diagnostics => self.screen_diagnostics(ui, now),
                     }
                     // Clearance for the floating tab bar.
                     ui.add_space(104.0 + BOTTOM_INSET);

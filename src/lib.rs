@@ -40,7 +40,13 @@ pub mod audio_file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capture_log;
 mod concurrency;
-// In-app diagnostics log ring (Room → DIAGNOSTICS), for phones without adb.
+// The Engineering Console's back end (events, assistant, self-tests,
+// export): the diagnostics stack ported from Vocal Tract Lab. Native only
+// (it owns files).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod diagnostics;
+// Routes `log` warnings/errors into the diagnostics session log.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod diag;
 // Stage configuration: every tunable number, mirrored in pipeline.toml.
 pub mod config;
@@ -119,9 +125,24 @@ pub fn run() -> anyhow::Result<()> {
     use std::path::Path;
     use std::thread;
 
-    env_logger::init();
+    let logger = env_logger::Builder::from_default_env().build();
+    log::set_max_level(logger.filter());
+    let _ = log::set_boxed_logger(Box::new(diag::Tee { inner: logger }));
 
     println!("Starting Voice Harmonic Engine...");
+
+    // The Engineering Console's session log, beside the archive.
+    let store_path = persist::default_store_path();
+    if let Some(files) = store_path.as_ref().and_then(|p| p.parent()) {
+        match diagnostics::runtime::initialize(files) {
+            Ok(()) => diagnostics::install_panic_hook(),
+            Err(e) => log::error!("diagnostics store did not open: {e}"),
+        }
+    }
+    diagnostics::runtime::update_renderer_mode(diagnostics::runtime::renderer_mode_name());
+    // Desktop has no runtime permission model: the microphone is available
+    // whenever a device is.
+    diagnostics::runtime::update_microphone_granted(true);
 
     let bridges = ConcurrencyBridges::new();
     let profile_tx = bridges.profile_tx;
@@ -189,13 +210,13 @@ pub fn run() -> anyhow::Result<()> {
     )?;
 
     println!("Audio engine running. Starting GUI...");
+    diagnostics::runtime::update_synthesizer_active(true);
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1024.0, 768.0]),
         ..Default::default()
     };
 
-    let store_path = persist::default_store_path();
     // Raw captures and the import folder live beside the archive:
     // `<data dir>/VoxLabs/{captures,import}/`.
     let data_dir = store_path

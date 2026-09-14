@@ -67,7 +67,7 @@ impl DashboardApp {
         if self.telemetry.audio_unavailable() {
             return Some(
                 "Microphone unavailable — no input stream is open. If the permission \
-                 dialog did not appear or was dismissed: Room → DIAGNOSTICS → Open app \
+                 dialog did not appear or was dismissed: DIAGNOSTICS → Open app \
                  settings → Permissions → Microphone → Allow. Audio starts as soon as \
                  it is granted.",
             );

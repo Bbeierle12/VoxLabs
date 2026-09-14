@@ -20,14 +20,16 @@ const PERMISSION_GRANTED: i32 = 0;
 /// never delivers to us; any value works.
 const REQUEST_CODE: i32 = 1;
 
-struct JErr(String);
+pub(crate) struct JErr(pub(crate) String);
 impl From<jni::errors::Error> for JErr {
     fn from(e: jni::errors::Error) -> Self {
         JErr(format!("{e}"))
     }
 }
 
-fn with_activity<T>(f: impl FnOnce(&mut Env, &JObject) -> Result<T, JErr>) -> Result<T, String> {
+pub(crate) fn with_activity<T>(
+    f: impl FnOnce(&mut Env, &JObject) -> Result<T, JErr>,
+) -> Result<T, String> {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
     let activity_ptr = ctx.context();

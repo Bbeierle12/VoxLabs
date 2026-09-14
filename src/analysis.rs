@@ -360,6 +360,12 @@ impl AnalysisEngine {
                             cal.ambient_rms,
                             cal.interferer.map(|i| (i.f0_hz, i.rms)),
                         )));
+                        crate::diagnostics::runtime::record_calibration(
+                            crate::diagnostics::room_calibration_report(
+                                cal.ambient_rms,
+                                cal.interferer.map(|i| i.f0_hz),
+                            ),
+                        );
                         log::info!(
                             "room calibrated: ambient rms {:.5}, interferer {:?}",
                             cal.ambient_rms,

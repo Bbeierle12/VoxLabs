@@ -22,6 +22,7 @@
 
 pub mod consts;
 pub mod contour;
+pub mod diagnostics;
 pub mod fach;
 pub mod formants;
 pub mod harmonics;
@@ -34,6 +35,7 @@ pub mod tract;
 pub mod voiceprint;
 
 pub use contour::VibratoConfig;
+pub use diagnostics::DiagnosticsConfig;
 pub use fach::FachConfig;
 pub use formants::{FormantConfig, LpcConfig};
 pub use harmonics::{
@@ -78,6 +80,7 @@ pub struct PipelineParams {
     pub spatial: SpatialConfig,
     pub tract: TractConfig,
     pub inverse: InverseConfig,
+    pub diagnostics: DiagnosticsConfig,
 }
 
 impl PipelineParams {
@@ -107,6 +110,7 @@ impl PipelineParams {
         spatial: SpatialConfig::DEFAULT,
         tract: TractConfig::DEFAULT,
         inverse: InverseConfig::DEFAULT,
+        diagnostics: DiagnosticsConfig::DEFAULT,
     };
 
     /// The repository's `pipeline.toml`, compiled in so every target — the
@@ -275,6 +279,10 @@ pub fn all_sections() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
         (SpatialConfig::SECTION, SpatialConfig::DEFAULT.entries()),
         (TractConfig::SECTION, TractConfig::DEFAULT.entries()),
         (InverseConfig::SECTION, InverseConfig::DEFAULT.entries()),
+        (
+            DiagnosticsConfig::SECTION,
+            DiagnosticsConfig::DEFAULT.entries(),
+        ),
     ]
 }
 
