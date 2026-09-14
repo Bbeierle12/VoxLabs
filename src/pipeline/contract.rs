@@ -46,7 +46,7 @@ pub fn live_model_coarse() -> Result<PipelineDefinition, String> {
     PipelineDefinition::from_toml(&text).map_err(|e| e.to_string())
 }
 
-fn fmt() -> StreamFormat {
+pub(crate) fn fmt() -> StreamFormat {
     StreamFormat {
         sample_rate_hz: SR,
         frame_samples: ANALYSIS_FRAME,
@@ -97,7 +97,11 @@ fn sawtooth_like(f0: f32, n: usize) -> Vec<f32> {
         .collect()
 }
 
-fn check<T: PartialEq + std::fmt::Debug>(what: &str, got: T, want: T) -> Result<(), String> {
+pub(crate) fn check<T: PartialEq + std::fmt::Debug>(
+    what: &str,
+    got: T,
+    want: T,
+) -> Result<(), String> {
     if got == want {
         Ok(())
     } else {
@@ -118,367 +122,35 @@ pub fn run_all() -> Vec<(&'static str, Result<String, String>)> {
             "runner_reframes_and_tube_moves",
             runner_reframes_and_tube_moves(),
         ),
-        ("atlas_data_files_verify", atlas_data_files_verify()),
-        ("posterior_matches_reference", posterior_matches_reference()),
-        ("lumen_mesh_morphs", lumen_mesh_morphs()),
-        ("atlas_mode_runs_a_vowel", atlas_mode_runs_a_vowel()),
-        ("choir_stft_matches_librosa", choir_stft_matches_librosa()),
-        ("choir_detects_a_close_triad", choir_detects_a_close_triad()),
-        ("choir_harmony_hears_c_major", choir_harmony_hears_c_major()),
+        (
+            "atlas_data_files_verify",
+            super::contract_atlas::atlas_data_files_verify(),
+        ),
+        (
+            "posterior_matches_reference",
+            super::contract_atlas::posterior_matches_reference(),
+        ),
+        (
+            "lumen_mesh_morphs",
+            super::contract_atlas::lumen_mesh_morphs(),
+        ),
+        (
+            "atlas_mode_runs_a_vowel",
+            super::contract_atlas::atlas_mode_runs_a_vowel(),
+        ),
+        (
+            "choir_stft_matches_librosa",
+            super::contract_choir::choir_stft_matches_librosa(),
+        ),
+        (
+            "choir_detects_a_close_triad",
+            super::contract_choir::choir_detects_a_close_triad(),
+        ),
+        (
+            "choir_harmony_hears_c_major",
+            super::contract_choir::choir_harmony_hears_c_major(),
+        ),
     ]
-}
-
-/// Phase 4: Coral's STFT reproduces librosa on the 48 kHz oracle fixture
-/// within Coral's cross-implementation tier (rtol 1e-4, atol 1e-7, bin 0
-/// excluded as Coral excludes it).
-pub fn choir_stft_matches_librosa() -> Result<String, String> {
-    use crate::choir::stft::CoralStft;
-    #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Oracle {
-        fft_size: usize,
-        hop_size: usize,
-        num_bins: usize,
-        frames: usize,
-        samples: Vec<f32>,
-        expected_magnitudes: Vec<Vec<f32>>,
-    }
-    const TEXT: &str =
-        include_str!("../../apps/coral/src/audio/__fixtures__/oracle/sine-bin100-48k-2048.json");
-    let fx: Oracle = serde_json::from_str(TEXT).map_err(|e| e.to_string())?;
-    let mut stft = CoralStft::new(fx.fft_size)?;
-    let mut got = vec![0.0f32; fx.num_bins];
-    let (rtol, atol) = (1e-4f32, 1e-7f32);
-    let mut max_rel = 0.0f32;
-    let mut frames = 0;
-    let mut start = 0;
-    while start + fx.fft_size <= fx.samples.len() {
-        stft.magnitudes(&fx.samples[start..start + fx.fft_size], &mut got)?;
-        let exp = &fx.expected_magnitudes[frames];
-        for b in 1..fx.num_bins {
-            let err = (got[b] - exp[b]).abs();
-            if err > atol + rtol * exp[b].abs() {
-                return Err(format!(
-                    "frame {frames} bin {b}: got {}, librosa {}",
-                    got[b], exp[b]
-                ));
-            }
-            if exp[b].abs() > atol / rtol {
-                max_rel = max_rel.max(err / exp[b].abs());
-            }
-        }
-        frames += 1;
-        start += fx.hop_size;
-    }
-    check("frames", frames, fx.frames)?;
-    Ok(format!(
-        "{frames} frames · max rel {max_rel:.2e} (tier 1e-4)"
-    ))
-}
-
-fn choir_last_frame(
-    voices: &[(crate::choir::labeler::Section, i32)],
-    secs: f64,
-    seed: u32,
-    sr: f32,
-    one_clean_singer_per_part: bool,
-) -> Result<
-    (
-        crate::pipeline::types::NoteSet,
-        crate::choir::cards::HarmonyResult,
-    ),
-    String,
-> {
-    use super::offline::run_offline;
-    use crate::choir::harmony::HarmonyConfig;
-    use crate::choir::pipeline::ChoirHarmony;
-    use crate::choir::synth::{ChordSpec, VoiceSpec, synthesize_choir_chord};
-    let mut spec = ChordSpec::new(
-        f64::from(sr),
-        secs,
-        voices
-            .iter()
-            .map(|&(s, m)| {
-                let mut v = VoiceSpec::new(s, m);
-                if one_clean_singer_per_part {
-                    v.singers = 1;
-                    v.detune_cents = 0.0;
-                    v.vibrato_cents = 0.0;
-                }
-                v
-            })
-            .collect(),
-    );
-    spec.seed = seed;
-    let samples = synthesize_choir_chord(&spec)?.samples;
-    let def = PipelineDefinition::by_name_or_path("choir").map_err(|e| e.to_string())?;
-    let p = PipelineParams::DEFAULT;
-    let mut harmony = ChoirHarmony::new(HarmonyConfig::default(), p.choir_harmony, p.choir_stft);
-    let (hop, frame) = (def.format.hop, def.format.frame_samples);
-    let mut last = None;
-    run_offline(&def, sr, &samples, |h| {
-        if let (Some(Wire::Spectrum(s)), Some(Wire::NoteSet(n)), Some(Wire::SectionLabels(l))) =
-            (h.wires.get(1), h.wires.get(3), h.wires.get(4))
-        {
-            let now_ms = (h.hop as usize * hop + frame) as f32 / sr * 1000.0;
-            let r = harmony.feed(s, n, l, now_ms);
-            last = Some((n.clone(), r));
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    last.ok_or_else(|| "the choir mode produced no frames".into())
-}
-
-/// Phase 4: Coral's calibrated contract — a close-voiced C–E–G triad is
-/// recovered exactly by the multi-F0 stage.
-pub fn choir_detects_a_close_triad() -> Result<String, String> {
-    use crate::choir::labeler::Section;
-    let (notes, _) = choir_last_frame(
-        &[(Section::B, 60), (Section::T, 64), (Section::A, 67)],
-        0.4,
-        7,
-        SR,
-        false,
-    )?;
-    check("active notes", notes.active_midi.clone(), vec![60, 64, 67])?;
-    Ok(format!(
-        "{:?} · voices {:?}",
-        notes.active_midi,
-        notes.voices.iter().map(|v| v.midi).collect::<Vec<_>>()
-    ))
-}
-
-/// Phase 4: the rehearsal harmony over the taps hears a settled C major
-/// with four voices on their sections (one clean singer per part, as
-/// Coral's own through-the-pipeline test sings it).
-pub fn choir_harmony_hears_c_major() -> Result<String, String> {
-    use crate::choir::labeler::Section;
-    let (_, r) = choir_last_frame(
-        &[
-            (Section::B, 48),
-            (Section::T, 55),
-            (Section::A, 64),
-            (Section::S, 72),
-        ],
-        1.5,
-        3,
-        SR,
-        true,
-    )?;
-    let id = r.id.ok_or("no chord")?;
-    check("chord", (id.chord.name, id.root), ("Major", 0))?;
-    check("settled", r.settled, true)?;
-    check(
-        "voices",
-        r.voices.iter().map(|v| v.info.midi).collect::<Vec<_>>(),
-        vec![48, 55, 64, 72],
-    )?;
-    Ok(format!(
-        "{} {} · consonance {:?} · held {:.0} ms · {}",
-        crate::choir::harmony::NOTE_NAMES[id.root],
-        id.chord.name,
-        r.cons,
-        r.chord_held_ms,
-        r.voices
-            .iter()
-            .map(|v| format!(
-                "{}{} {:+.1}c",
-                v.section.letter(),
-                v.info.midi,
-                v.info.cents
-            ))
-            .collect::<Vec<_>>()
-            .join(" ")
-    ))
-}
-
-/// Phase 3: both compiled-in data files load under their recorded digests
-/// and say what the JSON says about themselves.
-pub fn atlas_data_files_verify() -> Result<String, String> {
-    let m = crate::atlas::reduced_model::shared()?;
-    let l = crate::atlas::lumen::shared()?;
-    check(
-        "model id",
-        m.model_id.as_str(),
-        "vt3d-frozen-mri-pca-v0.7.0",
-    )?;
-    check("modes × sections", (m.n_modes(), m.n_sections()), (4, 32))?;
-    check(
-        "mesh",
-        (l.sections, l.angular, l.vertex_count),
-        (32, 24, 770),
-    )?;
-    check(
-        "renderer digest in JSON",
-        m.atlas.renderer_lumen_sha256.as_str(),
-        crate::atlas::lumen::SHA256,
-    )?;
-    check(
-        "scientific_release_ready",
-        m.atlas.scientific_release_ready,
-        false,
-    )?;
-    Ok(format!(
-        "{} · {} subjects · release-ready {} · acceptances {}",
-        m.model_id,
-        m.atlas.subjects,
-        m.atlas.scientific_release_ready,
-        m.atlas.independent_expert_acceptances
-    ))
-}
-
-/// Phase 3: the posterior stage on a strong frame equals the decompiled
-/// formulas (clamped linear map, follow rate, confidence, uncertainty).
-pub fn posterior_matches_reference() -> Result<String, String> {
-    use super::stages::posterior::PosteriorInverseStage;
-    use crate::config::PosteriorConfig;
-    use crate::types::VoiceMetrics;
-    let mut s =
-        PosteriorInverseStage::init(&PipelineParams::DEFAULT, &fmt()).map_err(|e| e.to_string())?;
-    let f0 = F0Track {
-        hz: 120.0,
-        confidence: 0.95,
-        voiced: true,
-        snr_db: Some(30.0),
-        rejected: false,
-    };
-    let vm = VoiceMetrics {
-        hnr_db: Some(25.0),
-        ..Default::default()
-    };
-    let ft = FormantTrack {
-        formants: [816.0f32, 2022.0, 3174.0].map(|frequency| Formant {
-            frequency,
-            bandwidth: 80.0,
-        }),
-        measured_f0: 120.0,
-        confidence: 1.0,
-        fresh: true,
-        f4: None,
-    };
-    let mut out = TractParams::default();
-    s.process((&f0, &ft, &vm), &mut out)
-        .map_err(|e| e.to_string())?;
-    let m = crate::atlas::reduced_model::shared()?;
-    let cfg = PosteriorConfig::DEFAULT;
-    let e = PosteriorInverseStage::evidence(&cfg, &f0, &vm, true);
-    let alpha = (cfg.filter_alpha_gain * e + cfg.filter_alpha_offset)
-        .clamp(cfg.filter_alpha_min, cfg.filter_alpha_max);
-    for i in 0..4 {
-        let raw: f32 = (0..3)
-            .map(|j| {
-                m.formant_to_mode[i][j] * (ft.formants[j].frequency - m.reference_formants_hz[j])
-            })
-            .sum::<f32>()
-            .clamp(-2.0, 2.0);
-        let want = (raw * alpha).clamp(-2.0, 2.0);
-        if (out.modes[i] - want).abs() > 1e-5 {
-            return Err(format!("mode {i}: got {}, expected {want}", out.modes[i]));
-        }
-    }
-    let conf = e * cfg.confidence_follow;
-    check("abstained", out.abstained, false)?;
-    if (out.confidence.unwrap_or(-1.0) - conf).abs() > 1e-5 {
-        return Err(format!("confidence {:?} vs {conf}", out.confidence));
-    }
-    let unc = (1.0 - conf) * cfg.area_std_gain + cfg.area_std_offset;
-    if (out.uncertainty.unwrap_or(-1.0) - unc).abs() > 1e-5 {
-        return Err(format!("uncertainty {:?} vs {unc}", out.uncertainty));
-    }
-    Ok(format!(
-        "evidence {e:.3} · α {alpha:.3} · modes {:+.3} {:+.3} {:+.3} {:+.3} · conf {conf:.3}",
-        out.modes[0], out.modes[1], out.modes[2], out.modes[3]
-    ))
-}
-
-/// Phase 3: the lumen morphed at its reference areas is the stored mesh.
-pub fn lumen_mesh_morphs() -> Result<String, String> {
-    let l = crate::atlas::lumen::shared()?;
-    let mut v = vec![0.0f32; l.vertex_count * 3];
-    l.morph_into(&l.reference_area_cm2, &mut v)?;
-    let mut worst = 0.0f32;
-    for s in 0..l.sections {
-        for i in 0..l.angular {
-            let idx = (s * l.angular + i) * 3;
-            for k in 0..3 {
-                let want = l.centerline_mm[s * 3 + k] + l.ring_offsets_mm[idx + k];
-                worst = worst.max((v[idx + k] - want).abs());
-            }
-        }
-    }
-    if worst > 0.0 {
-        return Err(format!("morph at reference differs by {worst} mm"));
-    }
-    let mut n = vec![0.0f32; v.len()];
-    crate::atlas::lumen::vertex_normals_into(&v, &l.triangle_indices, &mut n)?;
-    let bad = n
-        .chunks_exact(3)
-        .filter(|c| ((c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() - 1.0).abs() > 1e-3)
-        .count();
-    check("non-unit normals", bad, 0)?;
-    Ok(format!(
-        "{} vertices · {} triangles · centerline {:.1} mm",
-        l.vertex_count,
-        l.triangle_indices.len() / 3,
-        l.centerline_length_mm()
-    ))
-}
-
-/// Phase 3: the atlas mode builds and, on a synthetic vowel, stops
-/// abstaining, shapes a live area function and meshes it finitely.
-pub fn atlas_mode_runs_a_vowel() -> Result<String, String> {
-    use super::offline::run_offline;
-    crate::room::reset();
-    let def = PipelineDefinition::by_name_or_path("atlas").map_err(|e| e.to_string())?;
-    let signal = vowel(120.0, 3.86, 1.35, SR as usize);
-    let idx = |name: &str| {
-        def.stages
-            .iter()
-            .position(|s| s.name == name)
-            .map(|i| i + 1)
-    };
-    let (i_inv, i_tract, i_mesh) = (
-        idx("inverse").unwrap(),
-        idx("tract").unwrap(),
-        idx("mesh").unwrap(),
-    );
-    let mut evidence_hops = 0u64;
-    let mut live_meshes = 0u64;
-    let mut last = None;
-    let mut finite = true;
-    let (_, hops) = run_offline(&def, SR, &signal, |h| {
-        if let (
-            Some(Wire::TractParams(p)),
-            Some(Wire::AreaFunction(a)),
-            Some(Wire::TractGeometry(g)),
-        ) = (
-            h.wires.get(i_inv),
-            h.wires.get(i_tract),
-            h.wires.get(i_mesh),
-        ) {
-            if !p.abstained {
-                evidence_hops += 1;
-            }
-            if g.live && a.live {
-                live_meshes += 1;
-            }
-            finite &= g.vertices_mm.iter().all(|v| v.is_finite())
-                && a.areas_cm2[..32].iter().all(|v| v.is_finite() && *v > 0.0);
-            last = Some(*p);
-        }
-    })
-    .map_err(|e| e.to_string())?;
-    check("finite geometry", finite, true)?;
-    if evidence_hops == 0 {
-        return Err(format!(
-            "the posterior abstained on all {hops} hops: {last:?}"
-        ));
-    }
-    check("live meshes = evidence hops", live_meshes, evidence_hops)?;
-    Ok(format!(
-        "{hops} hops · {evidence_hops} with evidence · last {:?}",
-        last.map(|p| (p.modes, p.confidence, p.reason))
-    ))
 }
 
 pub fn definition_builds() -> Result<String, String> {

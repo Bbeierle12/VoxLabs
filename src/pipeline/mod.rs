@@ -41,6 +41,10 @@ pub mod runner;
 // self-test run the same bodies.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod contract;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod contract_atlas;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod contract_choir;
 
 #[cfg(test)]
 mod tests;

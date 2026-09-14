@@ -22,12 +22,12 @@ pub struct DetectorOptions {
     pub cfg: ChoirDetectorConfig,
 }
 
-struct Accepted {
-    i: usize,
+pub(super) struct Accepted {
+    pub(super) i: usize,
     /// Raw-spectrum partial levels, dB, k = 1..=Kc (None where absent).
-    parts: Vec<Option<f32>>,
+    pub(super) parts: Vec<Option<f32>>,
     /// Cached envelope fits per excluded harmonic number k0: (intercept, slope).
-    fits: Vec<Option<(f32, f32)>>,
+    pub(super) fits: Vec<Option<(f32, f32)>>,
 }
 
 pub struct NoteDetector {
@@ -35,15 +35,15 @@ pub struct NoteDetector {
     pub midi_max: i32,
     pub note_count: usize,
     pub harmonic: bool,
-    cfg: ChoirDetectorConfig,
+    pub(super) cfg: ChoirDetectorConfig,
     num_bins: usize,
     threshold_linear: f32,
     whitening_window_bins: usize,
-    bin_stride: usize,
+    pub(super) bin_stride: usize,
     /// (lo, hi) per note; hi < lo = skip.
     bin_ranges: Vec<(i64, i64)>,
     energy: Vec<f32>,
-    harmonic_bins: Vec<(i64, i64)>,
+    pub(super) harmonic_bins: Vec<(i64, i64)>,
     harmonic_weights: Vec<f32>,
     note_weight_norm: Vec<f32>,
     whitened: Vec<f32>,
@@ -51,7 +51,7 @@ pub struct NoteDetector {
     residual: Vec<f32>,
     frame_salience: Vec<f32>,
     cancel_amps: Vec<f32>,
-    accepted: Vec<Accepted>,
+    pub(super) accepted: Vec<Accepted>,
     explained: Vec<bool>,
     active: Vec<i32>,
     merged: Vec<i32>,
@@ -369,166 +369,6 @@ impl NoteDetector {
         &self.merged
     }
 
-    fn record_accepted(&mut self, slot: usize, i: usize, mags: &[f32]) {
-        let k_max = self.cfg.cancel_harmonic_count.min(self.bin_stride);
-        let mut parts = std::mem::take(&mut self.accepted[slot].parts);
-        parts.clear();
-        for k in 1..=k_max {
-            let d = self.partial_db(i, k, mags);
-            parts.push(d.filter(|&d| d > self.cfg.partial_floor_db));
-        }
-        let a = &mut self.accepted[slot];
-        a.i = i;
-        a.parts = parts;
-        a.fits.iter_mut().for_each(|f| *f = None);
-    }
-
-    /// Peak level (dB) of note i's k-th harmonic band on the raw spectrum.
-    fn partial_db(&self, i: usize, k: usize, mags: &[f32]) -> Option<f32> {
-        if k < 1 || k > self.bin_stride {
-            return None;
-        }
-        let (lo, hi) = self.harmonic_bins[i * self.bin_stride + (k - 1)];
-        if hi < lo {
-            return None;
-        }
-        let peak = peak_in(mags, lo, hi);
-        if peak <= 0.0 {
-            None
-        } else {
-            Some(20.0 * peak.log10())
-        }
-    }
-
-    fn fit_envelope_excluding(&self, parts: &[Option<f32>], k0: usize) -> (f32, f32) {
-        let c = &self.cfg;
-        let mut pts: Vec<(f32, f32)> = parts
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, d)| {
-                let k = idx + 1;
-                match d {
-                    Some(d) if k % k0 != 0 => Some(((k as f32).log2(), *d)),
-                    _ => None,
-                }
-            })
-            .collect();
-        let fit = |p: &[(f32, f32)]| -> (f32, f32) {
-            let m = p.len();
-            if m == 0 {
-                return (c.fit_default_intercept, c.fit_default_slope);
-            }
-            if m == 1 {
-                return (p[0].1, c.fit_default_slope);
-            }
-            let (mut sx, mut sy, mut sxx, mut sxy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for &(x, y) in p {
-                sx += x;
-                sy += y;
-                sxx += x * x;
-                sxy += x * y;
-            }
-            let den = m as f32 * sxx - sx * sx;
-            let slope = if den != 0.0 {
-                (m as f32 * sxy - sx * sy) / den
-            } else {
-                c.fit_default_slope
-            };
-            let sl = slope.min(0.0);
-            ((sy - sl * sx) / m as f32, sl)
-        };
-        let mut f = fit(&pts);
-        for _ in 0..2 {
-            if pts.len() <= 2 {
-                break;
-            }
-            let keep: Vec<(f32, f32)> = pts
-                .iter()
-                .copied()
-                .filter(|&(x, y)| y - (f.0 + f.1 * x) <= c.fit_outlier_db)
-                .collect();
-            if keep.len() == pts.len() || keep.len() < 2 {
-                break;
-            }
-            pts = keep;
-            f = fit(&pts);
-        }
-        f
-    }
-
-    fn prior_db(&self, k: usize) -> f32 {
-        match k {
-            2 => self.cfg.prior_h2_db,
-            3 => self.cfg.prior_h3_db,
-            _ => f32::NEG_INFINITY,
-        }
-    }
-
-    fn explained_by_parent(
-        &mut self,
-        i: usize,
-        n_accepted: usize,
-        margin: f32,
-        mags: &[f32],
-    ) -> bool {
-        let slots: Vec<usize> = (0..n_accepted).collect();
-        self.explained_by_parent_among(i, &slots, margin, mags)
-    }
-
-    fn explained_by_parent_among(
-        &mut self,
-        i: usize,
-        slots: &[usize],
-        margin: f32,
-        mags: &[f32],
-    ) -> bool {
-        let midi = self.midi_min + i as i32;
-        for &slot in slots {
-            let pm = self.midi_min + self.accepted[slot].i as i32;
-            let semis = midi - pm;
-            if semis <= 0 {
-                continue;
-            }
-            let ratio = 2f32.powf(semis as f32 / 12.0);
-            let k = ratio.round() as usize;
-            if k < self.cfg.family_k_min || k > self.cfg.family_k_max {
-                continue;
-            }
-            if (1200.0 * (ratio / k as f32).log2()).abs() > self.cfg.family_cents {
-                continue;
-            }
-            let Some(h1) = self.accepted[slot].parts.first().copied().flatten() else {
-                continue;
-            };
-            let fit = match self.accepted[slot].fits[k] {
-                Some(f) => f,
-                None => {
-                    let f = self.fit_envelope_excluding(&self.accepted[slot].parts, k);
-                    self.accepted[slot].fits[k] = Some(f);
-                    f
-                }
-            };
-            let env = |kk: usize| -> f32 {
-                (fit.0 + fit.1 * (kk as f32).log2()).max(h1 + self.prior_db(kk))
-            };
-            let mut excess: Vec<f32> = Vec::with_capacity(3);
-            for m in 1..=3 {
-                if let Some(own) = self.partial_db(i, m, mags) {
-                    excess.push(own - env(k * m));
-                }
-            }
-            if excess.is_empty() {
-                continue;
-            }
-            let mean = excess.iter().sum::<f32>() / excess.len() as f32;
-            let independent = excess[0] >= margin && mean >= margin;
-            if !independent {
-                return true;
-            }
-        }
-        false
-    }
-
     fn has_fundamental_support(&self, i: usize, floor: f32) -> bool {
         let (lo, hi) = self.harmonic_bins[i * self.bin_stride];
         (lo..=hi).any(|b| self.whitened[b as usize] > floor)
@@ -635,7 +475,7 @@ impl NoteDetector {
     }
 }
 
-fn peak_in(spec: &[f32], lo: i64, hi: i64) -> f32 {
+pub(super) fn peak_in(spec: &[f32], lo: i64, hi: i64) -> f32 {
     let mut peak = 0.0f32;
     let mut b = lo;
     while b <= hi {
@@ -649,176 +489,5 @@ fn peak_in(spec: &[f32], lo: i64, hi: i64) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const SR: f32 = 44_100.0;
-    const NUM_BINS: usize = 1024;
-    const BIN_HZ: f32 = SR / (2.0 * NUM_BINS as f32);
-
-    fn opts(harmonic: bool) -> DetectorOptions {
-        DetectorOptions {
-            num_bins: NUM_BINS,
-            sample_rate: SR,
-            min_freq_hz: 50.0,
-            max_freq_hz: 8000.0,
-            harmonic,
-            cfg: ChoirDetectorConfig::DEFAULT,
-        }
-    }
-
-    fn spike(bin: usize, v: f32) -> Vec<f32> {
-        let mut m = vec![0.0; NUM_BINS];
-        m[bin] = v;
-        m
-    }
-
-    fn harmonic_stack(f0: f32, count: usize) -> Vec<f32> {
-        let mut m = vec![0.0; NUM_BINS];
-        for k in 1..=count {
-            let bin = ((k as f32 * f0) / BIN_HZ).round() as usize;
-            if bin < NUM_BINS {
-                m[bin] = 1.0 / k as f32;
-            }
-        }
-        m
-    }
-
-    /// Coral's `note-detector.test.ts`, legacy path.
-    #[test]
-    fn legacy_bands_thresholds_polyphony_decay_and_reset() {
-        let d = NoteDetector::new(opts(false)).unwrap();
-        assert!(d.midi_min <= 69 && d.midi_max >= 69);
-        let (lo, hi) = d.bin_range_for_midi(69).unwrap();
-        let a4_bin = (440.0 / BIN_HZ).round() as i64;
-        assert!(lo <= a4_bin && a4_bin <= hi);
-        let half = 2f32.powf(1.0 / 24.0);
-        for midi in [60, 69, 72, 96] {
-            let f = 440.0 * 2f32.powf((midi - 69) as f32 / 12.0);
-            let want_lo = ((f / half / BIN_HZ).floor() as i64).max(0);
-            let want_hi = ((f * half / BIN_HZ).ceil() as i64).min(NUM_BINS as i64 - 1);
-            assert_eq!(d.bin_range_for_midi(midi), Some((want_lo, want_hi)));
-        }
-        let narrow = NoteDetector::new(DetectorOptions {
-            min_freq_hz: 200.0,
-            max_freq_hz: 2000.0,
-            ..opts(false)
-        })
-        .unwrap();
-        assert!(narrow.bin_range_for_midi(45).is_none());
-        assert!(narrow.bin_range_for_midi(93).is_some());
-        let mut d = NoteDetector::new(opts(false)).unwrap();
-        assert!(d.analyze(&vec![0.0; NUM_BINS]).unwrap().is_empty());
-        let mut above = NoteDetector::new(opts(false)).unwrap();
-        assert!(
-            above
-                .analyze(&spike(97, 10f32.powf(-49.5 / 20.0)))
-                .unwrap()
-                .contains(&96)
-        );
-        let mut below = NoteDetector::new(opts(false)).unwrap();
-        assert!(
-            !below
-                .analyze(&spike(97, 10f32.powf(-50.5 / 20.0)))
-                .unwrap()
-                .contains(&96)
-        );
-        let mut d = NoteDetector::new(opts(false)).unwrap();
-        let a = d.analyze(&spike(97, 1.0)).unwrap().to_vec();
-        assert!(a.contains(&96) && !a.contains(&95) && !a.contains(&97));
-        let mut m = vec![0.0; NUM_BINS];
-        m[97] = 1.0;
-        m[122] = 1.0;
-        m[145] = 1.0;
-        let mut d = NoteDetector::new(opts(false)).unwrap();
-        let a = d.analyze(&m).unwrap().to_vec();
-        for n in [96, 100, 103] {
-            assert!(a.contains(&n), "{a:?}");
-        }
-        let mut d = NoteDetector::new(opts(false)).unwrap();
-        d.analyze(&spike(97, 0.5)).unwrap();
-        let silent = vec![0.0; NUM_BINS];
-        let mut frames = 0;
-        while frames < 200 {
-            if !d.analyze(&silent).unwrap().contains(&96) {
-                break;
-            }
-            frames += 1;
-        }
-        assert!(frames > 55 && frames < 70, "{frames}");
-        let mut d = NoteDetector::new(opts(false)).unwrap();
-        assert!(d.analyze(&spike(97, 1.0)).unwrap().contains(&96));
-        d.reset();
-        assert!(d.analyze(&silent).unwrap().is_empty());
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                num_bins: 0,
-                ..opts(false)
-            })
-            .is_err()
-        );
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                sample_rate: -1.0,
-                ..opts(false)
-            })
-            .is_err()
-        );
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                min_freq_hz: 0.0,
-                ..opts(false)
-            })
-            .is_err()
-        );
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                max_freq_hz: 50.0,
-                ..opts(false)
-            })
-            .is_err()
-        );
-        assert!(d.analyze(&[0.0; 5]).is_err());
-    }
-
-    /// Coral's `note-detector.test.ts`, harmonic path.
-    #[test]
-    fn harmonic_stack_reads_as_one_fundamental_and_flat_spectra_are_rejected() {
-        let mut d = NoteDetector::new(opts(true)).unwrap();
-        let a = d.analyze(&harmonic_stack(220.0, 7)).unwrap().to_vec();
-        assert!(a.contains(&57), "{a:?}");
-        assert!(!a.contains(&69), "{a:?}");
-        let conf = d.last_confidences();
-        assert_eq!(conf.iter().map(|c| c.0).collect::<Vec<_>>(), a);
-        assert!(conf.iter().all(|c| c.1 >= 1.0));
-        let flat = vec![0.5f32; NUM_BINS];
-        let mut legacy = NoteDetector::new(opts(false)).unwrap();
-        assert!(!legacy.analyze(&flat).unwrap().is_empty());
-        let mut harmonic = NoteDetector::new(opts(true)).unwrap();
-        assert!(harmonic.analyze(&flat).unwrap().is_empty());
-        assert!(legacy.harmonic_bins_for_midi(57).is_none());
-        let ranges = d.harmonic_bins_for_midi(57).unwrap();
-        assert_eq!(ranges.len(), 9);
-        assert_eq!(ranges[0], d.bin_range_for_midi(57).unwrap());
-        d.reset();
-        assert!(d.analyze(&vec![0.0; NUM_BINS]).unwrap().is_empty());
-        let bad = ChoirDetectorConfig {
-            harmonic_count: 0,
-            ..ChoirDetectorConfig::DEFAULT
-        };
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                cfg: bad,
-                ..opts(true)
-            })
-            .is_err()
-        );
-        assert!(
-            NoteDetector::new(DetectorOptions {
-                cfg: bad,
-                ..opts(false)
-            })
-            .is_ok()
-        );
-    }
-}
+#[path = "note_detector_tests.rs"]
+mod tests;

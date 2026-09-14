@@ -8,7 +8,9 @@
 //! wrap the kernels.
 
 pub mod cards;
+mod family;
 pub mod harmony;
+pub mod intervals;
 pub mod labeler;
 pub mod note_detector;
 pub mod pipeline;
