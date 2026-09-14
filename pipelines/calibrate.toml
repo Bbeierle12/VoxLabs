@@ -1,0 +1,40 @@
+# Calibrate — the room pass (Plan v3 §5 Phase 2).
+#
+# What the room calibrator consumes: the estimator's raw verdict (a
+# calibrating room with a voice in it must fail), the gated verdict with
+# the frame's SNR, and the spectrum for the persistent-tone view. The
+# calibrator itself (`math::RoomCalibrator`) accumulates over a pass and
+# is a consumer; its result reaches the `voicing` stage through the room
+# slot. The two-microphone spatial calibration (`SpatialCal`) stays a
+# native two-channel capture on Android and is not a single-channel stage.
+
+name = "calibrate"
+
+taps = ["yin", "voicing", "stft"]
+
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 2048
+hop = 1024
+
+[runner]
+poll_ms = 5
+tap_capacity = 256
+report_every_hops = 512
+hop_budget_fraction_max = 0.5
+mic_to_render_max_ms = 100
+init_timeout_ms = 4000
+legacy_frame_every_hops = 2
+pending_capacity_frames = 2
+
+[[stage]]
+name = "yin"
+backend = "yin_cpu"
+
+[[stage]]
+name = "voicing"
+backend = "snr_hum"
+
+[[stage]]
+name = "stft"
+backend = "rustfft"

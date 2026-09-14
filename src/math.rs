@@ -115,9 +115,19 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; N_FORMANTS]
         frequency: 0.0,
         bandwidth: 0.0,
     }; N_FORMANTS];
+    for (slot, f) in result.iter_mut().zip(formant_candidates(lpc, sample_rate)) {
+        *slot = f;
+    }
+    result
+}
 
+/// Every in-band, sharp-enough pole of the LPC polynomial, ascending in
+/// frequency — the list `formants_from_lpc` takes its first three from.
+/// The fourth entry, when present, is the F4 the posterior inverse's
+/// four-formant map wants.
+pub fn formant_candidates(lpc: &[f32], sample_rate: f32) -> Vec<Formant> {
     if lpc.len() < FORMANT.min_coefficients {
-        return result;
+        return Vec::new();
     }
 
     // Reverse (root in z, not z^-1) and promote to f64 for conditioning.
@@ -161,11 +171,7 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; N_FORMANTS]
             .partial_cmp(&b.frequency)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-
-    for (slot, f) in result.iter_mut().zip(formants) {
-        *slot = f;
-    }
-    result
+    formants
 }
 
 /// Computes a parabolic interpolation around the minimum lag `tau`.
@@ -294,31 +300,6 @@ pub fn yin_f0_from_diff(diff: &[f32], sample_rate: f32) -> Option<PitchEstimate>
         running += diff[tau];
         cmnd[tau] = if running > 0.0 {
             diff[tau] * tau as f32 / running
-        } else {
-            1.0
-        };
-    }
-    yin_pick(&cmnd, tau_min, tau_max, sample_rate)
-}
-
-/// YIN steps 2-4 using a GPU-computed **inclusive prefix sum** of `diff` as the
-/// CMND denominator. `cumsum[tau]` must equal `sum_{j=0..=tau} diff[j]`; since
-/// `diff[0] == 0` that equals `sum_{j=1..tau} diff[j]`, exactly the YIN
-/// denominator. This is the path where the cumulative sum runs as a parallel
-/// prefix-sum on the GPU rather than a serial loop on the CPU.
-pub fn yin_f0_from_diff_cumsum(
-    diff: &[f32],
-    cumsum: &[f32],
-    sample_rate: f32,
-) -> Option<PitchEstimate> {
-    let len = diff.len().min(cumsum.len());
-    let (tau_min, tau_max) = yin_bounds(len, sample_rate)?;
-
-    let mut cmnd = vec![1.0f32; tau_max + 1];
-    for tau in 1..=tau_max {
-        let denom = cumsum[tau];
-        cmnd[tau] = if denom > 0.0 {
-            diff[tau] * tau as f32 / denom
         } else {
             1.0
         };

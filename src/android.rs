@@ -7,17 +7,24 @@
 //! egui app the desktop and web targets use.
 //!
 //! Two deliberate de-risking choices for this first on-device build:
-//!   1. **CPU DSP only.** Analysis runs `math::yin_pitch` + LPC formants on the
-//!      CPU (see [`cpu_analysis_loop`]); it never constructs the wgpu `GpuYin`
-//!      compute path, so a missing/limited Vulkan driver can't break launch.
+//!   1. **CPU DSP only.** Analysis runs through the pipeline runner
+//!      (`pipeline::runner`, Plan v3): every kernel is a stage of the
+//!      mode file the phone last chose (`shell::engine`, default
+//!      `live_model.toml`), and the UI's profile, waterfall, scope, room
+//!      calibration and capture export are tap consumers on the hop hook
+//!      (`shell::consumers::WireConsumers`). No GPU compute path exists
+//!      any more (D15), so a missing or limited Vulkan driver can't break
+//!      launch.
 //!   2. **glow (GLES/EGL) renderer**, not wgpu/Vulkan — forced via
 //!      `NativeOptions.renderer`.
 //!
 //! Microphone capture needs the `RECORD_AUDIO` runtime permission. It is
-//! declared in the manifest, but Android only grants it once the user (or
-//! `adb shell pm grant`) approves it. Until then cpal's input stream fails to
-//! open; we treat that as non-fatal so the UI still launches (it just shows
-//! "SEARCHING"). See docs/android-build.md.
+//! declared in the manifest, but Android only grants it once the user
+//! approves it. The app asks at launch (`permission`), and
+//! [`start_audio_when_permitted`] opens the audio engine as soon as the
+//! grant lands — on the spot when it is already held, otherwise from a
+//! polling thread after the dialog. Until then the UI runs and says the
+//! microphone is unavailable. See docs/android-build.md.
 //!
 //! **Re-entry.** NativeActivity can call `android_main` again in the same
 //! process — an activity relaunch under "Don't keep activities", a task
@@ -31,57 +38,50 @@
 //! ≥ 0.31 (with real `Destroy` handling) lands in eframe.
 
 use crate::audio::AudioEngine;
-use crate::concurrency::{AnalysisState, ConcurrencyBridges, Telemetry};
+use crate::concurrency::{AnalysisState, ConcurrencyBridges, MicPermission, MicRequest, Telemetry};
+use crate::shell::consumers::WireConsumers;
+use crate::shell::engine::{self, LiveEngine};
 use crate::types::VocalProfile;
 use crate::ui::DashboardApp;
-use rtrb::Consumer;
-use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
-use triple_buffer::Input;
+use std::thread;
+use std::time::Duration;
 use winit::platform::android::activity::AndroidApp;
-
-use crate::frame::ANALYSIS_FRAME;
 
 /// Fallback microphone rate when the input device can't be queried yet (e.g.
 /// `RECORD_AUDIO` not granted at launch). 48 kHz is the near-universal Android
 /// capture rate.
 const FALLBACK_SAMPLE_RATE: f32 = 48_000.0;
 
-/// Idle sleep between ring-buffer drains on the analysis thread. Also the
-/// granularity at which it notices a shutdown request.
-const ANALYSIS_POLL_MS: u64 = 5;
-
-/// How long a new generation waits for the previous analysis thread to finish
-/// before giving up and detaching it. The loop polls its shutdown flag every
-/// [`ANALYSIS_POLL_MS`], so this is ~100x the expected wait: long enough that
-/// it never fires in practice, short enough that a wedged thread can't stop
-/// the activity from relaunching.
+/// How long a new generation waits for the previous runner to finish before
+/// giving up and detaching it. The worker polls its shutdown flag every
+/// `runner.poll_ms`, so this is ~100x the expected wait: long enough that it
+/// never fires in practice, short enough that a wedged thread can't stop the
+/// activity from relaunching.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 /// Poll interval while waiting out [`SHUTDOWN_GRACE`].
 const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
-/// Per-frame analysis times kept for the p95 estimate (~11 s at 48 kHz).
-const TIMING_WINDOW: usize = 256;
-
-/// How often, in frames, the frame-cost summary is logged. 512 frames is ~22 s
-/// at 48 kHz — frequent enough to watch live over `adb logcat`, rare enough
-/// not to be the noisiest thing in it.
-const TIMING_REPORT_FRAMES: u32 = 512;
+/// How often the grant state is re-read after the permission dialog was
+/// shown. The poll runs until the grant lands or the generation is retired:
+/// the user may grant it from Settings minutes later (Room → DIAGNOSTICS →
+/// Open app settings) and expects audio to come up without a relaunch.
+const PERMISSION_POLL: Duration = Duration::from_secs(1);
 
 /// One `android_main` invocation's background resources, parked where the
 /// *next* invocation can reach them.
 struct Generation {
-    /// Set to ask this generation's analysis loop to return.
+    /// Set to ask this generation's threads to return.
     shutdown: Arc<AtomicBool>,
-    analysis: Option<JoinHandle<()>>,
+    /// The live runner and the parked audio stream (mode switching).
+    engine: Arc<Mutex<LiveEngine>>,
     /// Dropping this closes the AAudio input/output streams — the reason the
     /// engine lives here instead of on the parked `android_main` stack frame,
-    /// which the new generation cannot reach.
-    audio: Option<AudioEngine>,
+    /// which the new generation cannot reach. Shared with the thread that
+    /// opens the engine once the microphone permission is granted.
+    audio: Arc<Mutex<Option<AudioEngine>>>,
 }
 
 /// The most recent generation, or `None` before the first launch. A poisoned
@@ -96,7 +96,7 @@ fn retire_previous_generation() {
         Ok(mut slot) => slot.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
-    let Some(mut previous) = previous else {
+    let Some(previous) = previous else {
         return;
     };
     log::info!("retiring the previous android_main generation");
@@ -105,35 +105,49 @@ fn retire_previous_generation() {
     // rather than waiting on the thread — a second AAudio input stream opening
     // while the first still holds the mic is the failure this exists to stop.
     previous.shutdown.store(true, Ordering::Relaxed);
-    drop(previous.audio.take());
+    let engine = match previous.audio.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if engine.is_some() {
+        crate::diagnostics::runtime::update_synthesizer_active(false);
+    }
+    drop(engine);
 
     // The spatial (TV-path) capture thread holds its own AudioRecord; it
     // checks this flag every 0.1 s chunk and releases the recorder itself.
     crate::spatial::request_shutdown();
 
-    if let Some(handle) = previous.analysis.take() {
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        while !handle.is_finished() && Instant::now() < deadline {
-            thread::sleep(SHUTDOWN_POLL);
-        }
-        if handle.is_finished() {
-            // Never `join()` blind: a wedged loop would hang the relaunch.
-            let _ = handle.join();
-        } else {
-            log::warn!(
-                "previous analysis thread did not stop within {} ms; detaching it",
-                SHUTDOWN_GRACE.as_millis()
-            );
-        }
+    match previous.engine.lock() {
+        Ok(mut e) => e.retire(SHUTDOWN_GRACE, SHUTDOWN_POLL),
+        Err(poisoned) => poisoned.into_inner().retire(SHUTDOWN_GRACE, SHUTDOWN_POLL),
     }
 }
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    install_logger();
+    log::info!("android_main: starting VoxLabs");
+
+    // The Engineering Console's session log lives in the app's private
+    // files dir; open it first so everything below can report into it.
+    if let Some(files) = app.internal_data_path() {
+        match crate::diagnostics::runtime::initialize(&files) {
+            Ok(()) => {
+                crate::diagnostics::install_panic_hook();
+                // The bundle's `shared_model` block: the compiled-in atlas
+                // files, their digests and their own release statements.
+                crate::diagnostics::runtime::set_shared_model_snapshot(
+                    serde_json::to_value(crate::atlas::data_provenance())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(e) => log::error!("diagnostics store did not open: {e}"),
+        }
+    }
+    crate::diagnostics::runtime::update_renderer_mode(
+        crate::diagnostics::runtime::renderer_mode_name(),
     );
-    log::info!("android_main: starting Voice Harmonic Engine");
 
     // Before anything is constructed: whatever a previous launch left running
     // in this process must be gone. See the module docs on re-entry.
@@ -153,68 +167,60 @@ fn android_main(app: AndroidApp) {
     let input_sample_rate = query_input_sample_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     log::info!("android input sample rate: {input_sample_rate} Hz");
 
-    // CPU YIN + LPC on the non-real-time analysis thread. A panic in here used
-    // to unwind into nothing and leave the UI showing its last profile forever;
-    // now the death is caught, logged to logcat, and published as
-    // `AnalysisState::Stopped` so the UI can say analysis has stopped.
-    let analysis_telemetry = bridges.telemetry.clone();
+    // The analysis worker is the pipeline runner (Plan v3): the stages of
+    // the mode the phone last chose (`mode.txt` in the files dir; default
+    // live_model), with the UI's consumers on the hop hook. The runner
+    // builds on its own thread — the inversion grids — so audio is opened
+    // only once it is ready (bounded by the mode file's init_timeout_ms).
     let shutdown = Arc::new(AtomicBool::new(false));
-    let loop_shutdown = shutdown.clone();
-    let analysis = thread::spawn(move || {
-        analysis_telemetry.set_analysis_state(AnalysisState::Running);
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            cpu_analysis_loop(
-                profile_tx,
-                ui_profile_tx,
-                audio_rx,
-                spectrum_tx,
-                scope_tx,
-                input_sample_rate,
-                &analysis_telemetry,
-                &loop_shutdown,
-            );
-        }));
-        // A requested shutdown is a relaunch, not a fault: it must not be
-        // logged as an error, and the retired generation's telemetry must not
-        // be marked `Stopped` (nothing reads it, but the log would mislead).
-        if loop_shutdown.load(Ordering::Relaxed) {
-            log::info!("analysis loop stopped for an activity relaunch");
-            return;
+    let mode_dir = app.internal_data_path();
+    let mode = engine::saved_mode(mode_dir.as_deref());
+    let consumers = WireConsumers::new(
+        profile_tx,
+        ui_profile_tx,
+        spectrum_tx,
+        scope_tx,
+        bridges.telemetry.clone(),
+        1,
+        1,
+    );
+    let mut live = LiveEngine::new(
+        input_sample_rate,
+        audio_rx,
+        Some(Box::new(consumers)),
+        bridges.telemetry.clone(),
+    );
+    let shell = match live.start(&mode) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("{e}; live analysis unavailable");
+            bridges
+                .telemetry
+                .set_analysis_state(AnalysisState::Unavailable);
+            None
         }
-        match outcome {
-            Ok(()) => log::error!("analysis loop exited; live analysis has stopped"),
-            Err(_) => log::error!("analysis loop panicked; live analysis has stopped"),
-        }
-        analysis_telemetry.set_analysis_state(AnalysisState::Stopped);
-    });
+    };
+    let live = Arc::new(Mutex::new(live));
+    engine::spawn_watcher(live.clone(), shutdown.clone(), mode_dir);
 
-    // cpal AAudio engine. Non-fatal on failure: without RECORD_AUDIO the input
-    // stream can't open, but we still want the UI up so the user can grant it.
-    let audio = match AudioEngine::start(
+    // cpal AAudio engine, opened as soon as RECORD_AUDIO is granted: now if
+    // it already is, otherwise after the system dialog the app raises here.
+    let audio: Arc<Mutex<Option<AudioEngine>>> = Arc::new(Mutex::new(None));
+    start_audio_when_permitted(
         bridges.profile_rx,
         bridges.event_rx,
         bridges.audio_tx,
         bridges.telemetry.clone(),
-    ) {
-        Ok(engine) => Some(engine),
-        Err(e) => {
-            log::error!(
-                "audio engine failed to start (is RECORD_AUDIO granted?): {e:?}; UI will run without audio"
-            );
-            // The UI must say this. A NativeActivity cannot raise the runtime
-            // permission dialog itself, so without a banner the app looks
-            // merely broken rather than un-permitted, and the only diagnosis
-            // is a logcat line most users will never read.
-            bridges.telemetry.set_audio_unavailable(true);
-            None
-        }
-    };
+        audio.clone(),
+        shutdown.clone(),
+        input_sample_rate,
+    );
 
     // Park both handles where the *next* `android_main` can find them. This
     // invocation may never get the chance to clean up after itself.
     let generation = Generation {
         shutdown,
-        analysis: Some(analysis),
+        engine: live,
         audio,
     };
     match ACTIVE_GENERATION.lock() {
@@ -279,10 +285,138 @@ fn android_main(app: AndroidApp) {
             if let Some(path) = shared {
                 app.queue_import(path);
             }
+            if let Some(shell) = shell {
+                app.attach_pipeline(shell);
+            }
             Ok(Box::new(app))
         }),
     ) {
         log::error!("eframe exited with error: {e:?}");
+    }
+}
+
+/// Opens the audio engine once `RECORD_AUDIO` is granted. Held already:
+/// opened on this thread before returning. Not held: the permission dialog
+/// is raised, the UI shows the microphone-unavailable banner, and a thread
+/// polls the grant state every [`PERMISSION_POLL`], opening the engine the
+/// moment it lands, until the generation is retired. A failure to open with
+/// the grant held stays fatal for audio, as before, and is logged.
+fn start_audio_when_permitted(
+    profile_rx: triple_buffer::Output<VocalProfile>,
+    event_rx: rtrb::Consumer<crate::concurrency::EngineEvent>,
+    audio_tx: rtrb::Producer<f32>,
+    telemetry: Arc<Telemetry>,
+    slot: Arc<Mutex<Option<AudioEngine>>>,
+    shutdown: Arc<AtomicBool>,
+    built_for_sample_rate: f32,
+) {
+    if crate::permission::has_record_audio() {
+        telemetry.set_mic_permission(MicPermission::Granted);
+        telemetry.set_mic_request(MicRequest::NotNeeded);
+        crate::diagnostics::runtime::update_microphone_granted(true);
+        log::info!("RECORD_AUDIO already granted; opening audio");
+        open_audio(
+            profile_rx,
+            event_rx,
+            audio_tx,
+            telemetry,
+            &slot,
+            &shutdown,
+            built_for_sample_rate,
+        );
+        return;
+    }
+    telemetry.set_mic_permission(MicPermission::NotGranted);
+    telemetry.set_audio_unavailable(true);
+    crate::diagnostics::runtime::update_microphone_granted(false);
+    log::info!("RECORD_AUDIO not granted yet; asking the user");
+    if crate::permission::request_record_audio() {
+        telemetry.set_mic_request(MicRequest::Raised);
+    } else {
+        telemetry.set_mic_request(MicRequest::Failed);
+        log::error!(
+            "could not raise the microphone permission dialog; \
+             grant it by hand: Room → DIAGNOSTICS → Open app settings → Permissions → Microphone"
+        );
+    }
+    thread::spawn(move || {
+        while !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(PERMISSION_POLL);
+            if crate::permission::has_record_audio() {
+                telemetry.set_mic_permission(MicPermission::Granted);
+                crate::diagnostics::runtime::update_microphone_granted(true);
+                log::info!("RECORD_AUDIO granted; opening audio");
+                open_audio(
+                    profile_rx,
+                    event_rx,
+                    audio_tx,
+                    telemetry,
+                    &slot,
+                    &shutdown,
+                    built_for_sample_rate,
+                );
+                return;
+            }
+        }
+    });
+}
+
+/// Installs the Android logger wrapped in the in-app diagnostics tee, so the
+/// Room screen can show the same lines logcat would. `set_boxed_logger`
+/// fails on a relaunch in the same process (the first generation's logger is
+/// still installed and already tees), which is fine to ignore.
+fn install_logger() {
+    let inner = android_logger::AndroidLogger::new(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+    let _ = log::set_boxed_logger(Box::new(crate::diag::Tee { inner }));
+    log::set_max_level(log::LevelFilter::Info);
+}
+
+/// Opens the cpal engine and parks it in the generation's slot. If the
+/// generation was retired meanwhile the engine is dropped again at once, so
+/// a stale launch can never hold the microphone.
+fn open_audio(
+    profile_rx: triple_buffer::Output<VocalProfile>,
+    event_rx: rtrb::Consumer<crate::concurrency::EngineEvent>,
+    audio_tx: rtrb::Producer<f32>,
+    telemetry: Arc<Telemetry>,
+    slot: &Mutex<Option<AudioEngine>>,
+    shutdown: &AtomicBool,
+    built_for_sample_rate: f32,
+) {
+    match AudioEngine::start(profile_rx, event_rx, audio_tx, telemetry.clone()) {
+        Ok(engine) => {
+            if let Some(rate) = query_input_sample_rate()
+                && rate != built_for_sample_rate
+            {
+                // The runner and the analyzer were built for the rate read at
+                // launch (the fallback when the grant was missing).
+                log::warn!(
+                    "input rate is {rate} Hz but analysis was built for {built_for_sample_rate} Hz; \
+                     relaunch the app to rebuild at the right rate"
+                );
+            }
+            match slot.lock() {
+                Ok(mut s) => *s = Some(engine),
+                Err(poisoned) => *poisoned.into_inner() = Some(engine),
+            }
+            if shutdown.load(Ordering::Relaxed) {
+                // Retired while opening: release the microphone immediately.
+                if let Ok(mut s) = slot.lock() {
+                    s.take();
+                }
+                return;
+            }
+            telemetry.set_audio_unavailable(false);
+            crate::diagnostics::runtime::update_synthesizer_active(true);
+            log::info!("audio engine running");
+        }
+        Err(e) => {
+            log::error!("audio engine failed to start: {e:?}; UI will run without audio");
+            telemetry.set_audio_unavailable(true);
+            crate::diagnostics::runtime::update_synthesizer_active(false);
+        }
     }
 }
 
@@ -293,178 +427,4 @@ fn query_input_sample_rate() -> Option<f32> {
     let dev = host.default_input_device()?;
     let config = dev.default_input_config().ok()?;
     Some(config.config().sample_rate as f32)
-}
-
-/// CPU-only analysis loop: drains the input ring buffer, and for each whole
-/// frame estimates f0 (YIN) and — on voiced frames — the formants (decimate →
-/// LPC → root-solve), publishing the profile to synthesis + UI. This mirrors
-/// `AnalysisEngine::process_frame`'s CPU path but never touches wgpu.
-#[allow(clippy::too_many_arguments)]
-fn cpu_analysis_loop(
-    mut profile_tx: Input<VocalProfile>,
-    mut ui_profile_tx: Input<VocalProfile>,
-    mut audio_rx: Consumer<f32>,
-    mut spectrum_tx: Input<Vec<f32>>,
-    mut scope_tx: Input<Vec<f32>>,
-    sample_rate: f32,
-    telemetry: &Telemetry,
-    shutdown: &AtomicBool,
-) {
-    use crate::frame::FrameAnalyzer;
-    use crate::math;
-
-    // The per-frame DSP is the shared `FrameAnalyzer` (identical to what the
-    // `voxlab` study harness runs on files); this loop owns only the ring
-    // drain, room-calibration bookkeeping, UI feeds, and timing.
-    let mut analyzer = FrameAnalyzer::new(sample_rate);
-    let mut accumulator: Vec<f32> = Vec::with_capacity(ANALYSIS_FRAME * 4);
-    // Scrolling-spectrogram STFT, mirroring the desktop path.
-    let mut spectrogram = crate::spectrogram::Spectrogram::new();
-    // Room calibration state, mirroring the desktop engine.
-    let mut calibrator = math::RoomCalibrator::new();
-    let mut timer = FrameTimer::new(sample_rate);
-
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return;
-        }
-
-        while let Ok(sample) = audio_rx.pop() {
-            accumulator.push(sample);
-        }
-
-        while accumulator.len() >= ANALYSIS_FRAME {
-            // A large backlog can hold us in here for many frames, so the
-            // shutdown request is checked at frame granularity too.
-            if shutdown.load(Ordering::Relaxed) {
-                return;
-            }
-            let started = Instant::now();
-            let frame = &accumulator[..ANALYSIS_FRAME];
-
-            // Mirror the frame to the capture export (no-op unless a capture
-            // is armed) before anything else sees it.
-            crate::capture_log::push(frame);
-            let result = analyzer.analyze(frame);
-
-            // Room calibration pass, mirroring the desktop engine. It wants
-            // the pre-gate periodicity (a calibrating room with a voice in
-            // it must fail), which the analyzer reports alongside the
-            // gated profile.
-            let (calibrating, calib_done) = telemetry.take_calibration_frame();
-            if calibrating {
-                calibrator.push(result.rms, result.yin_f0);
-                if calib_done {
-                    match calibrator.finish() {
-                        Ok(cal) => {
-                            analyzer.seed_floor(cal.ambient_rms);
-                            analyzer.set_interferer(cal.interferer);
-                            telemetry.set_calibration_result(Some((
-                                cal.ambient_rms,
-                                cal.interferer.map(|i| (i.f0_hz, i.rms)),
-                            )));
-                            log::info!(
-                                "room calibrated: ambient rms {:.5}, interferer {:?}",
-                                cal.ambient_rms,
-                                cal.interferer
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!("room calibration failed: {e:?}");
-                            telemetry.set_calibration_result(None);
-                        }
-                    }
-                    calibrator = math::RoomCalibrator::new();
-                }
-            }
-
-            let profile = result.profile;
-            profile_tx.write(profile);
-            ui_profile_tx.write(profile);
-
-            // Spectrogram + oscilloscope feeds, mirroring the desktop path.
-            spectrogram.process_block(frame);
-            spectrum_tx.write(spectrogram.magnitudes_db().to_vec());
-            scope_tx.write(frame.to_vec());
-
-            // Heartbeat for the UI's staleness watch.
-            telemetry.note_analysis_frame();
-
-            accumulator.drain(..ANALYSIS_FRAME);
-            timer.record(started.elapsed());
-        }
-
-        thread::sleep(Duration::from_millis(ANALYSIS_POLL_MS));
-    }
-}
-
-/// Rolling per-frame cost tracker for the Android analysis loop.
-///
-/// One analysis frame covers `ANALYSIS_FRAME / sample_rate` seconds of audio
-/// (42.7 ms at 48 kHz). Take longer than that on average and the input ring
-/// buffer backs up until the capture callback starts overrunning, which shows
-/// up as xruns and dropped input rather than as an obvious slowdown — so the
-/// number is worth logging even when it is comfortably inside budget.
-///
-/// Deliberately a measurement, not a control loop: the review's F25 asks for
-/// the benchmark first and an adaptive cadence *only* if a real device shows
-/// the budget being exceeded.
-struct FrameTimer {
-    budget_ms: f32,
-    recent: Vec<f32>,
-    next: usize,
-    since_report: u32,
-}
-
-impl FrameTimer {
-    fn new(sample_rate: f32) -> Self {
-        Self {
-            budget_ms: ANALYSIS_FRAME as f32 / sample_rate * 1000.0,
-            recent: Vec::with_capacity(TIMING_WINDOW),
-            next: 0,
-            since_report: 0,
-        }
-    }
-
-    fn record(&mut self, elapsed: Duration) {
-        let ms = elapsed.as_secs_f32() * 1000.0;
-        if self.recent.len() < TIMING_WINDOW {
-            self.recent.push(ms);
-        } else {
-            self.recent[self.next] = ms;
-            self.next = (self.next + 1) % TIMING_WINDOW;
-        }
-
-        self.since_report += 1;
-        if self.since_report < TIMING_REPORT_FRAMES {
-            return;
-        }
-        self.since_report = 0;
-        self.report();
-    }
-
-    fn report(&self) {
-        if self.recent.is_empty() {
-            return;
-        }
-        let mut sorted = self.recent.clone();
-        sorted.sort_by(f32::total_cmp);
-        let at = |q: f32| sorted[((sorted.len() - 1) as f32 * q).round() as usize];
-        let (p50, p95, max) = (at(0.5), at(0.95), sorted[sorted.len() - 1]);
-        let headroom = p95 / self.budget_ms * 100.0;
-
-        if p95 > self.budget_ms {
-            log::warn!(
-                "analysis frame cost over budget: p50 {p50:.1} ms, p95 {p95:.1} ms, \
-                 max {max:.1} ms vs {:.1} ms budget ({headroom:.0}%)",
-                self.budget_ms
-            );
-        } else {
-            log::info!(
-                "analysis frame cost: p50 {p50:.1} ms, p95 {p95:.1} ms, max {max:.1} ms \
-                 vs {:.1} ms budget ({headroom:.0}%)",
-                self.budget_ms
-            );
-        }
-    }
 }

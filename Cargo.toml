@@ -10,11 +10,12 @@ edition = "2024"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# The Fach Lab study harness: decodes audio files and runs them through the
-# same FrameAnalyzer the phone runs. Desktop only (it links the decoders).
-[[bin]]
-name = "voxlab"
-path = "src/bin/voxlab.rs"
+# Plan v3 D2: the workspace. `vox-core` is the root package (the library the
+# APK loads and the desktop binary link; cargo-apk and scripts/build-dev-apk.sh
+# operate on it unchanged). The study harness (`voxlab`) and the validation
+# crate are members under crates/. `cargo test --workspace` runs everything.
+[workspace]
+members = ["crates/vox-harness", "crates/vox-validation", "crates/vox-tract-vtl"]
 
 # Shared across every target (native desktop, Android, web/wasm). Pure-Rust and
 # wasm-compatible. eframe here is a minimal common base with no renderer/backend
@@ -39,6 +40,7 @@ rtrb = "0.3.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 triple_buffer = "9.0.0"
+toml = "1.1.5"
 
 # Desktop + web: restore eframe's stock default feature set, so those two targets
 # behave identically to before this Android work (wgpu renderer, accesskit,
@@ -101,13 +103,10 @@ hound = "3.5"
 # Android unchanged; the web target has no files to decode.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac", "vorbis", "ogg"] }
 
-# Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
-# logger, plus winit's default backends (x11/wayland, matching eframe's stock
-# `winit/default`). Android takes the CPU DSP path instead, so it never compiles
-# wgpu — keeping wgpu-on-Vulkan-Android out of the build entirely (de-risked).
+# Desktop only: the logger and winit's default backends (x11/wayland,
+# matching eframe's stock `winit/default`). The wgpu compute path is gone
+# (D15, Phase 5c): wgpu enters only as eframe's desktop renderer.
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
-wgpu = "29.0.3"
-pollster = "0.4.0"
 env_logger = "0.11.10"
 winit = "0.30.13"
 
@@ -162,7 +161,7 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [package.metadata.android.application]
-label = "Voice Harmonic Engine"
+label = "VoxLabs"
 
 # Real-time microphone capture. This is a runtime ("dangerous") permission on
 # Android 6+; declaring it here is necessary but NOT sufficient — the app/user

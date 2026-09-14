@@ -10,6 +10,8 @@
 /// `(a + b) / 2`, the parabola vertex `(s0 − s2) / (2·(s0 − 2·s1 + s2))`, and
 /// `2^x` in octave arithmetic. Range: exactly 2.
 pub const TWO: f32 = 2.0;
+/// Millimetres per centimetre (the lumen mesh is stored in mm).
+pub const MM_PER_CM: f32 = 10.0;
 /// [`TWO`] for `f64` arithmetic. Range: exactly 2.
 pub const TWO_F64: f64 = 2.0;
 /// [`TWO`] as an index/length divisor (Nyquist bin, integer midpoint).
@@ -27,6 +29,8 @@ pub const SQUARED: i32 = 2;
 pub const ADJACENT_PAIR: usize = 2;
 /// Milliseconds in a second. Range: exactly 1000.
 pub const MILLIS_PER_SECOND: f32 = 1000.0;
+/// Microseconds in a second (`f64`, for timing arithmetic). Range: exactly 1e6.
+pub const MICROS_PER_SECOND_F64: f64 = 1_000_000.0;
 /// Closed-form eigenvalues of a 2×2 Hermitian matrix `[[a, c], [c*, b]]`:
 /// `λ = (a + b ± sqrt((a − b)² + 4|c|²)) / 2`; this is the 4. Range: exactly 4.
 pub const EIGEN2_DISCRIMINANT_FACTOR: f64 = 4.0;

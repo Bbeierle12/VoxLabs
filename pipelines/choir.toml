@@ -1,0 +1,50 @@
+# Choir — Plan v3 Phase 4 (D4): Coral's choir branch on the VoxLabs
+# pipeline. Framed at Coral's DETECTION size (8192 / 2048): the STFT with
+# Coral's periodic Hann and 0 dB calibration, the QIFFT single-F0 trail,
+# the multi-F0 note detector with harmonic cancellation (display range and
+# the rehearsal voices ≤ C6), and the SATB labels. The rehearsal harmony
+# (chords, targets, drift, cards) is a consumer over the taps
+# (`choir::pipeline::ChoirHarmony`), as the plan's §5.2 has it.
+
+name = "choir"
+
+taps = ["stft", "pitch", "multi_f0", "satb"]
+
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 8192
+hop = 2048
+
+[runner]
+# Idle sleep between ring-buffer drains, ms. Range: 1..=10.
+poll_ms = 5
+# Tap channel depth, messages. Range: 8..=256.
+tap_capacity = 256
+# Timing summary every this many hops (~11 s at hop 2048 / 48 kHz). Range: 47..=4700.
+report_every_hops = 256
+# Gate: worst hop < this fraction of the 42.7 ms hop budget. Range: 0.1..=1.0.
+hop_budget_fraction_max = 0.5
+# Gate: mic-to-render latency ceiling, ms. Range: 20.0..=200.0.
+mic_to_render_max_ms = 100.0
+# The shell waits this long for the worker's init, ms. Range: 500..=10000.
+init_timeout_ms = 4000
+# Frame-cadence consumers run every this many hops. Range: 1..=4.
+legacy_frame_every_hops = 1
+# Drained-but-unconsumed audio the re-framer reserves, frames. Range: 1..=8.
+pending_capacity_frames = 2
+
+[[stage]]
+name = "stft"
+backend = "coral_hann"
+
+[[stage]]
+name = "pitch"
+backend = "qifft"
+
+[[stage]]
+name = "multi_f0"
+backend = "harmonic_cancellation"
+
+[[stage]]
+name = "satb"
+backend = "labeler"

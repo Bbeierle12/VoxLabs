@@ -10,7 +10,7 @@ page is the mechanics.
 Desktop only (it links the audio decoders). Build with the rest of the crate:
 
 ```bash
-cargo build --release --bin voxlab
+cargo build --release -p vox-harness
 ```
 
 ---
@@ -101,8 +101,8 @@ harness's numbers join on the file name.
 | Desktop | `$XDG_DATA_HOME/VoxLabs/captures/` (`~/.local/share/VoxLabs/captures/`) |
 | Web | no export (no filesystem) |
 
-Pull and analyze (dev package id shown; the release id is
-`org.voxlabs.core`):
+Pull and analyze (dev package id shown, from the Cargo.toml patch step in
+`docs/STATUS.md` §5; an unpatched build is `org.voxlabs.core`):
 
 ```bash
 adb pull /sdcard/Android/data/org.voxlabs.core.dev/files/captures ./captures
@@ -166,4 +166,4 @@ show the room.
 | `tenor/synth_t/vowel_a_180.wav` — 180 Hz, cluster 2800 Hz | FHE ≈ 2800, note F♯3 | FHE(m) 2849, cluster peak 2859, F♯3 |
 | `tenor/synth_t/glide_a.wav` — 200→600 Hz glide, F1 = 600 Hz | one ascending turnover at 2·F1/3 = 400 Hz, H1 taking over | 401 Hz ↑ H1 |
 
-These are also unit tests (`cargo test --bin voxlab`).
+These are also unit tests (`cargo test -p vox-harness`).

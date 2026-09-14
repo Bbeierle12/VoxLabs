@@ -6,35 +6,32 @@ use super::*;
 /// native (the UI shows CALIBRATING for the first moments of the first
 /// session). On wasm — which has no analysis thread and thus never measures
 /// formants — the build would run inline if ever requested.
+///
+/// The grids are the pipeline's shared ones (`pipeline::stages::inverse`):
+/// when the runner is up, its `init` has already built them and this
+/// returns immediately; otherwise the card starts the build here, once.
 pub(super) fn tract_grid_for(
     basis: &'static crate::tract::TractBasis,
 ) -> Option<&'static crate::tract::TractGrid> {
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static GRID_M: OnceLock<crate::tract::TractGrid> = OnceLock::new();
-    static GRID_F: OnceLock<crate::tract::TractGrid> = OnceLock::new();
+    use crate::pipeline::stages::inverse::{shared_grid, shared_grid_if_built};
+    use std::sync::atomic::AtomicBool;
     static BUILDING_M: AtomicBool = AtomicBool::new(false);
     static BUILDING_F: AtomicBool = AtomicBool::new(false);
 
-    let female = (basis.vtl_cm - 15.53).abs() < 0.1;
-    let (cell, building) = if female {
-        (&GRID_F, &BUILDING_F)
-    } else {
-        (&GRID_M, &BUILDING_M)
-    };
-    if let Some(g) = cell.get() {
+    if let Some(g) = shared_grid_if_built(basis) {
         return Some(g);
     }
+    let building = if std::ptr::eq(basis, &crate::tract::ADULT_FEMALE) {
+        &BUILDING_F
+    } else {
+        &BUILDING_M
+    };
     #[cfg(not(target_arch = "wasm32"))]
     {
+        use std::sync::atomic::Ordering;
         if !building.swap(true, Ordering::Relaxed) {
             std::thread::spawn(move || {
-                let g = crate::tract::TractGrid::build(
-                    basis,
-                    crate::tract::GRID_N,
-                    crate::tract::GRID_N,
-                );
-                let _ = cell.set(g);
+                shared_grid(basis, crate::tract::GRID_N);
             });
         }
         None
@@ -42,12 +39,7 @@ pub(super) fn tract_grid_for(
     #[cfg(target_arch = "wasm32")]
     {
         let _ = building;
-        let _ = cell.set(crate::tract::TractGrid::build(
-            basis,
-            crate::tract::GRID_N,
-            crate::tract::GRID_N,
-        ));
-        cell.get()
+        Some(shared_grid(basis, crate::tract::GRID_N))
     }
 }
 

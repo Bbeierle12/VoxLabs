@@ -1,0 +1,9 @@
+{
+  "name": "coral-note-detector",
+  "displayName": "Coral Choral Note Detector Tuner",
+  "description": "Optimizes multi-F0 note detection parameters against a synthetic SATB singing chord battery.",
+  "targetFile": "src/config/detector.ts",
+  "evalCommand": "npm run bench",
+  "metric": "f1",
+  "logFile": "results.tsv"
+}

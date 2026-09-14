@@ -1,0 +1,93 @@
+# Live Model — Plan v3 §5 Phase 1, the walking skeleton.
+#
+# Loaded by the runner (not generated). Selects the stream format, the
+# ordered stages with their backends, the taps the shell renders, and the
+# runner's limits. Stage parameters come from pipeline.toml; any key may be
+# overridden here under [params.<section>] (a key no config struct declares
+# fails to load).
+
+name = "live_model"
+
+# Every stage output the shell shows in its debug panel; `tract` also drives
+# the tube view.
+taps = ["yin", "voicing", "lpc", "harmonics", "metrics", "contour", "inverse", "tract", "stft"]
+
+# Stream format (D14: hop 1024 is canonical for the whole pipeline). The
+# shell substitutes the device's real sample rate before building; frame
+# and hop are as written. A frame must hold yin.window + sample_rate /
+# yin.f0_min_hz samples (1024 + 960 at 48 kHz).
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 2048
+hop = 1024
+
+[runner]
+# Idle sleep between ring-buffer drains, ms. Range: 1..=10.
+poll_ms = 5
+# Tap channel depth, messages. A full channel drops and counts. Range: 8..=256.
+tap_capacity = 256
+# Timing summary to the log every this many hops (512 hops ≈ 11 s at hop
+# 1024 / 48 kHz). Range: 47..=4700.
+report_every_hops = 512
+# Gate: worst hop < this fraction of the 21.3 ms hop budget (the report's
+# Experiment 1 threshold, applied natively). Range: 0.1..=1.0.
+hop_budget_fraction_max = 0.5
+# Gate: mic-to-render latency ceiling, ms (ring arrival → tap consumed by
+# the UI at paint). Range: 20.0..=200.0.
+mic_to_render_max_ms = 100.0
+# The shell waits this long for the worker's init (two 41×41 grid builds)
+# before opening audio anyway, ms. Range: 500..=10000.
+init_timeout_ms = 4000
+# The frame-cadence consumers (room-calibration pass, raw-capture export)
+# run every this many hops: 2 is one 2048-sample frame at hop 1024, so the
+# calibration's frame count and the capture file layout are unchanged.
+# Range: 1..=4.
+legacy_frame_every_hops = 2
+# Drained-but-unconsumed audio the re-framer reserves, in frames; more than
+# this in flight means the worker is behind and allocates. Range: 1..=8.
+pending_capacity_frames = 2
+
+# Ordered stages. Each input must be produced earlier (or be the source
+# AudioFrame); the builder names the missing adapter chain otherwise.
+[[stage]]
+name = "yin"
+backend = "yin_cpu"
+
+# The SNR and calibrated-hum gates: periodicity alone is not voice.
+[[stage]]
+name = "voicing"
+backend = "snr_hum"
+
+[[stage]]
+name = "lpc"
+backend = "lpc_levinson"
+
+[[stage]]
+name = "harmonics"
+backend = "goertzel"
+
+[[stage]]
+name = "metrics"
+backend = "classic"
+
+[[stage]]
+name = "contour"
+backend = "f0_contour"
+
+[[stage]]
+name = "inverse"
+backend = "grid_story"
+
+[[stage]]
+name = "tract"
+backend = "story_two_mode"
+
+# The waterfall reads this tap; at hop 1024 over a 2048 frame that is 50 %
+# overlap (D14).
+[[stage]]
+name = "stft"
+backend = "rustfft"
+
+# Parameter overrides on top of pipeline.toml, e.g.
+#   [params.tract]
+#   grid_n = 21

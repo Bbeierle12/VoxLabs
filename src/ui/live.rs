@@ -57,13 +57,19 @@ impl DashboardApp {
     /// or `None` when everything is running. Ordered by how much it costs the
     /// user: no analysis at all, then stopped, then stalled, then audio I/O.
     pub(super) fn engine_notice(&self) -> Option<&'static str> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(notice) = self.pipeline_notice() {
+            return Some(notice);
+        }
         // No microphone outranks everything else: with no input stream the
         // analysis path is idle by definition, so any staleness or GPU notice
         // below would only describe a consequence of this.
         if self.telemetry.audio_unavailable() {
             return Some(
-                "Microphone unavailable — the audio engine could not open the mic. \
-                 Grant the Microphone permission in Settings, then reopen the app.",
+                "Microphone unavailable — no input stream is open. If the permission \
+                 dialog did not appear or was dismissed: DIAGNOSTICS → Open app \
+                 settings → Permissions → Microphone → Allow. Audio starts as soon as \
+                 it is granted.",
             );
         }
         match self.telemetry.analysis_state() {

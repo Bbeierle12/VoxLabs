@@ -21,64 +21,6 @@ pub(super) fn sessions_subject_w(available: f32, inset_right: f32) -> f32 {
     available - SESSIONS_F0_W - SESSIONS_MATCH_W - inset_right
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pixel tolerance for a column edge: the header and the row reach the same
-    /// x by different arithmetic, so the last float bit may differ.
-    const ALIGN_EPS: f32 = 0.01;
-
-    fn assert_aligned(label: &str, header: f32, row: f32, col: f32) {
-        assert!(
-            (header - row).abs() < ALIGN_EPS,
-            "{label} misaligned at column width {col}: header {header}, row {row}"
-        );
-    }
-
-    /// The Sessions header sits on the panel; each row sits inside a `glass`
-    /// card that insets it on both sides. Two different expressions therefore
-    /// compute what has to be one grid — this pins the invariant they exist to
-    /// satisfy. Before the shared constants the SUBJECT column was 4 px out,
-    /// and nothing said so.
-    #[test]
-    fn sessions_header_and_rows_share_one_column_grid() {
-        for col in [320.0f32, COL_WIDTH, 900.0] {
-            // Header: spans the full content column, padding itself by the
-            // card inset at each end.
-            let head_id_x = GLASS_INSET;
-            let head_subj_x = head_id_x + SESSIONS_ID_W;
-            let head_subj_w = sessions_subject_w(col - head_subj_x, GLASS_INSET);
-            let head_f0_x = head_subj_x + head_subj_w;
-            let head_right = col - GLASS_INSET;
-
-            // Row: the card supplies the inset, so its content box is narrower
-            // and its subject column subtracts one fewer term.
-            let row_w = col - 2.0 * GLASS_INSET;
-            let row_id_x = GLASS_INSET;
-            let row_subj_x = row_id_x + SESSIONS_ID_W;
-            let row_subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
-            let row_f0_x = row_subj_x + row_subj_w;
-            let row_right = GLASS_INSET + row_w;
-
-            assert_aligned("ID left edge", head_id_x, row_id_x, col);
-            assert_aligned("SUBJECT left edge", head_subj_x, row_subj_x, col);
-            assert_aligned("SUBJECT width", head_subj_w, row_subj_w, col);
-            assert_aligned("F0 left edge", head_f0_x, row_f0_x, col);
-            assert_aligned("MATCH right edge", head_right, row_right, col);
-        }
-    }
-
-    /// The flexible column has to survive the narrowest layout the app can be
-    /// shown at; a negative width would invert the allocation.
-    #[test]
-    fn subject_column_stays_positive_at_the_narrowest_layout() {
-        let row_w = 320.0f32 - 2.0 * GLASS_INSET;
-        let subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
-        assert!(subj_w > 0.0, "SUBJECT column collapsed to {subj_w}");
-    }
-}
-
 impl DashboardApp {
     pub(super) fn screen_sessions(&mut self, ui: &mut egui::Ui) {
         self.screen_kicker(ui, "CAPTURE ARCHIVE", "Sessions");
@@ -257,5 +199,63 @@ impl DashboardApp {
             }
             ui.add_space(8.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pixel tolerance for a column edge: the header and the row reach the same
+    /// x by different arithmetic, so the last float bit may differ.
+    const ALIGN_EPS: f32 = 0.01;
+
+    fn assert_aligned(label: &str, header: f32, row: f32, col: f32) {
+        assert!(
+            (header - row).abs() < ALIGN_EPS,
+            "{label} misaligned at column width {col}: header {header}, row {row}"
+        );
+    }
+
+    /// The Sessions header sits on the panel; each row sits inside a `glass`
+    /// card that insets it on both sides. Two different expressions therefore
+    /// compute what has to be one grid — this pins the invariant they exist to
+    /// satisfy. Before the shared constants the SUBJECT column was 4 px out,
+    /// and nothing said so.
+    #[test]
+    fn sessions_header_and_rows_share_one_column_grid() {
+        for col in [320.0f32, COL_WIDTH, 900.0] {
+            // Header: spans the full content column, padding itself by the
+            // card inset at each end.
+            let head_id_x = GLASS_INSET;
+            let head_subj_x = head_id_x + SESSIONS_ID_W;
+            let head_subj_w = sessions_subject_w(col - head_subj_x, GLASS_INSET);
+            let head_f0_x = head_subj_x + head_subj_w;
+            let head_right = col - GLASS_INSET;
+
+            // Row: the card supplies the inset, so its content box is narrower
+            // and its subject column subtracts one fewer term.
+            let row_w = col - 2.0 * GLASS_INSET;
+            let row_id_x = GLASS_INSET;
+            let row_subj_x = row_id_x + SESSIONS_ID_W;
+            let row_subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
+            let row_f0_x = row_subj_x + row_subj_w;
+            let row_right = GLASS_INSET + row_w;
+
+            assert_aligned("ID left edge", head_id_x, row_id_x, col);
+            assert_aligned("SUBJECT left edge", head_subj_x, row_subj_x, col);
+            assert_aligned("SUBJECT width", head_subj_w, row_subj_w, col);
+            assert_aligned("F0 left edge", head_f0_x, row_f0_x, col);
+            assert_aligned("MATCH right edge", head_right, row_right, col);
+        }
+    }
+
+    /// The flexible column has to survive the narrowest layout the app can be
+    /// shown at; a negative width would invert the allocation.
+    #[test]
+    fn subject_column_stays_positive_at_the_narrowest_layout() {
+        let row_w = 320.0f32 - 2.0 * GLASS_INSET;
+        let subj_w = sessions_subject_w(row_w - SESSIONS_ID_W, 0.0);
+        assert!(subj_w > 0.0, "SUBJECT column collapsed to {subj_w}");
     }
 }

@@ -2,9 +2,11 @@
 
 Native Android build of **Voice Harmonic Engine**: the same egui `DashboardApp`
 as desktop, packaged as a `NativeActivity` APK. Real-time mic capture + additive
-synthesis via cpal's AAudio backend; pitch/formant DSP runs on the **CPU**
-(`math::yin_pitch` + LPC) — the wgpu GPU-compute path is desktop-only and is not
-compiled into the APK.
+synthesis via cpal's AAudio backend; analysis runs on the **CPU** through the
+pipeline runner (`pipelines/live_model.toml`: YIN → LPC → grid inverse → Story
+tract, plus the not-yet-wrapped per-frame work as a hop observer) — the wgpu
+GPU-compute path is desktop-only and is not compiled into the APK. The Phase 1
+on-device gate procedure is in `phase1-gate.md`.
 
 - **Package:** `org.voxlabs.core`
 - **App label:** Voice Harmonic Engine
@@ -120,6 +122,12 @@ dist/vox-core-release.apk            # copy kept as the deliverable
 `--lib` is required: the app is a `cdylib` (`libvox_core.so`) loaded
 by NativeActivity; the `[[bin]]` target is only the desktop/web entry.
 
+For the dev-flavoured build that installs beside a release one — id
+`org.voxlabs.core.dev`, label "VoxLabs (dev)" — run `scripts/build-dev-apk.sh
+[<feature>]` with the same keystore variables set. It patches `Cargo.toml`
+for the build, restores it afterwards, runs the alignment and signature checks
+below itself, and writes `dist/voxlabs-dev-<feature>-<sha>.apk`.
+
 Verify the signature and manifest:
 
 ```bash
@@ -154,18 +162,19 @@ This build host has **no device access**; do the following on your phone.
    `adb uninstall org.voxlabs.core` first.
 5. **Launch** "Voice Harmonic Engine" from the app drawer (default system icon —
    no custom launcher icon is bundled yet; see Known rough edges).
-6. **Grant the microphone permission.** This build uses a plain `NativeActivity`
-   and does **not** pop the runtime permission dialog itself, so grant it
-   manually — either:
-   - Settings → Apps → Voice Harmonic Engine → Permissions → Microphone → Allow, **or**
+6. **Grant the microphone permission.** The app asks on first launch (the
+   system dialog); tap Allow and audio starts within a second, no relaunch
+   needed. If the dialog was dismissed, the next launch asks again, or grant it
+   by hand — Settings → Apps → the app → Permissions → Microphone → Allow, or
    ```bash
    "$ANDROID_HOME/platform-tools/adb" shell pm grant org.voxlabs.core android.permission.RECORD_AUDIO
    ```
-   then fully close and reopen the app. Until RECORD_AUDIO is granted the UI runs
-   but the audio input stream can't open, so the dashboard stays in "SEARCHING".
+   (`org.voxlabs.core.dev` for the dev build). Until RECORD_AUDIO is granted the
+   UI runs with the microphone-unavailable banner and the dashboard stays in
+   "SEARCHING".
 7. **Watch logs while testing:**
    ```bash
-   "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio RustStdoutStderr '*:E'
+   "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio vox_core::pipeline::runner RustStdoutStderr '*:E'
    ```
    (`android_logger` is configured without an explicit tag, so each line is
    tagged with the Rust module path that logged it — `vox_core::<module>`.)
@@ -177,8 +186,9 @@ This build host has **no device access**; do the following on your phone.
 - **Not run on hardware.** The APK builds, assembles, and signs cleanly, but no
   device was available here — on-device launch, egui/glow rendering, live mic
   capture, synthesis output, and **audio latency** are all unverified.
-- **Mic permission is manual** (step 6). A proper JNI runtime-permission request
-  (or an `androidx`/`RustActivity` shell) is a follow-up.
+- **Mic permission dialog is polled, not delivered.** `NativeActivity` gives
+  no `onRequestPermissionsResult`, so the app re-reads the grant every 0.5 s
+  for two minutes after asking (`src/permission.rs`, `android.rs`).
 - **No custom launcher icon.** The app uses the Android default icon. To add one:
   drop `res/mipmap-*/ic_launcher.png` in the crate, set
   `[package.metadata.android] resources = "res"` and

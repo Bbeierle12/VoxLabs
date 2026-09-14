@@ -20,17 +20,25 @@
 mod app;
 mod capture;
 mod detail;
+// The console's page and metrics feed are native; the web build keeps the
+// stub and the shared header.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+mod diagnostics;
 mod files;
 mod gauges;
 mod live;
 mod model;
 mod nav;
 mod overview;
+#[cfg(not(target_arch = "wasm32"))]
+mod pipeline_panel;
 mod recording;
 mod room;
 mod room_probe;
 mod room_tv_path;
 mod sessions;
+#[cfg(not(target_arch = "wasm32"))]
+mod tap_views;
 mod theme;
 mod tract_card;
 mod viz;
@@ -119,6 +127,9 @@ enum Screen {
     /// Everything DETERMINISTIC about the space lives here — fans, HVAC, the
     /// TV's hardware hum. Program audio is out of scope by design.
     Room,
+    /// The Engineering Console (see `diagnostics`), opened from the
+    /// DIAGNOSTICS chip in every header; not in the tab bar.
+    Diagnostics,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -305,6 +316,12 @@ pub struct DashboardApp {
     /// Why the last export could not be started, if it could not.
     capture_error: Option<String>,
     rng: u64,
+    /// The pipeline runner's taps and stats, once a shell attaches one
+    /// (Android; see `pipeline_panel`). None on desktop until Phase 5c.
+    #[cfg(not(target_arch = "wasm32"))]
+    pipeline: Option<pipeline_panel::PipelineShell>,
+    /// Engineering Console state (see `diagnostics`).
+    console: diagnostics::Console,
 }
 
 impl eframe::App for DashboardApp {
@@ -314,6 +331,8 @@ impl eframe::App for DashboardApp {
         let now = ui.input(|i| i.time);
 
         self.watch_engine(now);
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_pipeline();
         self.advance(now);
         if let Some(path) = self.pending_import.take() {
             self.start_import(path, now);
@@ -332,6 +351,7 @@ impl eframe::App for DashboardApp {
         } else {
             self.ingest_profile(live, fresh);
         }
+        self.feed_diagnostics();
         // Display smoothing for the digit readouts; reset when the value goes
         // away so stale numbers never linger.
         let smooth = |disp: &mut Option<f32>, v: Option<f32>| match (disp.as_mut(), v) {
@@ -386,6 +406,9 @@ impl eframe::App for DashboardApp {
                     // Android renders edge-to-edge under the system bars and
                     // eframe exposes no safe-area insets, so pad past them.
                     ui.add_space(TOP_INSET);
+                    // The overlay line and the DIAGNOSTICS chip, above
+                    // every screen but the console itself.
+                    self.console_header(ui);
                     // Engine health (analysis unavailable/stopped/stalled, cpal
                     // stream errors) is live state, so this banner is not
                     // dismissible — it clears itself when the condition does.
@@ -407,6 +430,7 @@ impl eframe::App for DashboardApp {
                         Screen::Sessions => self.screen_sessions(ui),
                         Screen::Detail => self.screen_detail(ui),
                         Screen::Room => self.screen_room(ui),
+                        Screen::Diagnostics => self.screen_diagnostics(ui, now),
                     }
                     // Clearance for the floating tab bar.
                     ui.add_space(104.0 + BOTTOM_INSET);

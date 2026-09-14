@@ -671,3 +671,574 @@ vtl_weight_f2 = 0.3
 # Weight of the F3-derived length. Range: 0.5..=1.0; with vtl_weight_f2 sums
 # to 1.
 vtl_weight_f3 = 0.7
+
+# InverseConfig: The grid-inverse stage (`pipeline::stages::inverse`): measured
+# (F1, F2) → Story mode coefficients through the precomputed grid.
+[inverse]
+# EMA coefficient for the per-frame vocal-tract-length estimate that picks the
+# basis and scales the formants into its length reference. Anatomy accumulates
+# slowly; identity-grade frames only. Range: 0.01..=0.3.
+vtl_ema_alpha = 0.05
+
+# PosteriorConfig: `inverse/posterior_pca4`: evidence confidence, the temporal
+# atlas filter, the area clamp and the uncertainty readout, as Vocal Tract Lab
+# 0.10.0 computes them.
+[posterior]
+# Weight of the f0 estimator's confidence (clamped to 0..1) in the acoustic-
+# evidence score. Range: 0.0..=1.0; the three weights sum to 1.
+evidence_f0_confidence_weight = 0.42
+# Weight of harmonicity (0..1) in the acoustic-evidence score. Range:
+# 0.0..=1.0.
+evidence_harmonicity_weight = 0.30
+# Weight of the SNR term in the acoustic-evidence score. Range: 0.0..=1.0.
+evidence_snr_weight = 0.28
+# SNR term: (snr_db + offset) / span, clamped to 0..1. The offset, dB. Range:
+# 0.0..=20.0.
+evidence_snr_offset_db = 5.0
+# SNR term span, dB. Range: 5.0..=60.0.
+evidence_snr_span_db = 25.0
+# The app's harmonicity is its own 0..1 measure that VoxLabs does not compute;
+# HNR (dB) is mapped linearly onto 0..1 over this span. Range: 5.0..=40.0.
+harmonicity_hnr_span_db = 20.0
+# High-f0 penalty: (f0 − start) / span, clamped to 0..max. Sparse harmonics
+# above this f0, Hz, weaken the formant evidence. Range: 200.0..=800.0.
+f0_penalty_start_hz = 420.0
+# High-f0 penalty span, Hz. Range: 100.0..=2000.0.
+f0_penalty_span_hz = 600.0
+# High-f0 penalty ceiling. Range: 0.0..=1.0.
+f0_penalty_max = 0.28
+# Evidence = clamp(gain · acoustic + offset − penalty, min, max). The gain.
+# Range: 0.0..=1.0.
+evidence_gain = 0.78
+# Evidence offset. Range: 0.0..=0.5.
+evidence_offset = 0.05
+# Evidence floor. Range: 0.0..=0.5.
+evidence_min = 0.03
+# Evidence ceiling. Range: 0.5..=1.0.
+evidence_max = 0.82
+# Temporal filter: the follow rate is clamp(gain · evidence + offset, min,
+# max) when the frame is voiced and the evidence clears the model's abstention
+# threshold. The gain. Range: 0.0..=1.0.
+filter_alpha_gain = 0.38
+# Follow-rate offset. Range: 0.0..=1.0.
+filter_alpha_offset = 0.12
+# Follow-rate floor. Range: 0.0..=1.0.
+filter_alpha_min = 0.12
+# Follow-rate ceiling. Range: filter_alpha_min..=1.0.
+filter_alpha_max = 0.46
+# Confidence follows the evidence at this rate on evidence frames. Range:
+# 0.0..=1.0.
+confidence_follow = 0.35
+# Coefficients decay toward the atlas mean by this factor per abstained frame.
+# Range: 0.0..=1.0.
+decay_coefficients = 0.9
+# Confidence decays by this factor per abstained frame. Range: 0.0..=1.0.
+decay_confidence = 0.82
+# Relative area standard deviation = (1 − confidence) · gain + offset (the
+# app's uncertainty readout, `TractPosterior.relativeAreaStd`). The gain.
+# Range: 0.0..=2.0.
+area_std_gain = 0.53
+# Relative area std offset (the floor at full confidence). Range: 0.0..=1.0.
+area_std_offset = 0.12
+# Synthesized section area is clamped to this multiple of the atlas mean from
+# below. Range: 0.01..=1.0.
+area_floor_ratio = 0.2
+# … and to this multiple from above. Range: 1.0..=20.0.
+area_ceiling_ratio = 5.0
+# The mesh's uncertainty envelope scales ring offsets by sqrt(1 +
+# clamp(rel_std, 0, this)). Range: 0.0..=4.0.
+uncertainty_expand_max = 1.5
+# Resampled areas handed to the mesh are floored here, cm². Range: 1e-4..=0.1.
+resample_min_area_cm2 = 0.001
+
+# ArticulatorConfig: The articulator readout (`atlas::articulators`, the app's
+# `ArticulatorPosterior.infer`): mean log area ratio over six glottis-to-lips
+# regions of the normalized tract, clamped to ±1.
+[articulators]
+# Epilarynx region (fraction of tract length from the glottis), start. Range:
+# 0.0..=1.0.
+epilarynx_lo = 0.0
+# Epilarynx region end. Range: epilarynx_lo..=1.0.
+epilarynx_hi = 0.16
+# Pharynx region start. Range: 0.0..=1.0.
+pharynx_lo = 0.16
+# Pharynx region end. Range: pharynx_lo..=1.0.
+pharynx_hi = 0.45
+# Tongue-root region start. Range: 0.0..=1.0.
+tongue_root_lo = 0.28
+# Tongue-root region end. Range: tongue_root_lo..=1.0.
+tongue_root_hi = 0.52
+# Tongue-dorsum region start. Range: 0.0..=1.0.
+tongue_dorsum_lo = 0.48
+# Tongue-dorsum region end. Range: tongue_dorsum_lo..=1.0.
+tongue_dorsum_hi = 0.72
+# Front-of-tongue region start. Range: 0.0..=1.0.
+tongue_front_lo = 0.68
+# Front-of-tongue region end. Range: tongue_front_lo..=1.0.
+tongue_front_hi = 0.88
+# Lip region start. Range: 0.0..=1.0.
+lips_lo = 0.88
+# Lip region end. Range: lips_lo..=1.0.
+lips_hi = 1.0
+# Jaw opening = clamp(w_lips · lips + w_front · front). Lip weight. Range:
+# 0.0..=1.0.
+jaw_lip_weight = 0.55
+# Jaw opening front-of-tongue weight. Range: 0.0..=1.0.
+jaw_front_weight = 0.45
+# Area ratios are floored here before the log. Range: 1e-6..=1e-2.
+ratio_floor = 1.0e-4
+
+# ValidationConfig: Phase 3 validation bands (Experiment 3, `voxlab gen-inverse-
+# fixtures`) and the atlas figures the Evidence output reports.
+[validation]
+# Held-out (formants, tract-parameter) pairs per backend in the inverse
+# fixture set. Range: 100..=100000.
+inverse_fixture_pairs = 1000
+# Seed of the fixture sampler (deterministic xorshift). Range: any.
+inverse_fixture_seed = 20260914
+# A second posterior row samples coefficients within ±this many SD of the
+# atlas mean — the local regime the app's linear map was built for. Range:
+# 0.05..=2.0.
+inverse_local_span_sd = 0.5
+# Experiment 3 sweeps the forward model up to this frequency, Hz, so it can
+# return F4 (the atlas map's fourth input; the runtime solver stops at
+# `tract.sweep_hi_hz`). Range: 4500.0..=8000.0.
+forward_sweep_hi_hz = 6000.0
+# Central-difference step, SD, for the forward-model Jacobian that is compared
+# against the JSON's `jacobian_hz_per_sd`. Range: 0.01..=0.5.
+jacobian_step_sd = 0.1
+# Gate: 95th-percentile worst-of-F1..F3 round-trip error, relative. Range:
+# 0.001..=0.5.
+p95_relative_error_max = 0.05
+# Gate: the same, absolute, Hz (either band satisfies the gate). Range:
+# 1.0..=500.0.
+p95_absolute_error_hz_max = 50.0
+# Gate: per-frame inverse latency, ms. Range: 0.1..=50.0.
+inverse_latency_ms_max = 5.0
+# The atlas's held-out surface-error target, mm (the app's Evidence tab).
+# Range: 0.5..=20.0.
+surface_error_target_mm = 4.0
+# The held-out median surface error the atlas reports, mm ("Median 4.781 mm ·
+# target ≤4 mm · not met"). Range: 0.0..=50.0.
+surface_error_reported_mm = 4.781
+
+# ChoirStftConfig: Coral's STFT framing and wire encoding (`FFT_CONFIG`,
+# `DETECTOR_CONFIG.fftSize`, `spectrogram-encoding.ts`). The pipeline's `choir`
+# mode frames at the DETECTION size; the display size is recorded for the
+# renderer.
+[choir_stft]
+# Detection STFT size (decoupled from display in Coral: resolves bass
+# semitones, ~5.4 Hz bins at 44.1 kHz). Range: power of two, 2048..=16384.
+detection_fft_size = 8192
+# Detection hop, samples (fftSize / 4). Range: 1..=detection_fft_size.
+detection_hop = 2048
+# Display STFT size Coral's waterfall used. Range: power of two.
+display_fft_size = 2048
+# Display hop, samples. Range: 1..=display_fft_size.
+display_hop = 512
+# u8 wire encoding floor, dBFS. Range: -200.0..=-60.0.
+src_floor_db = -140.0
+# u8 wire encoding ceiling, dBFS (+12 dB headroom for coherent sums). Range:
+# 0.0..=24.0.
+src_ceil_db = 12.0
+# Epsilon added before the log. Range: 1e-15..=1e-6.
+magnitude_epsilon = 1.0e-10
+# Level meter cadence, ms. Range: 10..=500.
+level_interval_ms = 50.0
+
+# ChoirDetectorConfig: Coral's multi-F0 note detector (`DETECTOR_CONFIG` plus
+# the `NoteDetector` local defaults). Detection runs on the whitened spectrum by
+# iterative harmonic cancellation.
+[choir_detector]
+# Lowest candidate frequency, Hz. Range: 20.0..=200.0.
+min_freq_hz = 50.0
+# Highest candidate frequency, Hz. Range: 1000.0..=Nyquist.
+max_freq_hz = 8000.0
+# The rehearsal detector's candidate ceiling, Hz (just above C6). Range:
+# 800.0..=2000.0.
+harmony_max_hz = 1150.0
+# Legacy path dBFS threshold; also the whitening noise gate. Range:
+# -100.0..=0.0.
+threshold_db = -50.0
+# Harmonics summed per candidate (K), fundamental included. Range: 1..=32.
+harmonic_count = 9
+# Unitless salience floor (flat whitened region = 1.0). Range: 1.0..=10.0.
+salience_threshold = 3.0
+# Whitening moving-average width, Hz (→ bins at the detection STFT). Range:
+# 200.0..=8000.0.
+whitening_window_hz = 2000.0
+# Max simultaneous F0s the canceller extracts per frame. Range: 1..=16.
+max_polyphony = 8
+# Fraction of the modelled amplitude removed per cancellation. Range: 0.0 < x
+# ≤ 1.0.
+cancel_factor = 0.9
+# Collapse runs of active semitones with gaps ≤ this to the centroid. Range:
+# 0..=3.
+merge_radius = 1
+# Per-frame multiplicative decay of smoothed salience. Range: 0.0 < x < 1.0.
+decay_per_frame = 0.92
+# Harmonic-family margin, dB (0 = off; 8 = solo rehearsal). Range: 0.0..=20.0.
+family_margin_db = 0.0
+# Harmonics cancelled per accepted note (Kc). Range: 1..=32.
+cancel_harmonic_count = 16
+# Headroom multiplier on the neighbour envelope during cancellation. Range: ≥
+# 1.0.
+cancel_headroom = 1.0
+# Minimum whitened peak in the fundamental band for eligibility. Range:
+# 0.0..=5.0.
+fundamental_floor = 1.0
+# Partial levels below this, dB, count as absent. Range: -140.0..=-40.0.
+partial_floor_db = -90.0
+# Family test: smallest harmonic number a child can sit on. Range: 2..=4.
+family_k_min = 2
+# Family test: largest harmonic number. Range: family_k_min..=32.
+family_k_max = 12
+# Family test: a candidate is "on" a harmonic within this many cents. Range:
+# 10.0..=100.0.
+family_cents = 50.0
+# Envelope fit: points more than this above the trend are dropped, dB. Range:
+# 1.0..=12.0.
+fit_outlier_db = 4.0
+# Envelope fit default slope, dB per octave of k. Range: -12.0..=0.0.
+fit_default_slope = -6.0
+# Envelope fit default intercept when no points, dB. Range: -120.0..=0.0.
+fit_default_intercept = -60.0
+# Chest-voice prior: H2 may sit this far above H1, dB. Range: 0.0..=12.0.
+prior_h2_db = 6.0
+# Chest-voice prior: H3 may sit this far above H1, dB. Range: 0.0..=12.0.
+prior_h3_db = 3.0
+# Whitening envelope floor (division guard). Range: 1e-15..=1e-6.
+envelope_floor = 1.0e-12
+
+# QifftConfig: Coral's single-F0 estimator (`qifft.ts`, `INTONATION_CONFIG`):
+# parabolic interpolation of the magnitude peak in the vocal band.
+[qifft]
+# Lowest fundamental searched, Hz (~C2). Range: 30.0..=200.0.
+min_f0_hz = 65.0
+# Highest fundamental searched, Hz (~C#6). Range: 500.0..=2000.0.
+max_f0_hz = 1100.0
+# Voiced if peak / mean magnitude ≥ this. Range: 1.0..=20.0.
+voiced_ratio = 5.0
+# Sub-octave check: a peak at half the bin at least this fraction of the
+# global peak (and a local maximum) is the fundamental. Range: 0.0..=1.0.
+sub_octave_ratio = 0.3
+# Confidence = min(1, peak/mean / (this · voiced_ratio)). Range: 1.0..=4.0.
+confidence_divisor = 2.0
+# Epsilon under the log. Range: 1e-15..=1e-6.
+log_epsilon = 1.0e-12
+
+# ChoirLabelerConfig: Coral's SATB section labeler (`section-labeler.ts`):
+# pitch-range priors, a monotonic DP over the sorted notes, and an `A/T?`
+# abstention class in the alto/tenor overlap.
+[choir_labeler]
+# Bass range, MIDI, low (E2). Range: 30..=50.
+bass_lo = 40
+# Bass range high (E4). Range: bass_lo..=70.
+bass_hi = 64
+# Tenor range low (C3). Range: 40..=55.
+tenor_lo = 48
+# Tenor range high (A4). Range: tenor_lo..=75.
+tenor_hi = 69
+# Alto range low (F3). Range: 45..=60.
+alto_lo = 53
+# Alto range high (F5). Range: alto_lo..=84.
+alto_hi = 77
+# Soprano range low (C4). Range: 55..=65.
+soprano_lo = 60
+# Soprano range high (C6). Range: soprano_lo..=96.
+soprano_hi = 84
+# Alto/tenor overlap register, low (G3). Range: 48..=60.
+at_zone_lo = 55
+# Alto/tenor overlap register, high (A4). Range: at_zone_lo..=72.
+at_zone_hi = 69
+# |SPR lean| below this cannot resolve A vs T. Range: 0.0..=1.0.
+spr_margin = 0.3
+# Fit penalty for two notes in one section (divisi). Range: 0.0..=2.0.
+repeat_penalty = 0.5
+# Range fit outside a range: max(floor, scale · exp(−over / decay)). The
+# floor. Range: 0.0..=0.2.
+outside_floor = 0.02
+# Outside-range scale. Range: 0.0..=1.0.
+outside_scale = 0.25
+# Outside-range decay, semitones. Range: 1.0..=24.0.
+outside_decay_semitones = 6.0
+# Range fit inside a range: max(this, 1 − |m − centre| / half). Range:
+# 0.0..=1.0.
+inside_floor = 0.3
+# Detector factor = clamp(confidence / this, min, 1). The divisor. Range:
+# 1.0..=8.0.
+detector_factor_divisor = 2.0
+# Detector factor floor. Range: 0.0..=1.0.
+detector_factor_min = 0.3
+# Confidence cap when the SPR lean decides. Range: 0.0..=1.0.
+spr_confidence_max = 0.9
+# Confidence multiplier for a pitch-order-bracketed overlap note. Range:
+# 0.0..=1.0.
+bracketed_discount = 0.6
+# Confidence of an `A/T?` abstention. Range: 0.0..=1.0.
+ambiguous_confidence = 0.3
+# Singer's-formant band for the SPR lean, low, Hz. Range: 1000.0..=3000.0.
+spr_band_lo_hz = 2000.0
+# SPR band high, Hz. Range: spr_band_lo_hz..=6000.0.
+spr_band_hi_hz = 4000.0
+# Tenor/alto formant midpoint, Hz. Range: 2000.0..=3500.0.
+spr_center_hz = 2800.0
+# Lean = clamp((centroid − centre) / this, −1, 1), Hz. Range: 50.0..=1000.0.
+spr_scale_hz = 250.0
+# Peak search half-width around each partial, bins. Range: 0..=8.
+spr_peak_bins = 2
+
+# ChoirHarmonyConfig: Coral's rehearsal harmony analysis (`harmony.ts`): card
+# state, tolerance bands, drift memory, chord hold, scatter measure and the
+# chord-identification score.
+[choir_harmony]
+# Reference A4, Hz. Range: 415.0..=466.0.
+a4_hz = 440.0
+# A card keeps a note this long after it was last seen, ms. Range:
+# 50.0..=2000.0.
+hold_ms = 400.0
+# Detection frames before a card lights (≈140 ms). Range: 1..=20.
+onset_frames = 3
+# Frames of consistent relabelling before a card abandons a note (≈0.6 s).
+# Range: 1..=60.
+relabel_frames = 12
+# Frames a suspect (partial-of-a-held-note) candidate must persist. Range:
+# 1..=60.
+suspect_frames = 6
+# A chord is "settled" after this long, ms. Range: 50.0..=2000.0.
+chord_hold_ms = 300.0
+# Drift memory: r ← memory · r + (1 − memory) · τ. Range: 0.0..=1.0.
+drift_memory = 0.85
+# Drift updates at least every this many ms without a chord change. Range:
+# 200.0..=10000.0.
+drift_interval_ms = 2000.0
+# In-tune band, cents. Range: 1.0..=30.0.
+band_in_cents = 10.0
+# Marginal band edge, cents. Range: band_in_cents..=60.0.
+band_out_cents = 20.0
+# In-tune band for short notes or the flat side when vibrato-heavy. Range:
+# 1.0..=40.0.
+band_wide_in_cents = 20.0
+# Marginal edge for the widened band. Range: band_wide_in_cents..=80.0.
+band_wide_out_cents = 30.0
+# Notes held shorter than this get the widened band, ms. Range: 50.0..=1000.0.
+short_note_ms = 250.0
+# Median window of recent pitches per card, frames. Range: 1..=15.
+history_len = 5
+# A candidate within this of partial 2–4 of a held note is a suspect, cents.
+# Range: 5.0..=100.0.
+suspect_cents = 40.0
+# A card follows the nearest voice within this, cents. Range: 20.0..=200.0.
+continuity_cents = 80.0
+# Highest partial a suspect is checked against. Range: 2..=8.
+suspect_k_max = 4
+# Orphans need at least this section confidence to displace a card. Range:
+# 0.0..=1.0.
+orphan_confidence_min = 0.2
+# Card-claim score = salience · max(this, section confidence). Range:
+# 0.0..=1.0.
+claim_confidence_floor = 0.05
+# Scatter band edges, cents: tight below this. Range: 1.0..=30.0.
+scatter_tight_cents = 10.0
+# Typical below this. Range: scatter_tight_cents..=40.0.
+scatter_typical_cents = 15.0
+# Loose below this; scattered above. Range: scatter_typical_cents..=80.0.
+scatter_loose_cents = 30.0
+# Highest partial examined for scatter. Range: 2..=20.
+scatter_k_max = 10
+# Lowest partial examined for scatter. Range: 2..=scatter_k_max.
+scatter_k_min = 2
+# A partial below this frequency is not used for scatter, Hz. Range:
+# 100.0..=2000.0.
+scatter_min_hz = 500.0
+# Scatter search half-width around the partial, cents. Range: 10.0..=200.0.
+scatter_half_cents = 60.0
+# Scatter search half-width floor, bins. Range: 1..=10.
+scatter_half_bins_min = 3
+# A partial must sit this far above the floor, dB. Range: 5.0..=60.0.
+scatter_min_above_floor_db = 20.0
+# Width cut: this far below the peak, dB. Range: 3.0..=30.0.
+scatter_cut_below_peak_db = 12.0
+# … but never lower than this above the floor, dB. Range: 0.0..=20.0.
+scatter_cut_above_floor_db = 6.0
+# Isolation: another voice's partial within this many cents disqualifies.
+# Range: 10.0..=100.0.
+scatter_isolation_cents = 50.0
+# Pair tune = exp(−(err / this)²), cents. Range: 5.0..=60.0.
+tune_sigma_cents = 20.0
+# Consonance index weight of pair tuning. Range: 0.0..=1.0.
+consonance_tune_weight = 0.6
+# Consonance index weight of interval-class consonance. Range: 0.0..=1.0.
+consonance_class_weight = 0.4
+# Chord score: points per covered pitch class. Range: 1.0..=20.0.
+chord_score_covered = 10.0
+# Chord score: points off per missing chord tone. Range: 0.0..=10.0.
+chord_score_missing = 4.0
+# Chord score: bonus when the lowest voice is the root. Range: 0.0..=5.0.
+chord_score_root_bonus = 2.0
+# Chord score: penalty per template tone (prefers smaller templates). Range:
+# 0.0..=1.0.
+chord_score_size_penalty = 0.1
+# Hann main-lobe RMS width integration range, bins. Range: 1.0..=6.0.
+hann_sigma_range_bins = 3.0
+# … and step, bins. Range: 0.001..=0.1.
+hann_sigma_step_bins = 0.01
+# Level meter epsilon under the log. Range: 1e-15..=1e-6.
+level_epsilon = 1.0e-10
+# Scatter/detection-spectrum floor estimate samples every this many bins.
+# Range: 1..=64.
+floor_sample_stride = 8
+# Floor fallback when the spectrum is empty, dB. Range: -200.0..=-60.0.
+floor_fallback_db = -120.0
+
+# DiagnosticsConfig: Diagnostics: offline assistant rules, store limits, form
+# validation.
+[diagnostics]
+# Minimum spacing between `derived_state_sample` events, ms; a change in the
+# dropped-frame count bypasses it. Range: 100..=5000.
+sample_interval_ms = 500
+# Events the console lists under "Recent session events". Range: 10..=200.
+recent_events_shown = 30
+# DSP time above this fraction of the frame budget is "budget pressure" (a
+# warning); above the whole budget is a missed deadline (an error). Range:
+# 0.25..=0.9.
+budget_pressure_fraction = 0.5
+# Dropped frames at or above this make `queue_drops` an error instead of a
+# warning. Range: 1..=100.
+drops_error_threshold = 10
+# Voiced frames with f0 confidence below this raise `low_f0_confidence`.
+# Range: 0.3..=0.9.
+f0_confidence_warn = 0.55
+# Voiced frames with SNR below this, dB, raise `low_signal_to_noise`. Range:
+# 0.0..=20.0.
+snr_low_db = 6.0
+# f0 below this, Hz, is outside the normal analysis range. Range:
+# 20.0..=100.0.
+f0_unusual_min_hz = 50.0
+# f0 above this, Hz, is outside the normal analysis range. Range:
+# 800.0..=3000.0.
+f0_unusual_max_hz = 1500.0
+# Mean formant standard deviation above this, Hz, raises
+# `uncertain_resonances`. Range: 50.0..=1000.0.
+formant_std_warn_hz = 250.0
+# Tract confidence below this is an error (`very_low_tract_confidence`).
+# Range: 0.0..=tract_confidence_warn.
+tract_confidence_error = 0.15
+# Tract confidence below this is a warning (`low_tract_confidence`). Range:
+# tract_confidence_error..=0.9.
+tract_confidence_warn = 0.35
+# Relative airway-area standard deviation above this raises
+# `large_area_uncertainty`. Range: 0.1..=1.0.
+area_std_warn = 0.65
+# Health-score points removed per ERROR finding. Range: 1..=100.
+penalty_error = 25
+# Health-score points removed per WARNING finding. Range: 1..=100.
+penalty_warning = 10
+# Health-score points removed per INFO finding. Range: 0..=100.
+penalty_info = 2
+# Health score is clamped to 0..=this. Range: exactly 100.
+health_max = 100
+# Lowest expected F0 a correction may propose, Hz. Range: 20.0..=100.0.
+expected_f0_min_hz = 40.0
+# Highest expected F0 a correction may propose, Hz. Range: 1000.0..=4000.0.
+expected_f0_max_hz = 2000.0
+# Most expected resonances a correction may list (R1–R6). Range: 1..=8.
+expected_resonances_max = 6
+# Lowest expected resonance, Hz. Range: 50.0..=200.0.
+resonance_min_hz = 80.0
+# Highest expected resonance, Hz. Range: 5000.0..=20000.0.
+resonance_max_hz = 10000.0
+# Session event file cap, bytes; appends stop past it. Range: 1 MiB..=64 MiB.
+max_session_bytes = 4194304
+# Refinement file cap, bytes; appends fail past it. Range: 1 MiB..=64 MiB.
+max_refinement_bytes = 4194304
+# Newest session files kept; older ones are pruned at startup. Range: 1..=100.
+max_session_files = 20
+# Events carried in an export bundle (and the most `recent_events` may
+# return). Range: 100..=10000.
+max_exported_events = 1500
+# Refinement records carried in an export bundle. Range: 10..=5000.
+max_exported_refinements = 500
+# Event category is truncated to this many characters. Range: 8..=100.
+category_max_chars = 40
+# Event code is truncated to this many characters. Range: 8..=200.
+code_max_chars = 80
+# Event message and each evidence value are truncated to this many characters.
+# Range: 50..=2000.
+message_max_chars = 500
+# Characters of the record/session UUID shown to the user. Range: 4..=32.
+short_id_chars = 8
+# Stack frames kept in a crash event's evidence. Range: 1..=32.
+crash_top_frames = 8
+# Pitch self-test: fixture tone, Hz. Range: 60.0..=400.0.
+self_test_tone_hz = 110.0
+# Pitch self-test: accepted low bound, Hz. Range: below tone.
+self_test_tone_min_hz = 105.0
+# Pitch self-test: accepted high bound, Hz. Range: above tone.
+self_test_tone_max_hz = 116.0
+# Pitch self-test: fixture amplitude, linear. Range: 0.05..=0.9.
+self_test_tone_amplitude = 0.3
+# Noise-floor self-test: quiet frame RMS. Range: 1e-5..=1e-2.
+self_test_quiet_rms = 0.001
+# Noise-floor self-test: quiet frames pushed before measuring. Range:
+# noise_floor.ring_min..=noise_floor.ring_len.
+self_test_quiet_frames = 40
+# Noise-floor self-test: loud frame RMS. Range: 0.01..=1.0.
+self_test_loud_rms = 0.1
+# Noise-floor self-test: SNR the loud frame must reach, dB. Range: 6.0..=40.0.
+self_test_min_snr_db = 30.0
+# Synthesis self-test: samples rendered. Range: 64..=8192.
+self_test_synth_samples = 512
+# Synthesis self-test: a sample above this counts as sound. Range:
+# 1e-9..=1e-2.
+self_test_synth_silence = 1e-5
+# Synthesis self-test: sample rate the bank renders at, Hz. Range:
+# 8000.0..=96000.0.
+self_test_synth_rate_hz = 48000.0
+# Synthesis self-test: glide time handed to the bank, ms. Range: 1.0..=500.0.
+self_test_synth_glide_ms = 20.0
+# Console toast lifetime, seconds. Range: 1.0..=10.0.
+toast_secs = 3.5
+
+# ToleranceConfig: D5 tolerance bands for tap-by-tap comparison
+# (`pipeline::compare`).
+[tolerance]
+# f0 agreement, Hz. Range: 0.01..=5.0.
+f0_hz = 0.1
+# Estimator confidence agreement (unit scale). Range: 1e-4..=0.1.
+confidence = 1e-3
+# Formant frequency agreement, Hz (kernel parity: tenths of a Hz). Range:
+# 0.01..=50.0.
+formant_hz = 0.1
+# Formant bandwidth agreement, Hz. Range: 0.01..=50.0.
+bandwidth_hz = 0.5
+# Harmonic amplitude agreement, relative to the frame's strongest harmonic.
+# Range: 1e-5..=0.1.
+harmonic_rel = 1e-3
+# Any dB-valued metric (HNR, H1–H2, CPP, shimmer, SNR, spectrum bins), dB.
+# Range: 0.01..=3.0.
+metric_db = 0.1
+# Jitter agreement, percent. Range: 1e-3..=1.0.
+jitter_pct = 0.01
+# Spectral centroid agreement, Hz. Range: 0.1..=100.0.
+centroid_hz = 1.0
+# Vibrato rate agreement, Hz. Range: 0.01..=1.0.
+vibrato_rate_hz = 0.05
+# Vibrato extent and steadiness agreement, cents. Range: 0.1..=20.0.
+cents = 1.0
+# Story mode coefficient agreement. Range: 1e-4..=0.5.
+tract_q = 1e-3
+# Atlas mode coefficient agreement, standard deviations (the posterior
+# inverse's `modes`). Range: 1e-4..=0.5.
+mode_sd = 1e-3
+# Mesh vertex agreement, mm per coordinate. Range: 1e-3..=1.0.
+geometry_mm = 0.01
+# Vocal-tract length agreement, cm. Range: 0.01..=1.0.
+vtl_cm = 0.05
+# Area-function agreement, cm² per section. Range: 1e-4..=0.5.
+area_cm2 = 1e-3
+# Diameter agreement, cm per section. Range: 1e-4..=0.5.
+diameter_cm = 1e-3
+# Linear spectrum magnitude agreement, relative to the frame's peak bin.
+# Range: 1e-5..=0.1.
+spectrum_rel = 1e-3

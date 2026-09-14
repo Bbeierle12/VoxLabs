@@ -15,6 +15,13 @@ impl DashboardApp {
         self.screen_kicker(ui, "ACOUSTIC ENVIRONMENT", "Room");
         ui.add_space(16.0);
 
+        // The analysis pipeline's taps and timing (Plan v3 Phase 1 gate).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.pipeline_card(ui);
+            ui.add_space(12.0);
+        }
+
         // ── Levels: live input against the learned floor ──
         glass(20.0).show(ui, |ui| {
             ui.label(

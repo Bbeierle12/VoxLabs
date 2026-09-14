@@ -21,6 +21,9 @@ mirrored back to the plan.
 | D11 | Provenance record per run (stage impls, versions, params, target, build flags, input hash) is the input to `vox-validation`; output format is Vocal Tract Lab's Evidence tab | Proposed |
 | D12 | No pipeline editor before Phase 8, and Phase 8 is gated on external use | Proposed |
 | D13 | Rename `voice_harmonic_engine` → `vox-core` and split `ui.rs` *before* the Coral subtree import | Proposed |
+| D14 | Hop 1024 is canonical for the whole pipeline; spectrogram moves to hop 1024 with `overlap` as its own parameter | Decided |
+| D16 | LPC order is adaptive (8–20 after decimation to 11 025 Hz) by design; not fixed 24 | Decided |
+| D17 | `parabolic_flat_eps` (1e-6 YIN vs 1e-12 elsewhere) and synthesis vs analysis default bandwidths: confirm intentional or reconcile, from the code | Decided (check in Phase 1) |
 | O1 | Whether inverse tables and PCA bases derived from VTL `.speaker` files are GPL-encumbered | Open — check the data files' license in the VTL repo; get a real opinion before any sale |
 | O2 | Canonical Coral signing key | Open |
 | O3 | Whether Resonator adopts the core (cheap if it's a 3-stage pipeline config) | Open |
@@ -36,3 +39,174 @@ mirrored back to the plan.
   renamed to `vox-core`, Android package to `org.voxlabs.core`, `ui.rs` split
   into `src/ui/`. Its row above still reads "Proposed" because that is how §1
   is written; the plan is the place to change it.
+- **D14, D16, D17** (2026-09-08): copied from Plan v3 §1 as written (D15 and
+  D18 exist in the plan but were not requested here). D14 is applied to the
+  runner (`pipelines/live_model.toml`, hop 1024); the spectrogram still runs at
+  hop 512 with its own `[spectrogram]` keys until it becomes a stage (Phase 5c).
+  D16 is the code as it stands: `lpc.order_base + fs_dec / lpc.order_hz_per_pole`
+  clamped to `[lpc.order_min, lpc.order_max]` = 8–20 at 11 025 Hz.
+- **D17 findings** (2026-09-08, read from the code and history; nothing
+  changed):
+  - `yin.parabolic_flat_eps = 1e-6` vs `1e-12` in `hnr`, `perturbation`, and
+    `vibrato`. All four guard the same formula, `|s0 − 2·s1 + s2|`. YIN's runs
+    on the cumulative-mean-normalized difference, whose values are of order 1,
+    so 1e-6 is a real "flat neighbourhood" threshold at f32 precision. The
+    other three run on raw signal-scale quantities (autocorrelation sums,
+    sample peaks, DFT power) where 1e-12 only catches an exact-zero
+    denominator. Both were introduced together in commit b32aed4
+    (2026-07-01, "publish jitter/shimmer/CPP on both analysis paths") with no
+    comment either way. Verdict: consistent with intent (different scales), but
+    undocumented; reconciling to one value would change YIN's lag refinement.
+    Recommendation: keep both, document the scale argument on the fields.
+  - Synthesis default bandwidths `[50, 100, 150]` vs analysis `[80, 120, 160]`.
+    The synthesis triple is the oscillator's start-up envelope before any
+    profile arrives (narrower = more resonant idle tone); the analysis triple is
+    the envelope held until the first voiced frame. They can both reach the
+    oscillator: `set_profile` adopts the analysis defaults whenever a voiced
+    frame's LPC resolves no F1. Both also date from b32aed4 with no comment.
+    Verdict: cannot be confirmed intentional from the code; the values do not
+    interact numerically (the glide converges either way), so no behavior
+    hinges on it. Recommendation: reconcile to the analysis triple when Phase 2
+    wraps synthesis, since that is the envelope the analyzer actually holds.
+
+- **D18 amendment — Pixel only** (2026-09-14, Brandon: "This is going on my
+  Google Pixel right now. Nothing else."): the phone is the only product.
+  Desktop stays a build-and-test target for the contract tests and the
+  `voxlab` harness, not a product; Phase 5c reduces to the D15 engine
+  cleanup on desktop; Phase 5b (browser wasm) is dropped from the schedule
+  (the wasm build must still type-check, nothing more). Every gate is the
+  phone's.
+- **Completion-plan calls** (2026-09-14, made by the agent under the
+  "complete all phases" directive, per `docs/PLAN_v3_completion.md` §13;
+  each stands until Brandon says otherwise):
+  1. No adb on the study phone: the contract tests run on device from the
+     Engineering Console self-test (`pipeline::contract`), the runner's
+     timing report is a `runtime/pipeline_report` event in the bundle.
+  2. Workspace split at the start of Phase 2.
+  3. No ISO 532-1 reference vectors are available; the `loudness` stage is
+     deferred until a vectors file exists (test-first rule).
+  4. Voiceprint, LTAS and the Fach measures are tap consumers, not stages.
+  5. The GPU baseline cannot be frozen here (no wgpu adapter) and desktop is
+     not a product; D15's gate becomes: the desktop CPU engine equals the
+     `voxlab` harness bit-for-bit and `gpu_yin_matches_cpu`'s CPU side.
+  6. O4: Phase 3 proceeds from the decompiled Vocal Tract Lab 0.10.0 APK;
+     the source is still wanted for fine-grained parity.
+  7. O1: to be answered from the `reduced_model.json` atlas block and the
+     `Vocal-Tract-Labs` corpus registry in Phase 3.
+  8. Coral capture moves to cpal in Phase 4.
+  9. Phone first (5a before any desktop work), unchanged.
+  10. O3 (Resonator/egui) decided at 5c.
+- **Phase 2 status** (2026-09-14): D6, D7, D8, D9 and D11 are implemented
+  as proposed — audio I/O stays outside the pipeline (ring buffer +
+  runner), `Stage` and the runner live in `vox-core`, every stage
+  preallocates at `init`, one TOML per mode (`live_model`, `fingerprint`,
+  `calibrate`), and a provenance record per run feeds `vox-validation`,
+  whose Evidence output follows the Vocal Tract Lab Evidence tab. The rows
+  above keep the plan's wording; see `docs/phase2-gate.md`.
+- **Phase 3 status** (2026-09-14): D10's two backends exist —
+  `inverse/posterior_pca4`, `tract/mri_pca4` and the `mesh/lumen_v2`
+  stage producing `TractGeometry`, ported formula-for-formula from the
+  decompiled Vocal Tract Lab 0.10.0 APK with the app's formulas as their
+  contract tests (`docs/phase3-gate.md`). The data files ship in
+  `assets/vocal_tract_lab/` with digests checked at load and their own
+  release statements carried into provenance and the Evidence output.
+  D10's second clause — "Kotlin DSP retires after tolerance-band parity" —
+  is **not met**: parity is bundle-against-bundle on the Pixel and has not
+  been run. The Kotlin DSP is not marked retired.
+- **Experiment 3 verdict and fallback** (2026-09-14): `grid_story` meets
+  the bands (p95 1.9 % / 12 Hz, 3 µs); `posterior_pca4` meets latency
+  (0.2 µs) and misses accuracy (p95 42 % over ±2 SD, 9.6 % within
+  ±0.5 SD, after F4 was fed in) under VoxLabs' forward model, whose
+  Jacobian is within 19 % of the app's own. The map is the exact inverse
+  of the app's 4 × 4 Jacobian and is a local linearization by the
+  app's own description. Decision, per the plan's exit clause: the
+  posterior is kept as the **parity target** (it is the app's
+  algorithm) and is not offered as an accuracy-grade inverse;
+  `live_model` keeps the Story grid; the plan's fallback (a distilled
+  offline-trained model at the same latency bar, report C3) is the path
+  if an accuracy-grade atlas inverse is wanted, and is not started until
+  the phone parity comparison says whether the port matches the app.
+- **F4** (2026-09-14): `FormantTrack` gained `f4: Option<Formant>` (the
+  fourth in-band LPC pole, from the same candidate list F1–F3 come from)
+  because the app's map needs four formants (`docs/phase3-gate.md`, "Why
+  F4 matters"). `VocalProfile`, the synthesizer and every three-formant
+  path are unchanged.
+- **O4** (2026-09-14): resolved as far as the decompile allows. Ported:
+  `ReducedModelAsset`, `TemporalAtlasFilter`, the evidence score from
+  `FrameAnalyzer`, `TractLumenAsset`, `TractMeshCpu`,
+  `ArticulatorPosterior`. Still wanted from the source: the Kotlin
+  originals (comments, tests), the replay fixtures and per-frame outputs
+  for the fine-grained parity gate, `SharedTractModel.fit`/`TubeGrid`
+  semantics. The decompile is checked in under
+  `research/vocal-tract-lab-0.10.0/` and labelled as such.
+- **O1** (2026-09-14, from the files in hand — the `Vocal-Tract-Labs`
+  corpus registry was not available to read): `reduced_model.json`'s
+  atlas block says the model is the app's own frozen (0.6.3) metric-MRI
+  engineering mean over five subject means; the app's MRI reference
+  (`reference.js`) cites Ruthven, Peplinski and Miquel (2023), Zenodo
+  10046815, CC BY 4.0, 2-D real-time MRI labels. No VocalTractLab
+  (Birkholz, GPL) `.speaker` data is involved in Phase 3's files, so
+  O1's GPL question does not attach to them. O1 stays open for Phase 6
+  (the `vox-tract-vtl` backend), where it does attach.
+- **Phase 4 status** (2026-09-14): D4 is implemented — Coral's choir
+  branch runs in Rust (`vox-core::choir`: Coral STFT, QIFFT, the multi-F0
+  detector with harmonic cancellation, the SATB labeler, the rehearsal
+  harmony and card analyser, the SATB synthesizer) with Coral's own tests
+  and its six librosa oracle fixtures as the contracts, wrapped as the
+  `stft/coral_hann`, `pitch/qifft`, `multi_f0/harmonic_cancellation` and
+  `satb/labeler` stages, and run headless by `vox-harness` as
+  `pipelines/choir.toml` (`docs/phase4-gate.md`). D1's import is a
+  working-tree copy at commit 382290e under `apps/coral/` (the clone was
+  shallow; `git subtree add` refuses shallow roots — `apps/coral/IMPORT.md`).
+- **Phase 4 deviations under the Pixel-only directive** (2026-09-14):
+  the plan's §5.3 shell (Tauri 2 + React on desktop), Coral's Spectrogram
+  and Rehearsal views as tap renderers, the TypeScript worker's deletion
+  and Coral's capture → cpal (completion-plan call 8) all move to Phase
+  5a, where the phone's shell is decided; a desktop-only shell is not on
+  the schedule. The TypeScript worker is not deleted in this phase
+  because nothing on the phone yet consumes the Rust taps in its place;
+  its deletion is 5a's exit condition (recorded, not optional). The JI
+  harmony is a tap consumer, not a wire (§5.2's preference; the fixtures
+  did not need a wire).
+- **Coral's salience threshold** (2026-09-14): `detector.ts` ships
+  `salienceThreshold: 3.0` while its comment argues 3.5 and `PROGRESS.md`
+  records 3.2 as the tuned value. The port keeps 3.0 (the shipped
+  behaviour, and what `choir-detection.test.ts` was calibrated against);
+  the drift is noted for Brandon, not resolved by the port.
+- **Phase 5 status and the shell decision** (2026-09-14): under the
+  Pixel-only directive the phone's shell is the existing egui
+  NativeActivity build; Tauri 2 Android is not stood up. Reasons: the
+  egui build already runs every mode, the Console and the taps on the
+  Pixel; a WebView shell could not be verified here (no device access,
+  no adb) and has no desktop product to share with; Coral's React views
+  would have been rewrites either way, and are now egui tap renderers.
+  O3 is answered for this repository: egui on both targets. D15 is done
+  as reduced (the desktop runs the same `shell::engine` as the phone; the
+  GPU engine and its shaders are deleted). 5b is dropped; the wasm
+  type-check stays in CI. Experiment 2 (WebGL2 vs WebGPU) is not run —
+  it measured a WebView the shell does not use. The D5 arm64-vs-x86_64
+  bands are procedure-complete (Console → Record/Export fixture taps;
+  `voxlab fixture-taps` / `compare-taps`) and wait for the phone's
+  files. Details: `docs/phase5-gate.md`. Brandon can overturn the shell
+  decision; nothing in the pipeline depends on it (D9).
+- **Phases 6–8 status** (2026-09-14): Phase 6 ships the boundary, not
+  the backend — `crates/vox-tract-vtl` (GPL-3.0-or-later, feature-gated,
+  API declarations and two stage types that refuse to init without the
+  feature), `scripts/check-no-vtl.sh` in CI proving `vox-core` has no VTL
+  dependency and the release cdylib no VTL symbol, and
+  `pipelines/workbench.toml` (both inverses side by side, every tap).
+  The fitting loop, the tube mapping, the 19-D parameter wire and the
+  derived tables wait for a VocalTractLab library and a `.speaker` file,
+  neither of which is in reach here. Phase 7 has no data in hand; the
+  entry point is recorded (FRIEDRICHS2026, CC BY 4.0). Phase 8's gate is
+  closed. `docs/phase6-8-gate.md`.
+- **O1, written answer** (2026-09-14, from `Vocal-Tract-Labs` at
+  f3f907a): the corpus registry lists no VocalTractLab `.speaker` data
+  and nothing derived from it; every resource is link-only with terms to
+  verify (one CC BY 4.0); Phase 3's atlas files descend from the app's
+  own MRI means and a CC BY 4.0 label set. Nothing in VoxLabs is
+  GPL-encumbered through VTL today because nothing has been derived from
+  VTL. O1 reopens the day `vox-tract-vtl` produces a table or a basis,
+  and that output does not ship without a written licence opinion. A
+  reading of the files, not legal advice.
+
