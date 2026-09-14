@@ -279,3 +279,43 @@ fn atlas_mode_round_trips_with_geometry_and_reports_the_atlas_statements() {
     assert!(evidence_hops > 0, "the posterior abstained on every hop");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// Phase 4: the choir mode records and round-trips within the bands —
+/// NoteSet and SectionLabels included — on a synthetic SATB chord.
+#[test]
+fn choir_mode_round_trips_note_sets_and_labels() {
+    use vox_core::choir::labeler::Section;
+    use vox_core::choir::synth::{ChordSpec, VoiceSpec, synthesize_choir_chord};
+    let dir = temp_dir("choir");
+    let wav = dir.join("cmaj.wav");
+    let mut spec = ChordSpec::new(
+        SR as f64,
+        1.5,
+        vec![
+            VoiceSpec::new(Section::B, 48),
+            VoiceSpec::new(Section::T, 55),
+            VoiceSpec::new(Section::A, 64),
+            VoiceSpec::new(Section::S, 72),
+        ],
+    );
+    spec.seed = 7;
+    write_wav(&wav, &synthesize_choir_chord(&spec).unwrap().samples);
+    let mode = PipelineDefinition::by_name_or_path("choir").unwrap();
+    let out = dir.join("results");
+    let (hops, provenance) = record_run(&mode, &wav, &out, SR as f32).unwrap();
+    assert!(hops > 20, "{hops} hops");
+    let report = validate_and_write(&provenance).unwrap();
+    assert!(report.pass, "{:#?}", report.compare.per_type);
+    for t in ["Spectrum", "F0Track", "NoteSet", "SectionLabels"] {
+        assert!(report.compare.per_type.contains_key(t), "{t} compared");
+    }
+    let taps = vox_validation::read_taps(&out.join("cmaj.taps.jsonl")).unwrap();
+    let last = taps.last().unwrap();
+    let Some(vox_core::pipeline::types::Wire::NoteSet(n)) = last.taps.get("multi_f0") else {
+        panic!("no NoteSet tap");
+    };
+    for m in [48, 55, 64] {
+        assert!(n.active_midi.contains(&m), "{:?}", n.active_midi);
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

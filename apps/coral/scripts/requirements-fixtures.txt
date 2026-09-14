@@ -1,0 +1,8 @@
+# Oracle-fixture generation only — never needed in CI (fixtures are committed).
+# Usage:
+#   python3 -m venv scripts/.venv
+#   scripts/.venv/bin/pip install -r scripts/requirements-fixtures.txt
+#   scripts/.venv/bin/python scripts/generate_fixtures.py
+librosa>=0.10
+soundfile>=0.12
+numpy>=1.26

@@ -399,6 +399,36 @@ impl TractGeometry {
     }
 }
 
+/// One detected voice in a `NoteSet`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DetectedNote {
+    pub midi: i32,
+    /// Parabola-refined fundamental on the detection spectrum, Hz.
+    pub f0_hz: f32,
+    /// Detector confidence: smoothed salience / threshold (≥ 1 active).
+    pub salience: f32,
+}
+
+/// Coral's per-detection-frame note sets (`multi_f0` stage): the active
+/// MIDI numbers over the display range, and the rehearsal voices (the
+/// same detector bound to sung fundamentals, ≤ `choir_detector.harmony_max_hz`)
+/// with their sub-bin pitch and confidence. Vectors are sized once at
+/// `init` to the detector's note count and only cleared per hop.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NoteSet {
+    pub active_midi: Vec<i32>,
+    pub voices: Vec<DetectedNote>,
+    pub frame_index: u64,
+}
+
+/// Coral's SATB labels for the `NoteSet` voices (`satb` stage), in the
+/// voices' order.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SectionLabels {
+    pub labels: Vec<crate::choir::labeler::SectionLabel>,
+    pub frame_index: u64,
+}
+
 /// One preallocated wire slot. The runner owns one per stage output plus
 /// the source frame; stages read inputs and write their output in place.
 // The variants differ in size by design: wires are preallocated once and
@@ -416,6 +446,8 @@ pub enum Wire {
     TractParams(TractParams),
     AreaFunction(AreaFunction),
     TractGeometry(TractGeometry),
+    NoteSet(NoteSet),
+    SectionLabels(SectionLabels),
 }
 
 impl Wire {
@@ -430,6 +462,8 @@ impl Wire {
             Wire::TractParams(_) => WireType::TractParams,
             Wire::AreaFunction(_) => WireType::AreaFunction,
             Wire::TractGeometry(_) => WireType::TractGeometry,
+            Wire::NoteSet(_) => WireType::NoteSet,
+            Wire::SectionLabels(_) => WireType::SectionLabels,
         }
     }
 
@@ -457,6 +491,15 @@ impl Wire {
             WireType::TractParams => Wire::TractParams(TractParams::default()),
             WireType::AreaFunction => Wire::AreaFunction(AreaFunction::neutral(BasisId::AdultMale)),
             WireType::TractGeometry => Wire::TractGeometry(TractGeometry::preallocated()?),
+            WireType::NoteSet => Wire::NoteSet(NoteSet {
+                active_midi: Vec::with_capacity(128),
+                voices: Vec::with_capacity(128),
+                frame_index: 0,
+            }),
+            WireType::SectionLabels => Wire::SectionLabels(SectionLabels {
+                labels: Vec::with_capacity(128),
+                frame_index: 0,
+            }),
             other => {
                 return Err(StageError::Init(format!(
                     "no payload for wire type {other}; no stage produces it yet"
@@ -501,6 +544,8 @@ wire_value!(FormantTrack);
 wire_value!(TractParams);
 wire_value!(AreaFunction);
 wire_value!(TractGeometry);
+wire_value!(NoteSet);
+wire_value!(SectionLabels);
 
 /// A stage's input: one wire value, or a tuple of them, borrowed from the
 /// runner's wire slots for the duration of `process`.

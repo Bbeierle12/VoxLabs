@@ -113,6 +113,8 @@ impl PipelineDefinition {
     /// Phase 3: the Vocal Tract Lab chain (posterior inverse, MRI-reduced
     /// area function, lumen mesh).
     pub const ATLAS: &'static str = include_str!("../../pipelines/atlas.toml");
+    /// Phase 4: Coral's choir branch (Coral STFT, QIFFT, multi-F0, SATB).
+    pub const CHOIR: &'static str = include_str!("../../pipelines/choir.toml");
 
     /// Every compiled-in mode, by name.
     pub const MODES: &'static [(&'static str, &'static str)] = &[
@@ -120,6 +122,7 @@ impl PipelineDefinition {
         ("fingerprint", Self::FINGERPRINT),
         ("calibrate", Self::CALIBRATE),
         ("atlas", Self::ATLAS),
+        ("choir", Self::CHOIR),
     ];
 
     /// A compiled-in mode by name, or a `.toml` path.

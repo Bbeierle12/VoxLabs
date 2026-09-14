@@ -12,8 +12,8 @@ use crate::config::ToleranceConfig;
 use crate::types::VoiceMetrics;
 
 use super::types::{
-    AreaFunction, F0Track, FormantTrack, HarmonicSeries, Spectrum, TractGeometry, TractParams,
-    Wire, WireType,
+    AreaFunction, F0Track, FormantTrack, HarmonicSeries, NoteSet, SectionLabels, Spectrum,
+    TractGeometry, TractParams, Wire, WireType,
 };
 
 /// The worst disagreement seen for one wire type, and whether it stayed
@@ -80,6 +80,8 @@ impl Comparer {
                 (Wire::TractParams(p), Wire::TractParams(q)) => self.tract(p, q, &mut worst),
                 (Wire::AreaFunction(p), Wire::AreaFunction(q)) => self.area(p, q, &mut worst),
                 (Wire::TractGeometry(p), Wire::TractGeometry(q)) => self.geometry(p, q, &mut worst),
+                (Wire::NoteSet(p), Wire::NoteSet(q)) => self.notes(p, q, &mut worst),
+                (Wire::SectionLabels(p), Wire::SectionLabels(q)) => w_labels(p, q, &mut worst),
                 _ => {
                     self.report.mismatched_types += 1;
                     continue;
@@ -285,6 +287,44 @@ impl Comparer {
         for (i, (a, b)) in p.diameters_cm.iter().zip(&q.diameters_cm).enumerate() {
             w.abs(&format!("diameter[{i}]"), *a, *b, self.tol.diameter_cm);
         }
+    }
+}
+
+impl Comparer {
+    fn notes(&self, p: &NoteSet, q: &NoteSet, w: &mut Excess) {
+        w.flag("active_midi", p.active_midi != q.active_midi);
+        w.flag("voice count", p.voices.len() != q.voices.len());
+        for (i, (a, b)) in p.voices.iter().zip(&q.voices).enumerate() {
+            w.flag(&format!("voice[{i}].midi"), a.midi != b.midi);
+            w.abs(
+                &format!("voice[{i}].f0_hz"),
+                a.f0_hz,
+                b.f0_hz,
+                self.tol.f0_hz,
+            );
+            w.abs(
+                &format!("voice[{i}].salience"),
+                a.salience,
+                b.salience,
+                self.tol.confidence,
+            );
+        }
+    }
+}
+
+fn w_labels(p: &SectionLabels, q: &SectionLabels, w: &mut Excess) {
+    w.flag("label count", p.labels.len() != q.labels.len());
+    for (i, (a, b)) in p.labels.iter().zip(&q.labels).enumerate() {
+        w.flag(
+            &format!("label[{i}]"),
+            a.midi != b.midi || a.label != b.label || a.guess != b.guess,
+        );
+        w.abs(
+            &format!("label[{i}].confidence"),
+            a.confidence,
+            b.confidence,
+            0.011,
+        );
     }
 }
 

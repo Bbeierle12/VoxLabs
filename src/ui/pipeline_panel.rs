@@ -326,6 +326,22 @@ fn describe_tap(w: &Wire) -> String {
             a.basis.name(),
             if a.live { "LIVE" } else { "HELD" }
         ),
+        Wire::NoteSet(n) => format!(
+            "{} active · {} voices · {}",
+            n.active_midi.len(),
+            n.voices.len(),
+            n.voices
+                .iter()
+                .map(|v| format!("{} {:.1} Hz", v.midi, v.f0_hz))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        ),
+        Wire::SectionLabels(l) => l
+            .labels
+            .iter()
+            .map(|x| format!("{} {} ({:.2})", x.midi, x.label.text(), x.confidence))
+            .collect::<Vec<_>>()
+            .join(" · "),
         Wire::TractGeometry(g) => format!(
             "{} vertices · {} triangles · rel σ {:.2} · {} · {}",
             g.vertex_count,

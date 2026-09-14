@@ -73,6 +73,7 @@ pub mod fach;
 mod device_probe;
 // SHA-256 for provenance digests (no dependency).
 pub mod atlas;
+pub mod choir;
 pub mod hash;
 pub mod math;
 // The room as calibration learned it (floor seed, hum), shared between the

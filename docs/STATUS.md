@@ -274,3 +274,17 @@ the console.
 - Still needed from the phone: a screenshot or bundle for the live-audio
   fault ("No voice signal captured"), and the self-test lines.
 
+## Addendum — Phase 4 on branch `claude/epic-lamport-euju2k` (14 September 2026, evening)
+
+- Coral is imported under `apps/coral/` (commit 382290e, working-tree
+  copy) and its DSP runs in Rust: `pipelines/choir.toml` = Coral STFT →
+  QIFFT → multi-F0 (harmonic cancellation) → SATB labels, with the
+  rehearsal harmony as a tap consumer. Coral's tests and librosa fixtures
+  pass on the port; `docs/phase4-gate.md` has the table.
+- On the Pixel: three more `contract.*` lines in the Console self-test
+  (`choir_stft_matches_librosa`, `choir_detects_a_close_triad`,
+  `choir_harmony_hears_c_major`). The live screen still runs `live_model`;
+  the choir mode has no phone screen until 5a.
+- Not done: the shell, the tap renderers, the TypeScript worker's
+  deletion and Coral's capture → cpal (all 5a, see DECISIONS.md).
+

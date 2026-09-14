@@ -15,13 +15,17 @@
 //! itself passes through (`tract.grid_n`).
 
 pub mod contour;
+pub mod coral_stft;
 pub mod harmonics;
 pub mod inverse;
 pub mod lpc;
 pub mod mesh;
 pub mod metrics;
 pub mod mri_tract;
+pub mod multi_f0;
 pub mod posterior;
+pub mod qifft;
+pub mod satb;
 pub mod stft;
 pub mod tract;
 pub mod voicing;
@@ -44,6 +48,10 @@ pub fn registry() -> &'static [StageDescriptor] {
         describe::<mri_tract::MriTractStage>(),
         describe::<mesh::LumenMeshStage>(),
         describe::<stft::StftStage>(),
+        describe::<coral_stft::CoralStftStage>(),
+        describe::<qifft::QifftStage>(),
+        describe::<multi_f0::MultiF0Stage>(),
+        describe::<satb::SatbStage>(),
     ];
     REGISTRY
 }

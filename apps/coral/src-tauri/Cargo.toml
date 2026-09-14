@@ -1,0 +1,33 @@
+[package]
+name = "coral"
+version = "0.2.0"
+description = "Choral spectrogram & harmonic analyzer"
+authors = ["Bbeierle12"]
+license = "MIT"
+repository = "https://github.com/Bbeierle12/Coral"
+edition = "2021"
+rust-version = "1.77.2"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.2", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11.2", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+# Linux only: grant the WebKitGTK microphone permission-request (getUserMedia is
+# denied by default there). Pinned to the exact version wry 0.55 resolves so
+# Cargo unifies to one webkit2gtk and the WebView types match.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "=2.0.2"

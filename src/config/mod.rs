@@ -20,6 +20,7 @@
 //! Phase 0 rule: no behavior change — the `DEFAULT`s are the literals that
 //! were in the code, moved, not retuned.
 
+pub mod choir;
 pub mod consts;
 pub mod contour;
 pub mod diagnostics;
@@ -36,6 +37,9 @@ pub mod tolerance;
 pub mod tract;
 pub mod voiceprint;
 
+pub use choir::{
+    ChoirDetectorConfig, ChoirHarmonyConfig, ChoirLabelerConfig, ChoirStftConfig, QifftConfig,
+};
 pub use contour::VibratoConfig;
 pub use diagnostics::DiagnosticsConfig;
 pub use fach::FachConfig;
@@ -87,6 +91,11 @@ pub struct PipelineParams {
     pub posterior: PosteriorConfig,
     pub articulators: ArticulatorConfig,
     pub validation: ValidationConfig,
+    pub choir_stft: ChoirStftConfig,
+    pub choir_detector: ChoirDetectorConfig,
+    pub qifft: QifftConfig,
+    pub choir_labeler: ChoirLabelerConfig,
+    pub choir_harmony: ChoirHarmonyConfig,
     pub diagnostics: DiagnosticsConfig,
     pub tolerance: ToleranceConfig,
 }
@@ -121,6 +130,11 @@ impl PipelineParams {
         posterior: PosteriorConfig::DEFAULT,
         articulators: ArticulatorConfig::DEFAULT,
         validation: ValidationConfig::DEFAULT,
+        choir_stft: ChoirStftConfig::DEFAULT,
+        choir_detector: ChoirDetectorConfig::DEFAULT,
+        qifft: QifftConfig::DEFAULT,
+        choir_labeler: ChoirLabelerConfig::DEFAULT,
+        choir_harmony: ChoirHarmonyConfig::DEFAULT,
         diagnostics: DiagnosticsConfig::DEFAULT,
         tolerance: ToleranceConfig::DEFAULT,
     };
@@ -299,6 +313,20 @@ pub fn all_sections() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
         (
             ValidationConfig::SECTION,
             ValidationConfig::DEFAULT.entries(),
+        ),
+        (ChoirStftConfig::SECTION, ChoirStftConfig::DEFAULT.entries()),
+        (
+            ChoirDetectorConfig::SECTION,
+            ChoirDetectorConfig::DEFAULT.entries(),
+        ),
+        (QifftConfig::SECTION, QifftConfig::DEFAULT.entries()),
+        (
+            ChoirLabelerConfig::SECTION,
+            ChoirLabelerConfig::DEFAULT.entries(),
+        ),
+        (
+            ChoirHarmonyConfig::SECTION,
+            ChoirHarmonyConfig::DEFAULT.entries(),
         ),
         (
             DiagnosticsConfig::SECTION,

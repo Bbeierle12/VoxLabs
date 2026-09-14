@@ -148,4 +148,29 @@ mirrored back to the plan.
   (Birkholz, GPL) `.speaker` data is involved in Phase 3's files, so
   O1's GPL question does not attach to them. O1 stays open for Phase 6
   (the `vox-tract-vtl` backend), where it does attach.
+- **Phase 4 status** (2026-09-14): D4 is implemented — Coral's choir
+  branch runs in Rust (`vox-core::choir`: Coral STFT, QIFFT, the multi-F0
+  detector with harmonic cancellation, the SATB labeler, the rehearsal
+  harmony and card analyser, the SATB synthesizer) with Coral's own tests
+  and its six librosa oracle fixtures as the contracts, wrapped as the
+  `stft/coral_hann`, `pitch/qifft`, `multi_f0/harmonic_cancellation` and
+  `satb/labeler` stages, and run headless by `vox-harness` as
+  `pipelines/choir.toml` (`docs/phase4-gate.md`). D1's import is a
+  working-tree copy at commit 382290e under `apps/coral/` (the clone was
+  shallow; `git subtree add` refuses shallow roots — `apps/coral/IMPORT.md`).
+- **Phase 4 deviations under the Pixel-only directive** (2026-09-14):
+  the plan's §5.3 shell (Tauri 2 + React on desktop), Coral's Spectrogram
+  and Rehearsal views as tap renderers, the TypeScript worker's deletion
+  and Coral's capture → cpal (completion-plan call 8) all move to Phase
+  5a, where the phone's shell is decided; a desktop-only shell is not on
+  the schedule. The TypeScript worker is not deleted in this phase
+  because nothing on the phone yet consumes the Rust taps in its place;
+  its deletion is 5a's exit condition (recorded, not optional). The JI
+  harmony is a tap consumer, not a wire (§5.2's preference; the fixtures
+  did not need a wire).
+- **Coral's salience threshold** (2026-09-14): `detector.ts` ships
+  `salienceThreshold: 3.0` while its comment argues 3.5 and `PROGRESS.md`
+  records 3.2 as the tuned value. The port keeps 3.0 (the shipped
+  behaviour, and what `choir-detection.test.ts` was calibrated against);
+  the drift is noted for Brandon, not resolved by the port.
 
