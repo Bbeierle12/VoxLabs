@@ -168,3 +168,59 @@ simultaneous-source case, four-state design), *Fach, Measured* (what
 separates voice parts acoustically, the classification ceiling), *Fach Lab*
 (the study plan this status tracks). The fingerprint review's conclusions
 are summarized in §3 above.
+
+---
+
+## Addendum — state on branch `claude/epic-lamport-euju2k` (14 September 2026, later)
+
+The note above describes `main` at `b041c7a`. This branch (PR #1, head
+`520d5c3` + this commit) carries Plan v3 Phase 0 and Phase 1 on top of it;
+where the two disagree, this addendum is current.
+
+**Names.** Crate `voice_harmonic_engine` → `vox-core` (`vox_core` in paths,
+`libvox_core.so`); Android package `com.voiceharmonic.engine` →
+`org.voxlabs.core`. The dev-APK convention in §5 still holds and now yields
+`org.voxlabs.core.dev` / "VoxLabs (dev)". The build in PR #1 was made
+without that patch step, so its id is the base `org.voxlabs.core` and its
+label is still "Voice Harmonic Engine" — the label was not renamed in
+Phase 0. Data paths follow the id: `/sdcard/Android/data/<id>/files/…`.
+
+**Layout.** `src/ui.rs` is `src/ui/` (18 files, all under 500 lines).
+Every DSP literal is a field of a `StageConfig` in `src/config/` mirrored
+by `pipeline.toml` (a drift test enforces both directions); definitional
+constants are `config::consts`; `docs/phase0-extraction.md` maps each value
+to its old line. `DECISIONS.md` is the plan's §1 table plus D14, D16, D17
+and the D17 findings.
+
+**Pipeline (Phase 1).** `src/pipeline/`: the §2 type universe, the `Stage`
+contract, `pipelines/live_model.toml` (loaded, not generated: format, stages
+with backend ids, taps, runner limits, `[params]` overrides), a builder that
+refuses a bad wire and names the adapter chain, a bounded tap channel, and a
+worker runner that re-frames the ring to hop 1024 with per-stage timing and
+deadline accounting. YIN, LPC/Levinson, the 41×41 grid inverse and the Story
+tract are wrapped as stages (kernels untouched). The Android loop runs
+through the runner; the not-yet-wrapped per-frame work (`FrameAnalyzer`,
+spectrogram, calibration, export) is a hop observer on every second hop, so
+every readout in §1 is unchanged. The Room screen has a PIPELINE card.
+The desktop GPU engine is untouched (D15 → Phase 5c).
+
+**Verification on this branch.** `cargo test`: 163 library + 6 harness
+tests (Phase 1 adds 6 acceptance and 13 contract tests); rustfmt clean, no
+warnings; `cargo build --lib` for `aarch64-linux-android`; `cargo build`
+for `wasm32-unknown-unknown`; `cargo apk build --lib --release` packages and
+signs. The `voxlab` harness output was byte-identical before and after the
+config extraction. **Not yet done:** the Phase 1 gate's on-device half —
+per-stage timing, mic-to-render latency, deadline misses over ten minutes
+on the Pixel — procedure and pass criteria in `docs/phase1-gate.md`.
+
+**Field notes since.** Installing the Phase 1 build beside a dev build and
+then uninstalling it left the dev build without microphone input. Two
+mechanisms fit, neither caused by Phase 1: the app never reopens its
+capture stream after losing the mic to a foreground app, and it never
+requests `RECORD_AUDIO` itself, so an auto-reset permission leaves it in
+SEARCHING. Both are follow-ups (resume handling; runtime permission
+request), alongside renaming the launcher label to "VoxLabs".
+
+**Next.** Run the Phase 1 gate on the Pixel; if it passes, Phase 2 (wrap
+the rest of C2, provenance, `vox-harness`). The M1–M5 Fach Lab plan in §4
+is unchanged and runs in parallel on the harness.
