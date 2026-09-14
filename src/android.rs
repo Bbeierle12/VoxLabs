@@ -37,7 +37,7 @@
 //! ≥ 0.31 (with real `Destroy` handling) lands in eframe.
 
 use crate::audio::AudioEngine;
-use crate::concurrency::{AnalysisState, ConcurrencyBridges, Telemetry};
+use crate::concurrency::{AnalysisState, ConcurrencyBridges, MicPermission, MicRequest, Telemetry};
 use crate::pipeline::runner::{HopObserver, Runner, RunnerState};
 use crate::pipeline::{AudioFrame, PipelineDefinition, Wire};
 use crate::types::VocalProfile;
@@ -67,10 +67,10 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
 /// How often the grant state is re-read after the permission dialog was
-/// shown, and how long to keep asking before giving up on this launch (the
-/// user may have dismissed the dialog; the next launch asks again).
-const PERMISSION_POLL: Duration = Duration::from_millis(500);
-const PERMISSION_WAIT: Duration = Duration::from_secs(120);
+/// shown. The poll runs until the grant lands or the generation is retired:
+/// the user may grant it from Settings minutes later (Room → DIAGNOSTICS →
+/// Open app settings) and expects audio to come up without a relaunch.
+const PERMISSION_POLL: Duration = Duration::from_secs(1);
 
 /// One `android_main` invocation's background resources, parked where the
 /// *next* invocation can reach them.
@@ -138,10 +138,8 @@ fn retire_previous_generation() {
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
-    android_logger::init_once(
-        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
-    );
-    log::info!("android_main: starting Voice Harmonic Engine");
+    install_logger();
+    log::info!("android_main: starting VoxLabs");
 
     // Before anything is constructed: whatever a previous launch left running
     // in this process must be gone. See the module docs on re-entry.
@@ -324,9 +322,9 @@ fn android_main(app: AndroidApp) {
 /// Opens the audio engine once `RECORD_AUDIO` is granted. Held already:
 /// opened on this thread before returning. Not held: the permission dialog
 /// is raised, the UI shows the microphone-unavailable banner, and a thread
-/// polls the grant state, opening the engine the moment it lands (or giving
-/// up after [`PERMISSION_WAIT`] — the next launch asks again). A failure to
-/// open with the grant held stays fatal for audio, as before, and is logged.
+/// polls the grant state every [`PERMISSION_POLL`], opening the engine the
+/// moment it lands, until the generation is retired. A failure to open with
+/// the grant held stays fatal for audio, as before, and is logged.
 fn start_audio_when_permitted(
     profile_rx: triple_buffer::Output<VocalProfile>,
     event_rx: rtrb::Consumer<crate::concurrency::EngineEvent>,
@@ -337,6 +335,9 @@ fn start_audio_when_permitted(
     built_for_sample_rate: f32,
 ) {
     if crate::permission::has_record_audio() {
+        telemetry.set_mic_permission(MicPermission::Granted);
+        telemetry.set_mic_request(MicRequest::NotNeeded);
+        log::info!("RECORD_AUDIO already granted; opening audio");
         open_audio(
             profile_rx,
             event_rx,
@@ -348,16 +349,23 @@ fn start_audio_when_permitted(
         );
         return;
     }
+    telemetry.set_mic_permission(MicPermission::NotGranted);
     telemetry.set_audio_unavailable(true);
     log::info!("RECORD_AUDIO not granted yet; asking the user");
-    if !crate::permission::request_record_audio() {
-        log::error!("could not raise the microphone permission dialog; grant it in Settings");
+    if crate::permission::request_record_audio() {
+        telemetry.set_mic_request(MicRequest::Raised);
+    } else {
+        telemetry.set_mic_request(MicRequest::Failed);
+        log::error!(
+            "could not raise the microphone permission dialog; \
+             grant it by hand: Room → DIAGNOSTICS → Open app settings → Permissions → Microphone"
+        );
     }
     thread::spawn(move || {
-        let deadline = Instant::now() + PERMISSION_WAIT;
-        while Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
+        while !shutdown.load(Ordering::Relaxed) {
             thread::sleep(PERMISSION_POLL);
             if crate::permission::has_record_audio() {
+                telemetry.set_mic_permission(MicPermission::Granted);
                 log::info!("RECORD_AUDIO granted; opening audio");
                 open_audio(
                     profile_rx,
@@ -371,13 +379,19 @@ fn start_audio_when_permitted(
                 return;
             }
         }
-        if !shutdown.load(Ordering::Relaxed) {
-            log::warn!(
-                "RECORD_AUDIO not granted within {} s; audio stays off until the next launch",
-                PERMISSION_WAIT.as_secs()
-            );
-        }
     });
+}
+
+/// Installs the Android logger wrapped in the in-app diagnostics tee, so the
+/// Room screen can show the same lines logcat would. `set_boxed_logger`
+/// fails on a relaunch in the same process (the first generation's logger is
+/// still installed and already tees), which is fine to ignore.
+fn install_logger() {
+    let inner = android_logger::AndroidLogger::new(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+    let _ = log::set_boxed_logger(Box::new(crate::diag::Tee { inner }));
+    log::set_max_level(log::LevelFilter::Info);
 }
 
 /// Opens the cpal engine and parks it in the generation's slot. If the

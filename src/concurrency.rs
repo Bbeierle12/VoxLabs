@@ -96,6 +96,46 @@ pub struct Telemetry {
     calib_ambient_rms: CachePadded<AtomicU32>,
     calib_interferer_f0: CachePadded<AtomicU32>,
     calib_interferer_rms: CachePadded<AtomicU32>,
+    /// Microphone permission as the shell last saw it ([`MicPermission`]),
+    /// and whether the system dialog could be raised ([`MicRequest`]).
+    /// Written by the Android entry point, read by the DIAGNOSTICS card.
+    mic_permission: CachePadded<AtomicU8>,
+    mic_request: CachePadded<AtomicU8>,
+}
+
+/// RECORD_AUDIO grant state as the shell observes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum MicPermission {
+    /// Not checked on this target (desktop, web).
+    Unknown,
+    NotGranted,
+    Granted,
+}
+
+/// Whether the shell managed to raise the system permission dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum MicRequest {
+    NotNeeded,
+    Raised,
+    Failed,
+}
+
+impl MicPermission {
+    const ALL: &'static [MicPermission] = &[
+        MicPermission::Unknown,
+        MicPermission::NotGranted,
+        MicPermission::Granted,
+    ];
+}
+
+impl MicRequest {
+    const ALL: &'static [MicRequest] = &[
+        MicRequest::NotNeeded,
+        MicRequest::Raised,
+        MicRequest::Failed,
+    ];
 }
 
 impl Telemetry {
@@ -114,7 +154,31 @@ impl Telemetry {
             calib_ambient_rms: CachePadded::new(AtomicU32::new(0)),
             calib_interferer_f0: CachePadded::new(AtomicU32::new(0)),
             calib_interferer_rms: CachePadded::new(AtomicU32::new(0)),
+            mic_permission: CachePadded::new(AtomicU8::new(MicPermission::Unknown as u8)),
+            mic_request: CachePadded::new(AtomicU8::new(MicRequest::NotNeeded as u8)),
         }
+    }
+
+    pub fn mic_permission(&self) -> MicPermission {
+        MicPermission::ALL
+            .get(self.mic_permission.load(Ordering::Relaxed) as usize)
+            .copied()
+            .unwrap_or(MicPermission::Unknown)
+    }
+
+    pub fn set_mic_permission(&self, p: MicPermission) {
+        self.mic_permission.store(p as u8, Ordering::Relaxed);
+    }
+
+    pub fn mic_request(&self) -> MicRequest {
+        MicRequest::ALL
+            .get(self.mic_request.load(Ordering::Relaxed) as usize)
+            .copied()
+            .unwrap_or(MicRequest::NotNeeded)
+    }
+
+    pub fn set_mic_request(&self, r: MicRequest) {
+        self.mic_request.store(r as u8, Ordering::Relaxed);
     }
 
     /// UI: arm a calibration pass of `frames` analysis frames.

@@ -40,6 +40,8 @@ pub mod audio_file;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capture_log;
 mod concurrency;
+// In-app diagnostics log ring (Room → DIAGNOSTICS), for phones without adb.
+pub mod diag;
 // Stage configuration: every tunable number, mirrored in pipeline.toml.
 pub mod config;
 // The analysis pipeline (Plan v3 Phase 1): Stage trait, builder, runner,

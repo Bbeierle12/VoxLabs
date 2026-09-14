@@ -66,8 +66,10 @@ impl DashboardApp {
         // below would only describe a consequence of this.
         if self.telemetry.audio_unavailable() {
             return Some(
-                "Microphone unavailable — the audio engine could not open the mic. \
-                 Grant the Microphone permission in Settings, then reopen the app.",
+                "Microphone unavailable — no input stream is open. If the permission \
+                 dialog did not appear or was dismissed: Room → DIAGNOSTICS → Open app \
+                 settings → Permissions → Microphone → Allow. Audio starts as soon as \
+                 it is granted.",
             );
         }
         match self.telemetry.analysis_state() {

@@ -20,6 +20,7 @@
 mod app;
 mod capture;
 mod detail;
+mod diagnostics;
 mod files;
 mod gauges;
 mod live;

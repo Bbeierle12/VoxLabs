@@ -83,3 +83,70 @@ pub fn request_record_audio() -> bool {
         false
     })
 }
+
+/// `Intent.FLAG_ACTIVITY_NEW_TASK`.
+const FLAG_ACTIVITY_NEW_TASK: i32 = 0x1000_0000;
+
+/// Opens this app's page in the system Settings (Permissions → Microphone
+/// lives there) — the way to grant the permission by hand on a phone
+/// without `adb`, when the dialog could not be shown or was dismissed.
+pub fn open_app_settings() -> bool {
+    with_activity(|env, activity| {
+        let package = env
+            .call_method(
+                activity,
+                jni_str!("getPackageName"),
+                jni_sig!("()Ljava/lang/String;"),
+                &[],
+            )?
+            .l()?;
+        let intent_class = env.find_class(jni_str!("android/content/Intent"))?;
+        let action = env.new_string("android.settings.APPLICATION_DETAILS_SETTINGS")?;
+        let intent = env.new_object(
+            &intent_class,
+            jni_sig!("(Ljava/lang/String;)V"),
+            &[JValue::Object(&action)],
+        )?;
+        let uri_class = env.find_class(jni_str!("android/net/Uri"))?;
+        let scheme = env.new_string("package")?;
+        let null = JObject::null();
+        let uri = env
+            .call_static_method(
+                &uri_class,
+                jni_str!("fromParts"),
+                jni_sig!(
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Landroid/net/Uri;"
+                ),
+                &[
+                    JValue::Object(&scheme),
+                    JValue::Object(&package),
+                    JValue::Object(&null),
+                ],
+            )?
+            .l()?;
+        env.call_method(
+            &intent,
+            jni_str!("setData"),
+            jni_sig!("(Landroid/net/Uri;)Landroid/content/Intent;"),
+            &[JValue::Object(&uri)],
+        )?;
+        env.call_method(
+            &intent,
+            jni_str!("addFlags"),
+            jni_sig!("(I)Landroid/content/Intent;"),
+            &[JValue::Int(FLAG_ACTIVITY_NEW_TASK)],
+        )?;
+        env.call_method(
+            activity,
+            jni_str!("startActivity"),
+            jni_sig!("(Landroid/content/Intent;)V"),
+            &[JValue::Object(&intent)],
+        )?;
+        Ok(())
+    })
+    .map(|()| true)
+    .unwrap_or_else(|e| {
+        log::warn!("could not open the app's Settings page: {e}");
+        false
+    })
+}

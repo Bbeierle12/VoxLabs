@@ -15,6 +15,11 @@ impl DashboardApp {
         self.screen_kicker(ui, "ACOUSTIC ENVIRONMENT", "Room");
         ui.add_space(16.0);
 
+        // What the app knows about its own microphone and analysis state,
+        // and the recent log — the bug report for a phone without adb.
+        self.diagnostics_card(ui);
+        ui.add_space(12.0);
+
         // The analysis pipeline's taps and timing (Plan v3 Phase 1 gate).
         #[cfg(not(target_arch = "wasm32"))]
         {
