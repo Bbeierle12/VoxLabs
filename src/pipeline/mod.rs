@@ -28,6 +28,10 @@ pub mod types;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod runner;
+// The Phase 1 contract checks as functions: host tests and the phone's
+// self-test run the same bodies.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod contract;
 
 #[cfg(test)]
 mod tests;

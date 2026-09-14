@@ -69,3 +69,30 @@ mirrored back to the plan.
     hinges on it. Recommendation: reconcile to the analysis triple when Phase 2
     wraps synthesis, since that is the envelope the analyzer actually holds.
 
+- **D18 amendment — Pixel only** (2026-09-14, Brandon: "This is going on my
+  Google Pixel right now. Nothing else."): the phone is the only product.
+  Desktop stays a build-and-test target for the contract tests and the
+  `voxlab` harness, not a product; Phase 5c reduces to the D15 engine
+  cleanup on desktop; Phase 5b (browser wasm) is dropped from the schedule
+  (the wasm build must still type-check, nothing more). Every gate is the
+  phone's.
+- **Completion-plan calls** (2026-09-14, made by the agent under the
+  "complete all phases" directive, per `docs/PLAN_v3_completion.md` §13;
+  each stands until Brandon says otherwise):
+  1. No adb on the study phone: the contract tests run on device from the
+     Engineering Console self-test (`pipeline::contract`), the runner's
+     timing report is a `runtime/pipeline_report` event in the bundle.
+  2. Workspace split at the start of Phase 2.
+  3. No ISO 532-1 reference vectors are available; the `loudness` stage is
+     deferred until a vectors file exists (test-first rule).
+  4. Voiceprint, LTAS and the Fach measures are tap consumers, not stages.
+  5. The GPU baseline cannot be frozen here (no wgpu adapter) and desktop is
+     not a product; D15's gate becomes: the desktop CPU engine equals the
+     `voxlab` harness bit-for-bit and `gpu_yin_matches_cpu`'s CPU side.
+  6. O4: Phase 3 proceeds from the decompiled Vocal Tract Lab 0.10.0 APK;
+     the source is still wanted for fine-grained parity.
+  7. O1: to be answered from the `reduced_model.json` atlas block and the
+     `Vocal-Tract-Labs` corpus registry in Phase 3.
+  8. Coral capture moves to cpal in Phase 4.
+  9. Phone first (5a before any desktop work), unchanged.
+  10. O3 (Resonator/egui) decided at 5c.

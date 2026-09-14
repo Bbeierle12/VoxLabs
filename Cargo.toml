@@ -163,7 +163,7 @@ min_sdk_version = 26
 target_sdk_version = 34
 
 [package.metadata.android.application]
-label = "Voice Harmonic Engine"
+label = "VoxLabs"
 
 # Real-time microphone capture. This is a runtime ("dangerous") permission on
 # Android 6+; declaring it here is necessary but NOT sufficient — the app/user

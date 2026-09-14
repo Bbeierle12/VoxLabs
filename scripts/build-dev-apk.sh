@@ -26,7 +26,7 @@ set -euo pipefail
 
 readonly BASE_ID="org.voxlabs.core"
 readonly DEV_ID="org.voxlabs.core.dev"
-readonly BASE_LABEL="Voice Harmonic Engine"
+readonly BASE_LABEL="VoxLabs"
 readonly DEV_LABEL="VoxLabs (dev)"
 # Pixel 8+ / Android 15+ run with 16 KB pages; NDK 26 links 4 KB-aligned by
 # default and such a .so cannot be mapped (docs/android-build.md §3).

@@ -35,6 +35,17 @@ pub fn run(files_dir: Option<&Path>) -> Vec<SelfTestResult> {
     test("private_storage", &|| private_storage(files_dir));
     test("pitch_estimator", &pitch_estimator);
     test("noise_floor", &noise_floor);
+    for (code, result) in crate::pipeline::contract::run_all() {
+        let (passed, message) = match result {
+            Ok(m) => (true, m),
+            Err(e) => (false, e),
+        };
+        out.push(SelfTestResult {
+            code: format!("contract.{code}"),
+            passed,
+            message,
+        });
+    }
     let granted = microphone_granted();
     out.push(SelfTestResult {
         code: "microphone_permission".into(),
@@ -220,7 +231,10 @@ mod tests {
     #[test]
     fn every_check_reports_a_code() {
         let results = run(None);
-        assert_eq!(results.len(), 9);
+        assert_eq!(
+            results.len(),
+            9 + crate::pipeline::contract::run_all().len()
+        );
         assert_eq!(results.last().unwrap().code, "microphone_permission");
     }
 }

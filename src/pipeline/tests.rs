@@ -6,7 +6,6 @@
 //! against the thresholds in config. The on-device numbers (D18) come from
 //! the same runner on the Pixel; these prove the mechanism.
 
-use std::f32::consts::TAU;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -16,47 +15,10 @@ use super::definition::PipelineDefinition;
 use super::runner::{HopObserver, Runner, RunnerState};
 use super::types::{AudioFrame, Wire, WireType};
 
-const SR: f32 = 48_000.0;
+use super::contract::{SR, vowel};
 
-/// The Live Model definition with the coarse test grid (tract.rs's own
-/// tests use 21×21 for speed) — an override through the documented
-/// `[params]` mechanism, so the test exercises that path too.
 fn live_model_coarse() -> PipelineDefinition {
-    let text = format!(
-        "{}\n[params.tract]\ngrid_n = 21\n",
-        PipelineDefinition::LIVE_MODEL
-    );
-    PipelineDefinition::from_toml(&text).expect("live_model.toml with a grid override")
-}
-
-/// Harmonic-rich vowel at `f0`, filtered by the Story /ɑ/ tract so the
-/// formants are physical (frame.rs's synth is a plain sawtooth; here the
-/// harmonics get the model's own resonances, which the inverse can find).
-fn vowel(f0: f32, q1: f32, q2: f32, n: usize) -> Vec<f32> {
-    use crate::tract::{ADULT_MALE, area_function, resonances};
-    let areas = area_function(&ADULT_MALE, q1, q2);
-    let [r1, r2, r3] = resonances(&areas, ADULT_MALE.vtl_cm).expect("resonances");
-    let gain = |f: f32| -> f32 {
-        // Three resonance peaks with 80 Hz bandwidth, plus -6 dB/oct source.
-        let peak = |r: f32| 1.0 / (1.0 + ((f - r) / 40.0).powi(2));
-        (peak(r1) + peak(r2) + peak(r3) + 0.05) / (1.0 + f / 500.0)
-    };
-    (0..n)
-        .map(|i| {
-            let t = i as f32 / SR;
-            (1..=30)
-                .map(|k| {
-                    let fk = f0 * k as f32;
-                    if fk >= SR / 2.0 {
-                        0.0
-                    } else {
-                        gain(fk) * (TAU * fk * t).sin()
-                    }
-                })
-                .sum::<f32>()
-                * 0.15
-        })
-        .collect()
+    super::contract::live_model_coarse().expect("live_model.toml with a grid override")
 }
 
 #[test]

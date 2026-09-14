@@ -418,18 +418,57 @@ fn worker(
 /// Periodic timing line for logcat / the desktop log — the record a
 /// ten-minute on-device run leaves behind.
 fn report(name: &str, stats: &RunnerStats, names: &[Arc<str>], hop: u64, budget_us: u64) {
+    let mut evidence = std::collections::BTreeMap::new();
     let per_stage: Vec<String> = stats
         .stages
         .iter()
         .zip(names)
         .map(|(s, n)| {
             let mean = s.total_us.load(Ordering::Relaxed) / hop.max(1);
-            format!(
-                "{n} mean {mean} us max {} us",
-                s.max_us.load(Ordering::Relaxed)
-            )
+            let max = s.max_us.load(Ordering::Relaxed);
+            evidence.insert(format!("stage.{n}.mean_us"), mean.to_string());
+            evidence.insert(format!("stage.{n}.max_us"), max.to_string());
+            format!("{n} mean {mean} us max {max} us")
         })
         .collect();
+    let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+    for (k, v) in [
+        ("hop", hop),
+        ("worst_hop_us", load(&stats.worst_hop_us)),
+        ("budget_us", budget_us),
+        ("misses", load(&stats.misses)),
+        ("over_gate", load(&stats.over_fraction)),
+        (
+            "analysis_latency_max_us",
+            load(&stats.analysis_latency_max_us),
+        ),
+        ("render_latency_max_us", load(&stats.render_latency_max_us)),
+        ("backlog_max_samples", load(&stats.backlog_max_samples)),
+        ("tap_drops", load(&stats.tap_drops)),
+        ("stage_errors", load(&stats.stage_errors)),
+    ] {
+        evidence.insert(k.to_string(), v.to_string());
+    }
+    // The same line as an event, so a phone without adb keeps the record
+    // in its diagnostics bundle (Phase 1 gate, D18).
+    let severity = if load(&stats.misses) > 0 || load(&stats.stage_errors) > 0 {
+        crate::diagnostics::Severity::Warning
+    } else {
+        crate::diagnostics::Severity::Info
+    };
+    crate::diagnostics::runtime::log(
+        "runtime",
+        "pipeline_report",
+        &format!(
+            "pipeline `{name}` hop {hop}: worst hop {} us of {budget_us} us budget, misses {}, \
+             stage errors {}",
+            load(&stats.worst_hop_us),
+            load(&stats.misses),
+            load(&stats.stage_errors)
+        ),
+        evidence,
+        severity,
+    );
     log::info!(
         "pipeline `{name}` hop {hop}: worst hop {} us of {budget_us} us budget, misses {}, over-gate {}, \
          analysis latency max {} us, render latency max {} us, backlog max {} samples, tap drops {}, \
