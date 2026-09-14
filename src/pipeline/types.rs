@@ -228,6 +228,9 @@ impl AreaFunction {
 
 /// One preallocated wire slot. The runner owns one per stage output plus
 /// the source frame; stages read inputs and write their output in place.
+// The variants differ in size by design: wires are preallocated once and
+// cloned only into tap messages, so the largest variant costs nothing per hop.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Wire {
     AudioFrame(AudioFrame),

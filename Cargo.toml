@@ -10,11 +10,12 @@ edition = "2024"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-# The Fach Lab study harness: decodes audio files and runs them through the
-# same FrameAnalyzer the phone runs. Desktop only (it links the decoders).
-[[bin]]
-name = "voxlab"
-path = "src/bin/voxlab.rs"
+# Plan v3 D2: the workspace. `vox-core` is the root package (the library the
+# APK loads and the desktop binary link; cargo-apk and scripts/build-dev-apk.sh
+# operate on it unchanged). The study harness (`voxlab`) and the validation
+# crate are members under crates/. `cargo test --workspace` runs everything.
+[workspace]
+members = ["crates/vox-harness", "crates/vox-validation"]
 
 # Shared across every target (native desktop, Android, web/wasm). Pure-Rust and
 # wasm-compatible. eframe here is a minimal common base with no renderer/backend

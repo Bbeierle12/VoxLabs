@@ -112,7 +112,7 @@ fn unknown_backends_taps_and_param_keys_fail_loud() {
         PipelineDefinition::LIVE_MODEL
     );
     let def = PipelineDefinition::from_toml(&text).unwrap();
-    let err = def.params().err().expect("unknown key must fail");
+    let err = def.params().expect_err("unknown key must fail");
     assert!(err.to_string().contains("grid_size"), "{err}");
 
     // A runner limit missing from the mode file is a load error, not a default.

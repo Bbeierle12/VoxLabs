@@ -55,6 +55,9 @@ pub mod config;
 pub mod pipeline;
 // In-app file import: a file through the capture pipeline. Cross-target
 // (inert on web).
+// (The job and its messages are only constructed on native targets; the web
+// build compiles the types for the UI and never starts one.)
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod import;
 // Voice-part (Fach) measurements: FHE, LTAS, cluster stats, tessitura,
 // turnover, dominant harmonic, register events. Pure math, cross-target,
@@ -89,6 +92,7 @@ pub mod frame;
 // Scrolling-spectrogram STFT. Compiled on all targets (its consts size the
 // UI's waterfall buffers); the engine itself is driven only by the desktop
 // and Android analysis loops.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod spectrogram;
 mod synthesis;
 // Story two-mode vocal tract model: runtime (tract) + published basis data

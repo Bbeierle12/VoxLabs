@@ -136,6 +136,9 @@ impl<S: Stage> DynStage for Erased<S> {
     }
 }
 
+/// A backend's constructor: params and format in, an erased stage out.
+pub type MakeStage = fn(&PipelineParams, &StreamFormat) -> Result<Box<dyn DynStage>, StageError>;
+
 /// A backend the builder can instantiate: its identity, its wire signature,
 /// and its constructor. The registry of these is the whole adapter search
 /// space when a wiring error needs to name the missing chain.
@@ -144,7 +147,7 @@ pub struct StageDescriptor {
     pub backend: &'static str,
     pub inputs: &'static [WireType],
     pub output: WireType,
-    pub make: fn(&PipelineParams, &StreamFormat) -> Result<Box<dyn DynStage>, StageError>,
+    pub make: MakeStage,
 }
 
 /// The constructor for a typed stage, in the registry's shape.

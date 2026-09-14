@@ -1,0 +1,15 @@
+[package]
+name = "vox-harness"
+version = "0.1.0"
+edition = "2024"
+description = "voxlab — the Fach Lab study harness: runs audio files through the same pipeline the phone runs, headless"
+publish = false
+
+[[bin]]
+name = "voxlab"
+path = "src/main.rs"
+
+[dependencies]
+vox-core = { path = "../.." }
+anyhow = "1.0.102"
+hound = "3.5"

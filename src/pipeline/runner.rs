@@ -406,7 +406,7 @@ fn worker(
             }
             hop += 1;
             stats.hops.store(hop, Ordering::Relaxed);
-            if hop % cfg.report_every_hops == 0 {
+            if hop.is_multiple_of(cfg.report_every_hops) {
                 report(&def.name, &stats, &names, hop, budget_us);
             }
         }
