@@ -26,19 +26,20 @@ tap drops, and stage errors. All thresholds come from `live_model.toml`
 ## Build and install
 
 ```bash
-export ANDROID_HOME="$HOME/android-sdk" ANDROID_SDK_ROOT="$HOME/android-sdk"
-export ANDROID_NDK_ROOT="$HOME/android-sdk/ndk/26.3.11579264" ANDROID_NDK_HOME="$ANDROID_NDK_ROOT"
-export RUSTFLAGS="-C link-arg=-Wl,-z,max-page-size=16384"   # Pixel 8+ 16 KB pages
-cargo apk build --lib --release        # optimized: the timing gate needs this
-adb install -r target/release/apk/vox-core.apk
-adb shell pm grant org.voxlabs.core android.permission.RECORD_AUDIO
+export CARGO_APK_RELEASE_KEYSTORE=~/.android-keystores/voice_harmonic_engine-release.jks
+export CARGO_APK_RELEASE_KEYSTORE_PASSWORD="$(cat ~/.android-keystores/voice_harmonic_engine-release.password)"
+scripts/build-dev-apk.sh phase1      # → dist/voxlabs-dev-phase1-<sha>.apk
+adb install -r dist/voxlabs-dev-phase1-*.apk
+adb shell pm grant org.voxlabs.core.dev android.permission.RECORD_AUDIO
 ```
 
-Use the release build for the numbers. The debug build runs the same
-pipeline but unoptimized, and its hop times are not the gate's. For the
-`org.voxlabs.core.dev` / "VoxLabs (dev)" variant D18 names, patch `package`
-and `label` in `Cargo.toml` before building and revert after, as
-`docs/STATUS.md` §5 describes; the `pm grant` line then takes the `.dev` id.
+The script builds the D18 variant — id `org.voxlabs.core.dev`, label
+"VoxLabs (dev)" — with the release profile and the 16 KB page flags, verifies
+id, label, LOAD alignment and signature, and restores `Cargo.toml` afterwards
+(SDK and NDK locations default to `~/android-sdk`; override with
+`ANDROID_HOME` / `ANDROID_NDK_ROOT`). Use the release build for the numbers:
+`--debug` produces the same pipeline unoptimized, and its hop times are not
+the gate's.
 
 ## The ten-minute run
 

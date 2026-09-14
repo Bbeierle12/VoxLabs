@@ -136,7 +136,8 @@ above; feed file frames to the spectrogram during import; `voxlab archive`
   → `VoxLabs (dev)` in Cargo.toml, `cargo apk build --release --lib` with the
   16 KB `RUSTFLAGS`, then `git checkout Cargo.toml`. Verify page alignment
   with `llvm-readelf -l` (every LOAD at 0x4000). Build outputs were named
-  `voxlabs-dev-<feature>-<sha>.apk`.
+  `voxlabs-dev-<feature>-<sha>.apk`. (On this branch that is
+  `scripts/build-dev-apk.sh`, with the renamed id — see the addendum.)
 - **Manifest:** intent filters are declared in Cargo.toml; once any filter
   is declared the MAIN/LAUNCHER one must be spelled out too (cargo-apk only
   adds it when none exist).
@@ -179,11 +180,14 @@ where the two disagree, this addendum is current.
 
 **Names.** Crate `voice_harmonic_engine` → `vox-core` (`vox_core` in paths,
 `libvox_core.so`); Android package `com.voiceharmonic.engine` →
-`org.voxlabs.core`. The dev-APK convention in §5 still holds and now yields
-`org.voxlabs.core.dev` / "VoxLabs (dev)". The build in PR #1 was made
-without that patch step, so its id is the base `org.voxlabs.core` and its
-label is still "Voice Harmonic Engine" — the label was not renamed in
-Phase 0. Data paths follow the id: `/sdcard/Android/data/<id>/files/…`.
+`org.voxlabs.core`. The dev-APK convention in §5 is now a script,
+`scripts/build-dev-apk.sh`: it patches the id to `org.voxlabs.core.dev` and
+the label to "VoxLabs (dev)", builds the release APK with the 16 KB flags,
+verifies id, label, alignment and signature, writes
+`dist/voxlabs-dev-<feature>-<sha>.apk`, and restores `Cargo.toml` whatever
+happens. The first build in PR #1 predates the script, so its id is the base
+`org.voxlabs.core` and its label "Voice Harmonic Engine" — the label was not
+renamed in Phase 0. Data paths follow the id: `/sdcard/Android/data/<id>/files/…`.
 
 **Layout.** `src/ui.rs` is `src/ui/` (18 files, all under 500 lines).
 Every DSP literal is a field of a `StageConfig` in `src/config/` mirrored

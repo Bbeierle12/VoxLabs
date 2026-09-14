@@ -122,6 +122,12 @@ dist/vox-core-release.apk            # copy kept as the deliverable
 `--lib` is required: the app is a `cdylib` (`libvox_core.so`) loaded
 by NativeActivity; the `[[bin]]` target is only the desktop/web entry.
 
+For the dev-flavoured build that installs beside a release one — id
+`org.voxlabs.core.dev`, label "VoxLabs (dev)" — run `scripts/build-dev-apk.sh
+[<feature>]` with the same keystore variables set. It patches `Cargo.toml`
+for the build, restores it afterwards, runs the alignment and signature checks
+below itself, and writes `dist/voxlabs-dev-<feature>-<sha>.apk`.
+
 Verify the signature and manifest:
 
 ```bash
