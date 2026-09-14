@@ -301,3 +301,15 @@ the console.
 - Still needed from the phone: the fixture-tap files, a screenshot of
   each mode, the self-test lines, and the live-audio fault report.
 
+## Addendum — Phases 6–8 on branch `claude/epic-lamport-euju2k` (14 September 2026, late night)
+
+- Every phase of Plan v3 now has a gate document; the plan is executed as
+  far as this environment and the Pixel-only directive allow. Phase 6:
+  the GPL boundary (`vox-tract-vtl` scaffold, CI symbol check) and the
+  `workbench` mode; the VTL backend itself waits for the library. Phase
+  7: no data in hand, entry point recorded. Phase 8: gate closed. O1 has
+  its written answer (DECISIONS.md).
+- What only the Pixel can answer now: the live-audio fault, the Phase 1
+  timing, the fourteen contract lines, the fixture taps for the D5 bands,
+  the mode switch, and the app-vs-app parity for the atlas.
+

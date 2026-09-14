@@ -1,0 +1,19 @@
+[package]
+name = "vox-tract-vtl"
+version = "0.1.0"
+edition = "2024"
+description = "VocalTractLab (GPL) as Inverse backend #3 and TractModel backend #3 — desktop Workbench only, behind the `vtl` feature; never a dependency of vox-core"
+publish = false
+# The VocalTractLab API is GPL-3.0; this crate links it only when the `vtl`
+# feature is on, and the production build (vox-core, the APK) never depends
+# on this crate at all (scripts/check-no-vtl.sh, CI).
+license = "GPL-3.0-or-later"
+
+[features]
+default = []
+# Links libVocalTractLabApi (must be on the library path) and enables the
+# FFI-backed stages. Off: the stages exist, and refuse to `init`.
+vtl = []
+
+[dependencies]
+vox-core = { path = "../.." }

@@ -15,7 +15,7 @@ crate-type = ["rlib", "cdylib"]
 # operate on it unchanged). The study harness (`voxlab`) and the validation
 # crate are members under crates/. `cargo test --workspace` runs everything.
 [workspace]
-members = ["crates/vox-harness", "crates/vox-validation"]
+members = ["crates/vox-harness", "crates/vox-validation", "crates/vox-tract-vtl"]
 
 # Shared across every target (native desktop, Android, web/wasm). Pure-Rust and
 # wasm-compatible. eframe here is a minimal common base with no renderer/backend

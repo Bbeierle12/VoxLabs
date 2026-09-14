@@ -115,6 +115,8 @@ impl PipelineDefinition {
     pub const ATLAS: &'static str = include_str!("../../pipelines/atlas.toml");
     /// Phase 4: Coral's choir branch (Coral STFT, QIFFT, multi-F0, SATB).
     pub const CHOIR: &'static str = include_str!("../../pipelines/choir.toml");
+    /// Phase 6: every tap exposed, two inverse backends side by side.
+    pub const WORKBENCH: &'static str = include_str!("../../pipelines/workbench.toml");
 
     /// Every compiled-in mode, by name.
     pub const MODES: &'static [(&'static str, &'static str)] = &[
@@ -123,6 +125,7 @@ impl PipelineDefinition {
         ("calibrate", Self::CALIBRATE),
         ("atlas", Self::ATLAS),
         ("choir", Self::CHOIR),
+        ("workbench", Self::WORKBENCH),
     ];
 
     /// A compiled-in mode by name, or a `.toml` path.

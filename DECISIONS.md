@@ -189,4 +189,24 @@ mirrored back to the plan.
   `voxlab fixture-taps` / `compare-taps`) and wait for the phone's
   files. Details: `docs/phase5-gate.md`. Brandon can overturn the shell
   decision; nothing in the pipeline depends on it (D9).
+- **Phases 6–8 status** (2026-09-14): Phase 6 ships the boundary, not
+  the backend — `crates/vox-tract-vtl` (GPL-3.0-or-later, feature-gated,
+  API declarations and two stage types that refuse to init without the
+  feature), `scripts/check-no-vtl.sh` in CI proving `vox-core` has no VTL
+  dependency and the release cdylib no VTL symbol, and
+  `pipelines/workbench.toml` (both inverses side by side, every tap).
+  The fitting loop, the tube mapping, the 19-D parameter wire and the
+  derived tables wait for a VocalTractLab library and a `.speaker` file,
+  neither of which is in reach here. Phase 7 has no data in hand; the
+  entry point is recorded (FRIEDRICHS2026, CC BY 4.0). Phase 8's gate is
+  closed. `docs/phase6-8-gate.md`.
+- **O1, written answer** (2026-09-14, from `Vocal-Tract-Labs` at
+  f3f907a): the corpus registry lists no VocalTractLab `.speaker` data
+  and nothing derived from it; every resource is link-only with terms to
+  verify (one CC BY 4.0); Phase 3's atlas files descend from the app's
+  own MRI means and a CC BY 4.0 label set. Nothing in VoxLabs is
+  GPL-encumbered through VTL today because nothing has been derived from
+  VTL. O1 reopens the day `vox-tract-vtl` produces a table or a basis,
+  and that output does not ship without a written licence opinion. A
+  reading of the files, not legal advice.
 

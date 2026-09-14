@@ -24,6 +24,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - name: GPL boundary (no VTL in the production library)
+        run: scripts/check-no-vtl.sh
 
   targets:
     name: check (android · wasm)

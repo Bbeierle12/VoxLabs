@@ -1,0 +1,85 @@
+# Workbench — Plan v3 Phase 6: any pipeline with every tap exposed and two
+# backends side by side in one slot. Both inverses run on the same
+# formants and are both tapped; each drives its own tract model; the mesh
+# reads the atlas pair. The builder wires every stage's inputs to the most
+# recent producer of each type, which is what orders this file.
+
+name = "workbench"
+
+taps = [
+  "yin", "voicing", "lpc", "harmonics", "metrics", "contour",
+  "inverse_grid", "tract_story", "inverse_atlas", "tract_atlas", "mesh", "stft",
+]
+
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 2048
+hop = 1024
+
+[runner]
+# Idle sleep between ring-buffer drains, ms. Range: 1..=10.
+poll_ms = 5
+# Tap channel depth, messages. Range: 8..=256.
+tap_capacity = 256
+# Timing summary every this many hops. Range: 47..=4700.
+report_every_hops = 512
+# Gate: worst hop < this fraction of the hop budget. Range: 0.1..=1.0.
+hop_budget_fraction_max = 0.5
+# Gate: mic-to-render latency ceiling, ms. Range: 20.0..=200.0.
+mic_to_render_max_ms = 100.0
+# The shell waits this long for the worker's init, ms. Range: 500..=10000.
+init_timeout_ms = 4000
+# Frame-cadence consumers run every this many hops. Range: 1..=4.
+legacy_frame_every_hops = 2
+# Drained-but-unconsumed audio the re-framer reserves, frames. Range: 1..=8.
+pending_capacity_frames = 2
+
+[[stage]]
+name = "yin"
+backend = "yin_cpu"
+
+[[stage]]
+name = "voicing"
+backend = "snr_hum"
+
+[[stage]]
+name = "lpc"
+backend = "lpc_levinson"
+
+[[stage]]
+name = "harmonics"
+backend = "goertzel"
+
+[[stage]]
+name = "metrics"
+backend = "classic"
+
+[[stage]]
+name = "contour"
+backend = "f0_contour"
+
+# Inverse backend #1 and its tract model.
+[[stage]]
+name = "inverse_grid"
+backend = "grid_story"
+
+[[stage]]
+name = "tract_story"
+backend = "story_two_mode"
+
+# Inverse backend #2 and its tract model, on the same formants.
+[[stage]]
+name = "inverse_atlas"
+backend = "posterior_pca4"
+
+[[stage]]
+name = "tract_atlas"
+backend = "mri_pca4"
+
+[[stage]]
+name = "mesh"
+backend = "lumen_v2"
+
+[[stage]]
+name = "stft"
+backend = "rustfft"

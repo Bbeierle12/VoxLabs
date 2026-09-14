@@ -3909,6 +3909,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "vox-tract-vtl"
+version = "0.1.0"
+dependencies = [
+ "vox-core",
+]
+
+[[package]]
 name = "vox-validation"
 version = "0.1.0"
 dependencies = [
