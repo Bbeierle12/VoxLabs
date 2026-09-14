@@ -18,10 +18,12 @@
 //!      `NativeOptions.renderer`.
 //!
 //! Microphone capture needs the `RECORD_AUDIO` runtime permission. It is
-//! declared in the manifest, but Android only grants it once the user (or
-//! `adb shell pm grant`) approves it. Until then cpal's input stream fails to
-//! open; we treat that as non-fatal so the UI still launches (it just shows
-//! "SEARCHING"). See docs/android-build.md.
+//! declared in the manifest, but Android only grants it once the user
+//! approves it. The app asks at launch (`permission`), and
+//! [`start_audio_when_permitted`] opens the audio engine as soon as the
+//! grant lands — on the spot when it is already held, otherwise from a
+//! polling thread after the dialog. Until then the UI runs and says the
+//! microphone is unavailable. See docs/android-build.md.
 //!
 //! **Re-entry.** NativeActivity can call `android_main` again in the same
 //! process — an activity relaunch under "Don't keep activities", a task
@@ -64,6 +66,12 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 /// Poll interval while waiting out [`SHUTDOWN_GRACE`].
 const SHUTDOWN_POLL: Duration = Duration::from_millis(5);
 
+/// How often the grant state is re-read after the permission dialog was
+/// shown, and how long to keep asking before giving up on this launch (the
+/// user may have dismissed the dialog; the next launch asks again).
+const PERMISSION_POLL: Duration = Duration::from_millis(500);
+const PERMISSION_WAIT: Duration = Duration::from_secs(120);
+
 /// One `android_main` invocation's background resources, parked where the
 /// *next* invocation can reach them.
 struct Generation {
@@ -72,8 +80,9 @@ struct Generation {
     runner: Option<Runner>,
     /// Dropping this closes the AAudio input/output streams — the reason the
     /// engine lives here instead of on the parked `android_main` stack frame,
-    /// which the new generation cannot reach.
-    audio: Option<AudioEngine>,
+    /// which the new generation cannot reach. Shared with the thread that
+    /// opens the engine once the microphone permission is granted.
+    audio: Arc<Mutex<Option<AudioEngine>>>,
 }
 
 /// The most recent generation, or `None` before the first launch. A poisoned
@@ -97,7 +106,11 @@ fn retire_previous_generation() {
     // rather than waiting on the thread — a second AAudio input stream opening
     // while the first still holds the mic is the failure this exists to stop.
     previous.shutdown.store(true, Ordering::Relaxed);
-    drop(previous.audio.take());
+    let engine = match previous.audio.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    drop(engine);
 
     // The spatial (TV-path) capture thread holds its own AudioRecord; it
     // checks this flag every 0.1 s chunk and releases the recorder itself.
@@ -216,27 +229,18 @@ fn android_main(app: AndroidApp) {
         }
     };
 
-    // cpal AAudio engine. Non-fatal on failure: without RECORD_AUDIO the input
-    // stream can't open, but we still want the UI up so the user can grant it.
-    let audio = match AudioEngine::start(
+    // cpal AAudio engine, opened as soon as RECORD_AUDIO is granted: now if
+    // it already is, otherwise after the system dialog the app raises here.
+    let audio: Arc<Mutex<Option<AudioEngine>>> = Arc::new(Mutex::new(None));
+    start_audio_when_permitted(
         bridges.profile_rx,
         bridges.event_rx,
         bridges.audio_tx,
         bridges.telemetry.clone(),
-    ) {
-        Ok(engine) => Some(engine),
-        Err(e) => {
-            log::error!(
-                "audio engine failed to start (is RECORD_AUDIO granted?): {e:?}; UI will run without audio"
-            );
-            // The UI must say this. A NativeActivity cannot raise the runtime
-            // permission dialog itself, so without a banner the app looks
-            // merely broken rather than un-permitted, and the only diagnosis
-            // is a logcat line most users will never read.
-            bridges.telemetry.set_audio_unavailable(true);
-            None
-        }
-    };
+        audio.clone(),
+        shutdown.clone(),
+        input_sample_rate,
+    );
 
     // Park both handles where the *next* `android_main` can find them. This
     // invocation may never get the chance to clean up after itself.
@@ -314,6 +318,110 @@ fn android_main(app: AndroidApp) {
         }),
     ) {
         log::error!("eframe exited with error: {e:?}");
+    }
+}
+
+/// Opens the audio engine once `RECORD_AUDIO` is granted. Held already:
+/// opened on this thread before returning. Not held: the permission dialog
+/// is raised, the UI shows the microphone-unavailable banner, and a thread
+/// polls the grant state, opening the engine the moment it lands (or giving
+/// up after [`PERMISSION_WAIT`] — the next launch asks again). A failure to
+/// open with the grant held stays fatal for audio, as before, and is logged.
+fn start_audio_when_permitted(
+    profile_rx: triple_buffer::Output<VocalProfile>,
+    event_rx: rtrb::Consumer<crate::concurrency::EngineEvent>,
+    audio_tx: rtrb::Producer<f32>,
+    telemetry: Arc<Telemetry>,
+    slot: Arc<Mutex<Option<AudioEngine>>>,
+    shutdown: Arc<AtomicBool>,
+    built_for_sample_rate: f32,
+) {
+    if crate::permission::has_record_audio() {
+        open_audio(
+            profile_rx,
+            event_rx,
+            audio_tx,
+            telemetry,
+            &slot,
+            &shutdown,
+            built_for_sample_rate,
+        );
+        return;
+    }
+    telemetry.set_audio_unavailable(true);
+    log::info!("RECORD_AUDIO not granted yet; asking the user");
+    if !crate::permission::request_record_audio() {
+        log::error!("could not raise the microphone permission dialog; grant it in Settings");
+    }
+    thread::spawn(move || {
+        let deadline = Instant::now() + PERMISSION_WAIT;
+        while Instant::now() < deadline && !shutdown.load(Ordering::Relaxed) {
+            thread::sleep(PERMISSION_POLL);
+            if crate::permission::has_record_audio() {
+                log::info!("RECORD_AUDIO granted; opening audio");
+                open_audio(
+                    profile_rx,
+                    event_rx,
+                    audio_tx,
+                    telemetry,
+                    &slot,
+                    &shutdown,
+                    built_for_sample_rate,
+                );
+                return;
+            }
+        }
+        if !shutdown.load(Ordering::Relaxed) {
+            log::warn!(
+                "RECORD_AUDIO not granted within {} s; audio stays off until the next launch",
+                PERMISSION_WAIT.as_secs()
+            );
+        }
+    });
+}
+
+/// Opens the cpal engine and parks it in the generation's slot. If the
+/// generation was retired meanwhile the engine is dropped again at once, so
+/// a stale launch can never hold the microphone.
+fn open_audio(
+    profile_rx: triple_buffer::Output<VocalProfile>,
+    event_rx: rtrb::Consumer<crate::concurrency::EngineEvent>,
+    audio_tx: rtrb::Producer<f32>,
+    telemetry: Arc<Telemetry>,
+    slot: &Mutex<Option<AudioEngine>>,
+    shutdown: &AtomicBool,
+    built_for_sample_rate: f32,
+) {
+    match AudioEngine::start(profile_rx, event_rx, audio_tx, telemetry.clone()) {
+        Ok(engine) => {
+            if let Some(rate) = query_input_sample_rate()
+                && rate != built_for_sample_rate
+            {
+                // The runner and the analyzer were built for the rate read at
+                // launch (the fallback when the grant was missing).
+                log::warn!(
+                    "input rate is {rate} Hz but analysis was built for {built_for_sample_rate} Hz; \
+                     relaunch the app to rebuild at the right rate"
+                );
+            }
+            match slot.lock() {
+                Ok(mut s) => *s = Some(engine),
+                Err(poisoned) => *poisoned.into_inner() = Some(engine),
+            }
+            if shutdown.load(Ordering::Relaxed) {
+                // Retired while opening: release the microphone immediately.
+                if let Ok(mut s) = slot.lock() {
+                    s.take();
+                }
+                return;
+            }
+            telemetry.set_audio_unavailable(false);
+            log::info!("audio engine running");
+        }
+        Err(e) => {
+            log::error!("audio engine failed to start: {e:?}; UI will run without audio");
+            telemetry.set_audio_unavailable(true);
+        }
     }
 }
 

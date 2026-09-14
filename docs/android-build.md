@@ -162,15 +162,16 @@ This build host has **no device access**; do the following on your phone.
    `adb uninstall org.voxlabs.core` first.
 5. **Launch** "Voice Harmonic Engine" from the app drawer (default system icon —
    no custom launcher icon is bundled yet; see Known rough edges).
-6. **Grant the microphone permission.** This build uses a plain `NativeActivity`
-   and does **not** pop the runtime permission dialog itself, so grant it
-   manually — either:
-   - Settings → Apps → Voice Harmonic Engine → Permissions → Microphone → Allow, **or**
+6. **Grant the microphone permission.** The app asks on first launch (the
+   system dialog); tap Allow and audio starts within a second, no relaunch
+   needed. If the dialog was dismissed, the next launch asks again, or grant it
+   by hand — Settings → Apps → the app → Permissions → Microphone → Allow, or
    ```bash
    "$ANDROID_HOME/platform-tools/adb" shell pm grant org.voxlabs.core android.permission.RECORD_AUDIO
    ```
-   then fully close and reopen the app. Until RECORD_AUDIO is granted the UI runs
-   but the audio input stream can't open, so the dashboard stays in "SEARCHING".
+   (`org.voxlabs.core.dev` for the dev build). Until RECORD_AUDIO is granted the
+   UI runs with the microphone-unavailable banner and the dashboard stays in
+   "SEARCHING".
 7. **Watch logs while testing:**
    ```bash
    "$ANDROID_HOME/platform-tools/adb" logcat -s vox_core::android vox_core::audio vox_core::pipeline::runner RustStdoutStderr '*:E'
@@ -185,8 +186,9 @@ This build host has **no device access**; do the following on your phone.
 - **Not run on hardware.** The APK builds, assembles, and signs cleanly, but no
   device was available here — on-device launch, egui/glow rendering, live mic
   capture, synthesis output, and **audio latency** are all unverified.
-- **Mic permission is manual** (step 6). A proper JNI runtime-permission request
-  (or an `androidx`/`RustActivity` shell) is a follow-up.
+- **Mic permission dialog is polled, not delivered.** `NativeActivity` gives
+  no `onRequestPermissionsResult`, so the app re-reads the grant every 0.5 s
+  for two minutes after asking (`src/permission.rs`, `android.rs`).
 - **No custom launcher icon.** The app uses the Android default icon. To add one:
   drop `res/mipmap-*/ic_launcher.png` in the crate, set
   `[package.metadata.android] resources = "res"` and

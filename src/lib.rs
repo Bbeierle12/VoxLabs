@@ -26,6 +26,9 @@ mod android;
 // import folder. JNI, Android-only.
 #[cfg(target_os = "android")]
 mod share_intent;
+// Runtime RECORD_AUDIO request + grant polling. JNI, Android-only.
+#[cfg(target_os = "android")]
+mod permission;
 
 // Audio-file decoding + resampling for the in-app import path and the
 // `voxlab` harness. Native only (the web build has no files).
