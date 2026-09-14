@@ -788,3 +788,41 @@ self_test_synth_rate_hz = 48000.0
 self_test_synth_glide_ms = 20.0
 # Console toast lifetime, seconds. Range: 1.0..=10.0.
 toast_secs = 3.5
+
+# ToleranceConfig: D5 tolerance bands for tap-by-tap comparison
+# (`pipeline::compare`).
+[tolerance]
+# f0 agreement, Hz. Range: 0.01..=5.0.
+f0_hz = 0.1
+# Estimator confidence agreement (unit scale). Range: 1e-4..=0.1.
+confidence = 1e-3
+# Formant frequency agreement, Hz (kernel parity: tenths of a Hz). Range:
+# 0.01..=50.0.
+formant_hz = 0.1
+# Formant bandwidth agreement, Hz. Range: 0.01..=50.0.
+bandwidth_hz = 0.5
+# Harmonic amplitude agreement, relative to the frame's strongest harmonic.
+# Range: 1e-5..=0.1.
+harmonic_rel = 1e-3
+# Any dB-valued metric (HNR, H1–H2, CPP, shimmer, SNR, spectrum bins), dB.
+# Range: 0.01..=3.0.
+metric_db = 0.1
+# Jitter agreement, percent. Range: 1e-3..=1.0.
+jitter_pct = 0.01
+# Spectral centroid agreement, Hz. Range: 0.1..=100.0.
+centroid_hz = 1.0
+# Vibrato rate agreement, Hz. Range: 0.01..=1.0.
+vibrato_rate_hz = 0.05
+# Vibrato extent and steadiness agreement, cents. Range: 0.1..=20.0.
+cents = 1.0
+# Story mode coefficient agreement. Range: 1e-4..=0.5.
+tract_q = 1e-3
+# Vocal-tract length agreement, cm. Range: 0.01..=1.0.
+vtl_cm = 0.05
+# Area-function agreement, cm² per section. Range: 1e-4..=0.5.
+area_cm2 = 1e-3
+# Diameter agreement, cm per section. Range: 1e-4..=0.5.
+diameter_cm = 1e-3
+# Linear spectrum magnitude agreement, relative to the frame's peak bin.
+# Range: 1e-5..=0.1.
+spectrum_rel = 1e-3

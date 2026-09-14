@@ -1,0 +1,51 @@
+# Fingerprint — the enrollment/match mode (Plan v3 §5 Phase 2).
+#
+# The per-frame chain the voiceprint consumer needs: pitch and its gates,
+# formants (held across unvoiced frames, graded by the f0 they were
+# measured at), harmonics, the voice-quality metrics and the f0 contour.
+# The voiceprint itself accumulates over a capture and is a consumer
+# (`math::build_voiceprint`), not a stage. Stage parameters come from
+# pipeline.toml; overrides go under [params].
+
+name = "fingerprint"
+
+taps = ["yin", "voicing", "lpc", "harmonics", "metrics", "contour"]
+
+[format]
+sample_rate_hz = 48000.0
+frame_samples = 2048
+hop = 1024
+
+[runner]
+poll_ms = 5
+tap_capacity = 256
+report_every_hops = 512
+hop_budget_fraction_max = 0.5
+mic_to_render_max_ms = 100
+init_timeout_ms = 4000
+legacy_frame_every_hops = 2
+pending_capacity_frames = 2
+
+[[stage]]
+name = "yin"
+backend = "yin_cpu"
+
+[[stage]]
+name = "voicing"
+backend = "snr_hum"
+
+[[stage]]
+name = "lpc"
+backend = "lpc_levinson"
+
+[[stage]]
+name = "harmonics"
+backend = "goertzel"
+
+[[stage]]
+name = "metrics"
+backend = "classic"
+
+[[stage]]
+name = "contour"
+backend = "f0_contour"

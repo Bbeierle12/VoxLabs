@@ -11,5 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 vox-core = { path = "../.." }
+vox-validation = { path = "../vox-validation" }
 anyhow = "1.0.102"
 hound = "3.5"

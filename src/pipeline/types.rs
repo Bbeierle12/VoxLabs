@@ -76,7 +76,7 @@ impl std::fmt::Display for WireType {
 /// One analysis frame from the ring-buffer reader: `frame_samples` mono
 /// samples ending at the hop boundary, the rate they were captured at, and
 /// the hop index (frame 0 is the first full frame).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub sample_rate: f32,
@@ -96,7 +96,7 @@ impl AudioFrame {
 
 /// Fundamental frequency for one frame. `voiced` is the pitch stage's own
 /// gate (confidence and range); the SNR and hum gates are a later stage.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct F0Track {
     pub hz: f32,
     pub confidence: f32,
@@ -112,7 +112,7 @@ pub struct F0Track {
 
 /// One-sided magnitude spectrum of the current frame (Hann-windowed FFT
 /// over the whole frame), in linear magnitude and dB.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Spectrum {
     pub magnitude: Vec<f32>,
     pub magnitudes_db: Vec<f32>,
@@ -137,7 +137,7 @@ impl Spectrum {
 
 /// Measured amplitude of each harmonic k·f0 (linear peak); zeroed when
 /// the frame is unvoiced.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HarmonicSeries {
     pub amplitudes: [f32; MAX_PARTIALS],
     pub f0_hz: f32,
@@ -157,7 +157,7 @@ impl Default for HarmonicSeries {
 /// Formants for one frame. Held across unvoiced frames exactly as the
 /// existing analyzers hold them, so `measured_f0` is the f0 of the frame
 /// they were measured on — what reliability grading must judge by.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FormantTrack {
     pub formants: [Formant; N_FORMANTS],
     /// f0 of the frame the formants were measured on; 0.0 = never measured
@@ -182,7 +182,7 @@ impl FormantTrack {
 }
 
 /// Which published basis a tract parameter vector refers to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BasisId {
     AdultMale,
     AdultFemale,
@@ -215,7 +215,7 @@ impl BasisId {
 /// Model-specific tract parameters: the Story two-mode coefficients.
 /// `valid` is false when the frame did not clear the inversion's gates —
 /// the coefficients then still hold the last valid pair, for a HELD view.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TractParams {
     pub q1: f32,
     pub q2: f32,
@@ -245,11 +245,13 @@ impl Default for TractParams {
 /// The area function: `N_SECTIONS` equal-length sections from glottis to
 /// lips, as the diameters the display renders and the areas the resonance
 /// solver takes. `live` mirrors `TractParams::valid`.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AreaFunction {
     pub sections: usize,
     pub section_len_cm: f32,
+    #[serde(with = "sections_array")]
     pub diameters_cm: [f32; N_SECTIONS],
+    #[serde(with = "sections_array")]
     pub areas_cm2: [f32; N_SECTIONS],
     /// The basis's tract length, cm (the model's, not the singer's).
     pub vtl_cm: f32,
@@ -282,7 +284,8 @@ impl AreaFunction {
 // The variants differ in size by design: wires are preallocated once and
 // cloned only into tap messages, so the largest variant costs nothing per hop.
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type")]
 pub enum Wire {
     AudioFrame(AudioFrame),
     Spectrum(Spectrum),
@@ -422,5 +425,22 @@ impl<'a, A: WireValue, B: WireValue, C: WireValue> FromWires<'a> for (&'a A, &'a
             take::<B>(wires, idx, 1)?,
             take::<C>(wires, idx, 2)?,
         ))
+    }
+}
+
+/// serde for the 44-section arrays (serde's array impls stop at 32).
+mod sections_array {
+    use super::N_SECTIONS;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[f32; N_SECTIONS], s: S) -> Result<S::Ok, S::Error> {
+        v.as_slice().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[f32; N_SECTIONS], D::Error> {
+        let v: Vec<f32> = Vec::deserialize(d)?;
+        v.try_into().map_err(|v: Vec<f32>| {
+            serde::de::Error::custom(format!("expected {N_SECTIONS} sections, got {}", v.len()))
+        })
     }
 }

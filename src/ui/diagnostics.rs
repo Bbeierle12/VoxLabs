@@ -31,6 +31,7 @@ pub(super) struct Console {
     assistant_text: String,
     calibration_text: String,
     self_test_text: String,
+    evidence_text: String,
     event_text: String,
     overlay_enabled: bool,
     expected_f0: String,
@@ -52,6 +53,7 @@ impl Default for Console {
             assistant_text: "Analyzing latest metrics…".into(),
             calibration_text: "No completed calibration in this session".into(),
             self_test_text: "Not run in this session".into(),
+            evidence_text: String::new(),
             event_text: "No events".into(),
             overlay_enabled: false,
             expected_f0: String::new(),
@@ -352,6 +354,9 @@ impl DashboardApp {
         section(ui, "Self-test results");
         body(ui, &self.console.self_test_text);
 
+        section(ui, "Evidence");
+        body(ui, &self.console.evidence_text);
+
         section(ui, "Propose a refinement");
         body(
             ui,
@@ -470,6 +475,19 @@ impl DashboardApp {
             None => "No completed calibration in this session".into(),
         };
         self.console.atlas_text = atlas_text();
+        let evidence = runtime::current_evidence();
+        self.console.evidence_text = format!(
+            "{} — {}\n\nBaseline acceptance gates\n{}\n\n{}",
+            evidence.banner,
+            evidence.banner_text,
+            evidence
+                .gates
+                .iter()
+                .map(|g| format!("• {}: {}", g.name, g.status))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            evidence.statement
+        );
         self.console.overlay_enabled = runtime::debug_overlay_enabled();
         self.console_refresh_events();
     }

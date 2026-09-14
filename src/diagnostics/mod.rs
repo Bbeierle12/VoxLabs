@@ -17,6 +17,7 @@
 //! audio, no upload, no automatic model mutation.
 
 pub mod core;
+pub mod evidence;
 pub mod export;
 pub mod ids;
 pub mod runtime;

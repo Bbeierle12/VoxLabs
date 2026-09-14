@@ -20,8 +20,12 @@
 //! the web target has no analysis thread yet (Phase 5b).
 
 pub mod builder;
+pub mod compare;
 pub mod consumers;
 pub mod definition;
+pub mod framing;
+pub mod offline;
+pub mod provenance;
 pub mod stage;
 pub mod stages;
 pub mod tap;

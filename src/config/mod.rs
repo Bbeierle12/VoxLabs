@@ -31,6 +31,7 @@ pub mod spatial;
 pub mod spectrogram;
 pub mod stream;
 pub mod synthesis;
+pub mod tolerance;
 pub mod tract;
 pub mod voiceprint;
 
@@ -47,6 +48,7 @@ pub use spatial::SpatialConfig;
 pub use spectrogram::{ResampleConfig, SpectrogramConfig};
 pub use stream::StreamConfig;
 pub use synthesis::SynthesisConfig;
+pub use tolerance::ToleranceConfig;
 pub use tract::{InverseConfig, TractConfig};
 pub use voiceprint::VoiceprintConfig;
 
@@ -81,6 +83,7 @@ pub struct PipelineParams {
     pub tract: TractConfig,
     pub inverse: InverseConfig,
     pub diagnostics: DiagnosticsConfig,
+    pub tolerance: ToleranceConfig,
 }
 
 impl PipelineParams {
@@ -111,6 +114,7 @@ impl PipelineParams {
         tract: TractConfig::DEFAULT,
         inverse: InverseConfig::DEFAULT,
         diagnostics: DiagnosticsConfig::DEFAULT,
+        tolerance: ToleranceConfig::DEFAULT,
     };
 
     /// The repository's `pipeline.toml`, compiled in so every target — the
@@ -283,6 +287,7 @@ pub fn all_sections() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
             DiagnosticsConfig::SECTION,
             DiagnosticsConfig::DEFAULT.entries(),
         ),
+        (ToleranceConfig::SECTION, ToleranceConfig::DEFAULT.entries()),
     ]
 }
 

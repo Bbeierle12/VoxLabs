@@ -28,6 +28,12 @@ struct State {
     self_tests: Vec<SelfTestResult>,
     calibration_report: Option<CalibrationReport>,
     shared_model_snapshot: Option<Value>,
+    /// The latest provenance record (D11), as written to the store.
+    provenance: Option<Value>,
+    /// The last validation report and its verdict (`record_validation`).
+    validation: Option<(Value, bool)>,
+    /// Evidence of the last `runtime/pipeline_report` event.
+    last_pipeline_report: Option<BTreeMap<String, String>>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -63,6 +69,9 @@ pub fn initialize(files_dir: &Path) -> Result<(), String> {
         self_tests: Vec::new(),
         calibration_report: None,
         shared_model_snapshot: None,
+        provenance: None,
+        validation: None,
+        last_pipeline_report: None,
     };
     log_locked(
         &state,
@@ -132,6 +141,62 @@ pub fn recent_events(limit: usize) -> Vec<Event> {
 
 pub fn self_tests() -> Vec<SelfTestResult> {
     with_state(|s| s.self_tests.clone()).unwrap_or_default()
+}
+
+/// D11: files the record beside the session log
+/// (`provenance-<pipeline>-<ms>.json`), keeps it for the bundle, and logs
+/// `provenance/pipeline_built` with the digests as evidence.
+pub fn record_provenance(record: &crate::pipeline::provenance::ProvenanceRecord) {
+    let json = record.to_json();
+    with_state(|s| {
+        let name = format!(
+            "provenance-{}-{}.json",
+            record.definition.name, record.generated_at_epoch_ms
+        );
+        let path = s.store.directory().join(&name);
+        let written = std::fs::write(&path, &json).is_ok();
+        s.provenance = serde_json::from_str(&json).ok();
+        let stages: Vec<String> = record
+            .stages
+            .iter()
+            .map(|st| format!("{}/{}@{}", st.name, st.backend, st.version))
+            .collect();
+        log_locked(
+            s,
+            "provenance",
+            "pipeline_built",
+            &format!(
+                "pipeline `{}` built: {} stages, {} Hz, frame {} hop {}",
+                record.definition.name,
+                record.stages.len(),
+                record.format.sample_rate_hz,
+                record.format.frame_samples,
+                record.format.hop
+            ),
+            BTreeMap::from([
+                (
+                    "definition_sha256".to_string(),
+                    record.definition_sha256.clone(),
+                ),
+                ("params_sha256".to_string(), record.params_sha256.clone()),
+                (
+                    "pipeline_toml_sha256".to_string(),
+                    record.build.pipeline_toml_sha256.clone(),
+                ),
+                ("stages".to_string(), stages.join(", ")),
+                ("input".to_string(), record.input.kind.clone()),
+                (
+                    "file".to_string(),
+                    if written { name } else { "not written".into() },
+                ),
+            ]),
+            Severity::Info,
+        );
+    });
+}
+
+pub fn current_provenance() -> Option<Value> {
+    with_state(|s| s.provenance.clone()).flatten()
 }
 
 pub fn set_shared_model_snapshot(snapshot: Value) {
@@ -276,7 +341,57 @@ pub fn log(
     evidence: BTreeMap<String, String>,
     severity: Severity,
 ) {
-    with_state(|s| log_locked(s, category, code, message, evidence, severity));
+    with_state(|s| {
+        if category == "runtime" && code == "pipeline_report" {
+            s.last_pipeline_report = Some(evidence.clone());
+        }
+        log_locked(s, category, code, message, evidence, severity);
+    });
+}
+
+/// A `vox-validation` verdict for the Evidence output and the bundle.
+pub fn record_validation(report: Value, pass: bool) {
+    with_state(|s| {
+        log_locked(
+            s,
+            "validation",
+            "provenance_round_trip",
+            if pass {
+                "Provenance round-trip within tolerance bands"
+            } else {
+                "Provenance round-trip outside tolerance bands"
+            },
+            BTreeMap::from([("pass".to_string(), pass.to_string())]),
+            if pass {
+                Severity::Info
+            } else {
+                Severity::Warning
+            },
+        );
+        s.validation = Some((report, pass));
+    });
+}
+
+/// The Evidence output assembled from what the runtime knows now.
+pub fn current_evidence() -> super::evidence::Evidence {
+    with_state(|s| {
+        super::evidence::assemble(&super::evidence::EvidenceInputs {
+            self_tests: &s.self_tests,
+            provenance: s.provenance.as_ref(),
+            calibrated: s.calibration_report.is_some(),
+            validation: s.validation.as_ref().map(|(v, p)| (v, *p)),
+            last_pipeline_report: s.last_pipeline_report.as_ref(),
+        })
+    })
+    .unwrap_or_else(|| {
+        super::evidence::assemble(&super::evidence::EvidenceInputs {
+            self_tests: &[],
+            provenance: None,
+            calibrated: false,
+            validation: None,
+            last_pipeline_report: None,
+        })
+    })
 }
 
 /// `log` with no evidence at `INFO`.
@@ -397,6 +512,7 @@ pub fn export_bundle() -> Result<Export, String> {
         app: super::export::app_json(),
         device: super::export::device_json(),
     };
+    let evidence = super::evidence::to_json(&current_evidence());
     let (name, text) = with_state(|s| {
         let assessment = assess(&s.metrics, now_millis());
         s.store.build_bundle(
@@ -406,6 +522,8 @@ pub fn export_bundle() -> Result<Export, String> {
             &s.self_tests,
             s.calibration_report.as_ref(),
             s.shared_model_snapshot.as_ref(),
+            s.provenance.as_ref(),
+            Some(&evidence),
             now_millis(),
         )
     })

@@ -52,7 +52,7 @@ pub struct Voiceprint {
 
 /// Per-frame voice-quality metrics. All `None` until the analysis has enough
 /// voiced signal to say something honest.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct VoiceMetrics {
     /// Harmonics-to-noise ratio (dB); breathiness/clarity.
     pub hnr_db: Option<f32>,

@@ -16,6 +16,7 @@ use crate::config::consts::MICROS_PER_SECOND_F64;
 
 use super::builder::{Pipeline, WiringError, build};
 use super::definition::{PipelineDefinition, RunnerConfig};
+use super::framing::Framer;
 use super::stage::StreamFormat;
 use super::tap::{TapMsg, TapReceiver, TapSender, tap_channel};
 use super::types::{AudioFrame, Wire};
@@ -249,53 +250,6 @@ impl Drop for Runner {
     }
 }
 
-/// Re-frames a sample stream to fixed hops: the first hop needs a whole
-/// frame, every later hop `hop` new samples shifted into the frame.
-struct Framer {
-    frame: Vec<f32>,
-    pending: Vec<f32>,
-    hop: usize,
-    primed: bool,
-}
-
-impl Framer {
-    fn new(format: &StreamFormat, pending_frames: usize) -> Self {
-        Self {
-            frame: vec![0.0; format.frame_samples],
-            pending: Vec::with_capacity(format.frame_samples * pending_frames),
-            hop: format.hop,
-            primed: false,
-        }
-    }
-
-    fn need(&self) -> usize {
-        if self.primed {
-            self.hop
-        } else {
-            self.frame.len()
-        }
-    }
-
-    /// Advances one hop if enough samples are pending; the frame then holds
-    /// the newest `frame_samples` samples.
-    fn advance(&mut self) -> bool {
-        let need = self.need();
-        if self.pending.len() < need {
-            return false;
-        }
-        let len = self.frame.len();
-        if self.primed {
-            self.frame.copy_within(self.hop..len, 0);
-            self.frame[len - self.hop..].copy_from_slice(&self.pending[..need]);
-        } else {
-            self.frame.copy_from_slice(&self.pending[..need]);
-            self.primed = true;
-        }
-        self.pending.drain(..need);
-        true
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn worker(
     def: PipelineDefinition,
@@ -315,6 +269,13 @@ fn worker(
             return;
         }
     };
+    // D11: what is running, recorded before the first hop.
+    let record = super::provenance::ProvenanceRecord::for_pipeline(
+        &def,
+        &pipeline,
+        super::provenance::InputProvenance::live(format.sample_rate_hz),
+    );
+    crate::diagnostics::runtime::record_provenance(&record);
     let names: Vec<Arc<str>> = stats.stage_names.clone();
     let budget = Duration::from_secs_f32(format.hop_seconds());
     let budget_us = budget.as_micros() as u64;
@@ -337,12 +298,12 @@ fn worker(
 
     while !shutdown.load(Ordering::Relaxed) {
         while let Ok(s) = audio_rx.pop() {
-            framer.pending.push(s);
+            framer.push(s);
         }
         let drained_at = Instant::now();
         max_store(
             &stats.backlog_max_samples,
-            framer.pending.len().saturating_sub(framer.need()) as u64,
+            framer.pending_len().saturating_sub(framer.need()) as u64,
         );
 
         while framer.advance() {
@@ -352,7 +313,7 @@ fn worker(
             let started = Instant::now();
             // Source wire: the newest frame.
             if let Wire::AudioFrame(src) = &mut pipeline.wires[0] {
-                src.samples.copy_from_slice(&framer.frame);
+                src.samples.copy_from_slice(framer.frame());
                 src.frame_index = hop;
                 src.sample_rate = format.sample_rate_hz;
             }

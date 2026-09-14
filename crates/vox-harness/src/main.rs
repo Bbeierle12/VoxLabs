@@ -824,6 +824,88 @@ mod lab {
 
     // ─── CLI ────────────────────────────────────────────────────────────
 
+    // ─── `voxlab run` / `voxlab validate`: any mode file, headless ─────
+
+    /// `voxlab run`: every audio file under `root` (or one file) through
+    /// `mode`, results beside each other in `out`.
+    pub fn run_mode(mode_name: &str, root: &Path, out: &Path, sr: f32) -> anyhow::Result<()> {
+        let mode = vox_core::pipeline::PipelineDefinition::by_name_or_path(mode_name)
+            .map_err(|e| anyhow::anyhow!("{mode_name}: {e}"))?;
+        let files: Vec<PathBuf> = if root.is_file() {
+            vec![root.to_path_buf()]
+        } else {
+            let mut v: Vec<PathBuf> = fs::read_dir(root)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| audio_file::is_audio_file(p))
+                .collect();
+            v.sort();
+            v
+        };
+        if files.is_empty() {
+            anyhow::bail!("no audio files under {}", root.display());
+        }
+        for f in &files {
+            let (hops, _) = vox_validation::record_run(&mode, f, out, sr)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("{} · {} · {hops} hops", f.display(), mode.name);
+        }
+        println!("{} file(s) → {}", files.len(), out.display());
+        Ok(())
+    }
+
+    /// `voxlab validate`: the provenance round-trip for every
+    /// `*.provenance.json` under `dir` (or the one file named).
+    pub fn validate(target: &Path) -> anyhow::Result<()> {
+        let records: Vec<PathBuf> = if target.is_file() {
+            vec![target.to_path_buf()]
+        } else {
+            let mut v: Vec<PathBuf> = fs::read_dir(target)?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.ends_with(".provenance.json"))
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        if records.is_empty() {
+            anyhow::bail!("no provenance records under {}", target.display());
+        }
+        let mut failed = 0;
+        for r in &records {
+            let rep = vox_validation::validate_and_write(r).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let verdict = if rep.pass { "PASS" } else { "FAIL" };
+            println!(
+                "{verdict}  {} · {} hops · input digest {} · params digest {}",
+                r.display(),
+                rep.compare.hops_compared,
+                if rep.input_digest_matched {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                },
+                if rep.params_digest_matched {
+                    "ok"
+                } else {
+                    "MISMATCH"
+                }
+            );
+            for (t, d) in &rep.compare.per_type {
+                println!(
+                    "      {t}: {} compared, {} outside band, worst {:.3}× ({})",
+                    d.compared, d.outside_band, d.worst_ratio, d.worst
+                );
+            }
+            failed += usize::from(!rep.pass);
+        }
+        if failed > 0 {
+            anyhow::bail!("{failed} of {} record(s) failed", records.len());
+        }
+        Ok(())
+    }
+
     fn flag(args: &[String], name: &str) -> Option<String> {
         args.iter()
             .position(|a| a == name)
@@ -832,8 +914,27 @@ mod lab {
 
     pub fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
-        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>";
+        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>\n       voxlab run <mode|mode.toml> <audio|dir> [--out DIR] [--sr HZ]\n       voxlab validate <results_dir|x.provenance.json>";
         match args.get(1).map(String::as_str) {
+            Some("run") => {
+                let mode = args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?;
+                let root = PathBuf::from(args.get(3).ok_or_else(|| anyhow::anyhow!(usage))?);
+                let out = flag(&args, "--out").map(PathBuf::from).unwrap_or_else(|| {
+                    if root.is_dir() {
+                        root.join("results")
+                    } else {
+                        root.parent().unwrap_or(Path::new(".")).join("results")
+                    }
+                });
+                let sr: f32 = flag(&args, "--sr")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DEFAULT_SR);
+                run_mode(mode, &root, &out, sr)
+            }
+            Some("validate") => {
+                let target = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
+                validate(&target)
+            }
             Some("analyze") => {
                 let root = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
                 let out = flag(&args, "--out")

@@ -192,6 +192,8 @@ impl Store {
         self_tests: &[SelfTestResult],
         calibration: Option<&CalibrationReport>,
         shared_model: Option<&Value>,
+        provenance: Option<&Value>,
+        evidence: Option<&Value>,
         now_millis: u64,
     ) -> (String, String) {
         let bundle = json!({
@@ -210,6 +212,8 @@ impl Store {
             "self_tests": self_tests.iter().map(self_test_to_json).collect::<Vec<_>>(),
             "singer_calibration": calibration.map(calibration_to_json).unwrap_or(Value::Null),
             "shared_model": shared_model.cloned().unwrap_or(Value::Null),
+            "provenance": provenance.cloned().unwrap_or(Value::Null),
+            "evidence": evidence.cloned().unwrap_or(Value::Null),
             "events": self.recent_events(CFG.max_exported_events).iter().map(event_to_json).collect::<Vec<_>>(),
             "refinements": self.refinements(CFG.max_exported_refinements),
         });
@@ -492,6 +496,8 @@ mod tests {
             &Metrics::default(),
             &super::super::core::assess(&Metrics::default(), 0),
             &[],
+            None,
+            None,
             None,
             None,
             0,

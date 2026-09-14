@@ -106,6 +106,26 @@ impl PipelineDefinition {
         Self::from_toml(Self::LIVE_MODEL)
     }
 
+    /// The Fingerprint mode (enrollment/match), compiled in.
+    pub const FINGERPRINT: &'static str = include_str!("../../pipelines/fingerprint.toml");
+    /// The Calibrate mode (the room pass), compiled in.
+    pub const CALIBRATE: &'static str = include_str!("../../pipelines/calibrate.toml");
+
+    /// Every compiled-in mode, by name.
+    pub const MODES: &'static [(&'static str, &'static str)] = &[
+        ("live_model", Self::LIVE_MODEL),
+        ("fingerprint", Self::FINGERPRINT),
+        ("calibrate", Self::CALIBRATE),
+    ];
+
+    /// A compiled-in mode by name, or a `.toml` path.
+    pub fn by_name_or_path(name: &str) -> Result<Self, DefinitionError> {
+        match Self::MODES.iter().find(|(n, _)| *n == name) {
+            Some((_, text)) => Self::from_toml(text),
+            None => Self::from_path(Path::new(name)),
+        }
+    }
+
     pub fn from_toml(text: &str) -> Result<Self, DefinitionError> {
         let def: Self = toml::from_str(text).map_err(DefinitionError::Parse)?;
         def.validate()?;
@@ -198,5 +218,31 @@ impl PipelineDefinition {
         merged
             .try_into()
             .map_err(|e: toml::de::Error| DefinitionError::Params(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::PipelineDefinition;
+    use crate::pipeline::builder::build;
+
+    /// Every compiled-in mode file loads and builds (with the coarse grid
+    /// where a tract stage is present, for speed).
+    #[test]
+    fn every_compiled_in_mode_builds() {
+        for (name, text) in PipelineDefinition::MODES {
+            let text = if text.contains("story_two_mode") {
+                format!("{text}\n[params.tract]\ngrid_n = 21\n")
+            } else {
+                text.to_string()
+            };
+            let def =
+                PipelineDefinition::from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(&def.name, name);
+            let p =
+                build(&def, def.format(Some(48_000.0))).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(p.taps.len(), def.taps.len(), "{name}");
+        }
+        assert!(PipelineDefinition::by_name_or_path("no_such_mode").is_err());
     }
 }

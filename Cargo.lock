@@ -3905,12 +3905,15 @@ dependencies = [
  "anyhow",
  "hound",
  "vox-core",
+ "vox-validation",
 ]
 
 [[package]]
 name = "vox-validation"
 version = "0.1.0"
 dependencies = [
+ "hound",
+ "serde",
  "serde_json",
  "vox-core",
 ]

@@ -96,3 +96,10 @@ mirrored back to the plan.
   8. Coral capture moves to cpal in Phase 4.
   9. Phone first (5a before any desktop work), unchanged.
   10. O3 (Resonator/egui) decided at 5c.
+- **Phase 2 status** (2026-09-14): D6, D7, D8, D9 and D11 are implemented
+  as proposed — audio I/O stays outside the pipeline (ring buffer +
+  runner), `Stage` and the runner live in `vox-core`, every stage
+  preallocates at `init`, one TOML per mode (`live_model`, `fingerprint`,
+  `calibrate`), and a provenance record per run feeds `vox-validation`,
+  whose Evidence output follows the Vocal Tract Lab Evidence tab. The rows
+  above keep the plan's wording; see `docs/phase2-gate.md`.

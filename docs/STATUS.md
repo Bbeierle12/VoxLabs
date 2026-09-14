@@ -228,3 +228,28 @@ request), alongside renaming the launcher label to "VoxLabs".
 **Next.** Run the Phase 1 gate on the Pixel; if it passes, Phase 2 (wrap
 the rest of C2, provenance, `vox-harness`). The M1–M5 Fach Lab plan in §4
 is unchanged and runs in parallel on the harness.
+
+## Addendum — Phase 2 on branch `claude/epic-lamport-euju2k` (14 September 2026, later still)
+
+**Directive.** Brandon: the Pixel is the only product ("nothing else");
+desktop builds and tests but is not a product. Recorded as a D18 amendment
+in `DECISIONS.md` with the ten completion-plan calls.
+
+**Phase 1 close-out (host side).** The contract checks run on the phone
+from the Engineering Console's self-test (`pipeline::contract`); the
+runner's timing line is a `runtime/pipeline_report` event in the bundle;
+launcher label is "VoxLabs". The on-device gate numbers still have to be
+read off the phone.
+
+**Phase 2.** Workspace (`vox-core`, `vox-harness`, `vox-validation`) and
+CI. Every C2 kernel is a stage; `LegacyTail` is gone; the whole chain
+equals `FrameAnalyzer` field for field at frame cadence. Provenance record
+per run (runner and harness), `voxlab run` / `voxlab validate`, the D5
+tolerance bands in `pipeline.toml [tolerance]`, the Evidence output in the
+console and the bundle. `docs/phase2-gate.md` has the table. Deferred:
+`loudness` (no reference vectors), `SpatialCal` as a stage.
+
+**Field status.** Live microphone input on the Pixel was reported as not
+detecting voice before this work; the console build (46fd953) is the
+diagnosis tool and no screenshot has arrived yet. Every later APK carries
+the console.
