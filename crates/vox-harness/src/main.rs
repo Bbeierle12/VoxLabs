@@ -917,7 +917,7 @@ mod lab {
 
     pub fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
-        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>\n       voxlab run <mode|mode.toml> <audio|dir> [--out DIR] [--sr HZ]\n       voxlab validate <results_dir|x.provenance.json>\n       voxlab gen-inverse-fixtures <out_dir> [--n PAIRS] [--seed S]";
+        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>\n       voxlab run <mode|mode.toml> <audio|dir> [--out DIR] [--sr HZ]\n       voxlab validate <results_dir|x.provenance.json>\n       voxlab gen-inverse-fixtures <out_dir> [--n PAIRS] [--seed S]\n       voxlab fixture-taps <out_dir>\n       voxlab compare-taps <a.taps.jsonl> <b.taps.jsonl>";
         match args.get(1).map(String::as_str) {
             Some("run") => {
                 let mode = args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?;
@@ -937,6 +937,58 @@ mod lab {
             Some("validate") => {
                 let target = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
                 validate(&target)
+            }
+            Some("fixture-taps") => {
+                let out = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
+                for (mode, _) in vox_core::pipeline::PipelineDefinition::MODES {
+                    let (taps, prov, hops) =
+                        vox_core::pipeline::record::record_fixture_taps(mode, &out)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    println!(
+                        "{mode}: {hops} hops → {} · {}",
+                        taps.display(),
+                        prov.display()
+                    );
+                }
+                Ok(())
+            }
+            Some("compare-taps") => {
+                let a = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
+                let b = PathBuf::from(args.get(3).ok_or_else(|| anyhow::anyhow!(usage))?);
+                let report = vox_core::pipeline::record::compare_tap_files(
+                    &a,
+                    &b,
+                    vox_core::config::ToleranceConfig::DEFAULT,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!(
+                    "{} · {} hops compared · {} type mismatches",
+                    if report.within_bands() {
+                        "WITHIN BANDS"
+                    } else {
+                        "OUTSIDE BANDS"
+                    },
+                    report.hops_compared,
+                    report.mismatched_types
+                );
+                for (t, d) in &report.per_type {
+                    println!(
+                        "  {t}: {} compared · {} outside · worst {:.3}× band ({})",
+                        d.compared, d.outside_band, d.worst_ratio, d.worst
+                    );
+                }
+                let json = serde_json::to_string_pretty(&report)?;
+                let out = a.with_file_name(format!(
+                    "{}.compare.json",
+                    a.file_stem().and_then(|s| s.to_str()).unwrap_or("taps")
+                ));
+                fs::write(&out, json)?;
+                println!("→ {}", out.display());
+                if report.within_bands() {
+                    Ok(())
+                } else {
+                    anyhow::bail!("outside the tolerance bands")
+                }
             }
             Some("gen-inverse-fixtures") => {
                 let out = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);

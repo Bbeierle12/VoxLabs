@@ -13,10 +13,10 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod audio;
 
-// GPU-compute analysis (wgpu YIN): desktop only. Android uses the CPU DSP path
-// in the `android` module, so wgpu is never compiled for Android.
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-mod analysis;
+// The shell side shared by the phone and the desktop: the switchable live
+// engine over the runner, and the hop consumers the egui screens read.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod shell;
 
 // Android entry point: `android_main`, wired to android-activity's
 // NativeActivity glue. Gated so desktop and web are untouched.
@@ -98,9 +98,9 @@ pub mod frame;
 // Scrolling-spectrogram STFT. Compiled on all targets (its consts size the
 // UI's waterfall buffers); the engine itself is driven only by the desktop
 // and Android analysis loops.
-// The reference STFT (the `stft` stage's contract); only the desktop GPU
-// engine still runs it live (Phase 5c retires that).
-#[cfg_attr(any(target_arch = "wasm32", target_os = "android"), allow(dead_code))]
+// The reference STFT (the `stft` stage's contract) and the waterfall's bin
+// constants; nothing runs it live any more (D15).
+#[allow(dead_code)]
 mod spectrogram;
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 mod synthesis;
@@ -114,29 +114,19 @@ mod ui;
 pub use concurrency::ConcurrencyBridges;
 pub use ui::{AppPaths, DashboardApp};
 
-/// Consecutive `process_frame` failures tolerated before the desktop analysis
-/// loop gives up and reports itself stopped. A single failure can be a
-/// transient GPU submit hiccup; three in a row means the device is gone.
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-const MAX_CONSECUTIVE_FRAME_ERRORS: u32 = 3;
-
-/// Idle sleep between ring-buffer drains on the analysis thread.
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-const ANALYSIS_POLL_MS: u64 = 5;
-
-/// Desktop native entry point. Spawns the GPU-accelerated analysis thread,
-/// starts the cpal audio engine, and runs the egui dashboard. This is the
-/// former `fn main` body verbatim (now returning to `main.rs`), so desktop
-/// behaviour is unchanged.
+/// Desktop native entry point. Starts the pipeline runner on the live audio
+/// stream (the same `shell::engine` the phone uses — D15: the desktop is
+/// the CPU pipeline), the cpal audio engine, and the egui dashboard.
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 pub fn run() -> anyhow::Result<()> {
-    use crate::analysis::AnalysisEngine;
     use crate::audio::AudioEngine;
     use crate::concurrency::AnalysisState;
+    use crate::shell::consumers::WireConsumers;
+    use crate::shell::engine::{self, LiveEngine};
     use cpal::traits::{DeviceTrait, HostTrait};
-    use std::panic::AssertUnwindSafe;
     use std::path::Path;
-    use std::thread;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
 
     let logger = env_logger::Builder::from_default_env().build();
     log::set_max_level(logger.filter());
@@ -146,30 +136,29 @@ pub fn run() -> anyhow::Result<()> {
 
     // The Engineering Console's session log, beside the archive.
     let store_path = persist::default_store_path();
-    if let Some(files) = store_path.as_ref().and_then(|p| p.parent()) {
+    let data_dir = store_path
+        .as_ref()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    if let Some(files) = data_dir.as_deref() {
         match diagnostics::runtime::initialize(files) {
             Ok(()) => diagnostics::install_panic_hook(),
             Err(e) => log::error!("diagnostics store did not open: {e}"),
         }
     }
     diagnostics::runtime::update_renderer_mode(diagnostics::runtime::renderer_mode_name());
+    diagnostics::runtime::set_shared_model_snapshot(
+        serde_json::to_value(crate::atlas::data_provenance()).unwrap_or(serde_json::Value::Null),
+    );
     // Desktop has no runtime permission model: the microphone is available
     // whenever a device is.
     diagnostics::runtime::update_microphone_granted(true);
 
     let bridges = ConcurrencyBridges::new();
-    let profile_tx = bridges.profile_tx;
-
-    let mut audio_rx = bridges.audio_rx;
-    let ui_profile_tx = bridges.ui_profile_tx;
-    let spectrum_tx = bridges.spectrum_tx;
     let spectrum_rx = bridges.spectrum_rx;
-    let scope_tx = bridges.scope_tx;
     let scope_rx = bridges.scope_rx;
 
-    // Determine the real microphone sample rate up front so the analysis DSP
-    // scales its frequencies correctly. Previously process_frame was fed a
-    // hardcoded 44100.0, which mis-scaled f0/formants on any other device rate.
+    // The real microphone sample rate, so the DSP scales its frequencies
+    // correctly.
     let input_sample_rate = {
         let host = cpal::default_host();
         let dev = host
@@ -179,41 +168,37 @@ pub fn run() -> anyhow::Result<()> {
     };
     println!("Microphone sample rate: {input_sample_rate} Hz");
 
-    // Start background analysis thread. Nothing on this thread may panic the
-    // process or die silently: initialization failure, a panic inside the loop
-    // and repeated frame errors each land in `Telemetry` so the UI can say
-    // which one happened instead of showing a frozen readout forever.
-    let analysis_telemetry = bridges.telemetry.clone();
-    thread::spawn(move || {
-        let telemetry = analysis_telemetry;
-        let mut engine = match pollster::block_on(AnalysisEngine::new(
-            profile_tx,
-            ui_profile_tx,
-            spectrum_tx,
-            scope_tx,
-            telemetry.clone(),
-        )) {
-            Ok(engine) => engine,
-            Err(e) => {
-                // Almost always "no usable GPU adapter". Per the phase-F
-                // decision (gate G3) we report it rather than falling back to
-                // a desktop CPU analysis path.
-                log::error!("analysis engine failed to initialize: {e:?}");
-                telemetry.set_analysis_state(AnalysisState::Unavailable);
-                return;
-            }
-        };
-        telemetry.set_analysis_state(AnalysisState::Running);
-
-        let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            analysis_loop(&mut engine, &mut audio_rx, input_sample_rate, &telemetry);
-        }));
-        match outcome {
-            Ok(()) => log::error!("analysis loop exited; live analysis has stopped"),
-            Err(_) => log::error!("analysis loop panicked; live analysis has stopped"),
+    // The runner on the live stream, in the mode last chosen (mode.txt
+    // beside the archive; default live_model).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mode = engine::saved_mode(data_dir.as_deref());
+    let consumers = WireConsumers::new(
+        bridges.profile_tx,
+        bridges.ui_profile_tx,
+        bridges.spectrum_tx,
+        bridges.scope_tx,
+        bridges.telemetry.clone(),
+        1,
+        1,
+    );
+    let mut live = LiveEngine::new(
+        input_sample_rate,
+        bridges.audio_rx,
+        Some(Box::new(consumers)),
+        bridges.telemetry.clone(),
+    );
+    let shell = match live.start(&mode) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::error!("{e}; live analysis unavailable");
+            bridges
+                .telemetry
+                .set_analysis_state(AnalysisState::Unavailable);
+            None
         }
-        telemetry.set_analysis_state(AnalysisState::Stopped);
-    });
+    };
+    let live = Arc::new(Mutex::new(live));
+    engine::spawn_watcher(live.clone(), shutdown.clone(), data_dir.clone());
 
     let _audio_engine = AudioEngine::start(
         bridges.profile_rx,
@@ -232,20 +217,17 @@ pub fn run() -> anyhow::Result<()> {
 
     // Raw captures and the import folder live beside the archive:
     // `<data dir>/VoxLabs/{captures,import}/`.
-    let data_dir = store_path
-        .as_ref()
-        .and_then(|p| p.parent().map(Path::to_path_buf));
     let paths = AppPaths {
         store: store_path,
         captures: data_dir.as_ref().map(|d| d.join("captures")),
         imports: data_dir.as_ref().map(|d| d.join("import")),
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Voice Harmonic Engine",
         native_options,
         Box::new(move |cc| {
-            Ok(Box::new(DashboardApp::new(
+            let mut app = DashboardApp::new(
                 cc,
                 bridges.event_tx,
                 bridges.telemetry.clone(),
@@ -254,57 +236,20 @@ pub fn run() -> anyhow::Result<()> {
                 scope_rx,
                 input_sample_rate,
                 paths,
-            )))
+            );
+            if let Some(shell) = shell {
+                app.attach_pipeline(shell);
+            }
+            Ok(Box::new(app))
         }),
     )
-    .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e))?;
-
-    Ok(())
-}
-
-/// Desktop analysis loop body, split out of [`run`] so the spawning thread can
-/// wrap it in `catch_unwind` and report its death.
-///
-/// Returns only when analysis can no longer proceed: the caller then marks the
-/// engine `Stopped`. The accumulator is persistent — each tick drains
-/// *everything* available from the ring buffer, processes as many whole frames
-/// as it has, and carries the leftover samples into the next tick.
-#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
-fn analysis_loop(
-    engine: &mut analysis::AnalysisEngine,
-    audio_rx: &mut rtrb::Consumer<f32>,
-    input_sample_rate: f32,
-    telemetry: &concurrency::Telemetry,
-) {
-    let mut accumulator: Vec<f32> = Vec::with_capacity(analysis::ANALYSIS_FRAME * 4);
-    let mut consecutive_errors = 0u32;
-
-    loop {
-        while let Ok(sample) = audio_rx.pop() {
-            accumulator.push(sample);
-        }
-
-        while accumulator.len() >= analysis::ANALYSIS_FRAME {
-            capture_log::push(&accumulator[..analysis::ANALYSIS_FRAME]);
-            match engine.process_frame(&accumulator[..analysis::ANALYSIS_FRAME], input_sample_rate)
-            {
-                Ok(()) => {
-                    consecutive_errors = 0;
-                    telemetry.note_analysis_frame();
-                }
-                Err(e) => {
-                    consecutive_errors += 1;
-                    log::error!(
-                        "process_frame failed ({consecutive_errors}/{MAX_CONSECUTIVE_FRAME_ERRORS}): {e:?}"
-                    );
-                    if consecutive_errors >= MAX_CONSECUTIVE_FRAME_ERRORS {
-                        return;
-                    }
-                }
-            }
-            accumulator.drain(..analysis::ANALYSIS_FRAME);
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(ANALYSIS_POLL_MS));
+    .map_err(|e| anyhow::anyhow!("eframe error: {:?}", e));
+    shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut e) = live.lock() {
+        e.retire(
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(5),
+        );
     }
+    result
 }

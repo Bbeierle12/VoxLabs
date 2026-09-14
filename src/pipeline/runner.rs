@@ -104,6 +104,10 @@ fn max_store(slot: &AtomicU64, v: u64) {
 
 /// The shell's per-hop hook for work the pipeline does not wrap yet.
 pub trait HopObserver: Send {
+    /// A mode switch keeps the observer but may change the hop and the
+    /// frame-cadence divisor; the default ignores it.
+    fn set_cadence(&mut self, _every: u64, _hop: usize) {}
+
     /// `frame` is the hop's full analysis frame; `wires` every stage output
     /// (wire 0 is the frame). Called after the stages, before the taps.
     fn on_hop(&mut self, frame: &AudioFrame, wires: &[Wire], hop: u64);
@@ -120,10 +124,15 @@ pub struct ShellHandle {
     pub stages: Vec<(String, String)>,
 }
 
+/// What a stopped worker hands back: the ring-buffer consumer and the
+/// observer it was given, so a shell can start another mode on the same
+/// audio stream without reopening the device (Phase 5a mode switching).
+pub type Parked = (Consumer<f32>, Option<Box<dyn HopObserver>>);
+
 /// The worker's owner. Dropping it asks the worker to stop and joins it.
 pub struct Runner {
     shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handle: Option<JoinHandle<Option<Parked>>>,
     stats: Arc<RunnerStats>,
 }
 
@@ -189,9 +198,13 @@ impl Runner {
                         worker_shutdown,
                     )
                 }));
-                if outcome.is_err() {
-                    log::error!("pipeline worker panicked; live analysis has stopped");
-                    stats_for_panic.set_state(RunnerState::Failed);
+                match outcome {
+                    Ok(parked) => Some(parked),
+                    Err(_) => {
+                        log::error!("pipeline worker panicked; live analysis has stopped");
+                        stats_for_panic.set_state(RunnerState::Failed);
+                        None
+                    }
                 }
             })
             .expect("spawn runner thread");
@@ -229,11 +242,13 @@ impl Runner {
         self.stats.clone()
     }
 
-    pub fn stop(&mut self) {
+    /// Stops the worker and joins it, returning the audio consumer and the
+    /// observer it held (`None` when the worker panicked, or was already
+    /// stopped).
+    pub fn stop(&mut self) -> Option<Parked> {
         self.shutdown.store(true, Ordering::Relaxed);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
+        let h = self.handle.take()?;
+        h.join().ok().flatten()
     }
 
     /// Asks the worker to stop without joining it — for a shell that must
@@ -246,7 +261,7 @@ impl Runner {
 
 impl Drop for Runner {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
@@ -259,14 +274,14 @@ fn worker(
     taps: TapSender,
     stats: Arc<RunnerStats>,
     shutdown: Arc<AtomicBool>,
-) {
+) -> Parked {
     let cfg = def.runner;
     let mut pipeline: Pipeline = match build(&def, format) {
         Ok(p) => p,
         Err(e) => {
             log::error!("pipeline `{}` failed to build:\n{e}", def.name);
             stats.set_state(RunnerState::Failed);
-            return;
+            return (audio_rx, observer);
         }
     };
     // D11: what is running, recorded before the first hop.
@@ -374,6 +389,7 @@ fn worker(
         thread::sleep(poll);
     }
     stats.set_state(RunnerState::Stopped);
+    (audio_rx, observer)
 }
 
 /// Periodic timing line for logcat / the desktop log — the record a

@@ -22,12 +22,7 @@ use vox_core::pipeline::offline::run_offline;
 use vox_core::pipeline::provenance::{ProvenanceRecord, params_digest};
 use vox_core::pipeline::types::Wire;
 
-/// One line of a `.taps.jsonl` file: the hop and the tapped wires by stage.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TapLine {
-    pub hop: u64,
-    pub taps: BTreeMap<String, Wire>,
-}
+pub use vox_core::pipeline::record::TapLine;
 
 /// The round-trip's outcome.
 #[derive(Clone, Debug, Serialize, Deserialize)]

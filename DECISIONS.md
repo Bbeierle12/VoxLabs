@@ -173,4 +173,20 @@ mirrored back to the plan.
   records 3.2 as the tuned value. The port keeps 3.0 (the shipped
   behaviour, and what `choir-detection.test.ts` was calibrated against);
   the drift is noted for Brandon, not resolved by the port.
+- **Phase 5 status and the shell decision** (2026-09-14): under the
+  Pixel-only directive the phone's shell is the existing egui
+  NativeActivity build; Tauri 2 Android is not stood up. Reasons: the
+  egui build already runs every mode, the Console and the taps on the
+  Pixel; a WebView shell could not be verified here (no device access,
+  no adb) and has no desktop product to share with; Coral's React views
+  would have been rewrites either way, and are now egui tap renderers.
+  O3 is answered for this repository: egui on both targets. D15 is done
+  as reduced (the desktop runs the same `shell::engine` as the phone; the
+  GPU engine and its shaders are deleted). 5b is dropped; the wasm
+  type-check stays in CI. Experiment 2 (WebGL2 vs WebGPU) is not run —
+  it measured a WebView the shell does not use. The D5 arm64-vs-x86_64
+  bands are procedure-complete (Console → Record/Export fixture taps;
+  `voxlab fixture-taps` / `compare-taps`) and wait for the phone's
+  files. Details: `docs/phase5-gate.md`. Brandon can overturn the shell
+  decision; nothing in the pipeline depends on it (D9).
 

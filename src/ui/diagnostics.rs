@@ -33,6 +33,8 @@ pub(super) struct Console {
     self_test_text: String,
     evidence_text: String,
     event_text: String,
+    /// Status of the last fixture-tap record/export (Phase 5a, D5).
+    fixture_status: String,
     overlay_enabled: bool,
     expected_f0: String,
     expected_vowel: String,
@@ -55,6 +57,7 @@ impl Default for Console {
             self_test_text: "Not run in this session".into(),
             evidence_text: String::new(),
             event_text: "No events".into(),
+            fixture_status: String::new(),
             overlay_enabled: false,
             expected_f0: String::new(),
             expected_vowel: String::new(),
@@ -392,6 +395,30 @@ impl DashboardApp {
         ui.add_space(4.0);
         if action(ui, "Save proposed correction", full_width(ui)) {
             self.console_save_correction(now);
+        }
+
+        section(ui, "Cross-target tolerance (D5)");
+        body(
+            ui,
+            "Record runs every mode over its compiled-in fixture on this phone and keeps the taps; export copies them to Downloads/VoxLabs. On the host, `voxlab fixture-taps` records the same and `voxlab compare-taps` sets the [tolerance] bands from the two.",
+        );
+        let (record, export_taps) = two_up(ui, "Record fixture taps", "Export fixture taps");
+        if record {
+            match runtime::record_fixture_taps() {
+                Ok(lines) => self.console.fixture_status = lines.join("\n"),
+                Err(e) => self.console.fixture_status = format!("Record failed: {e}"),
+            }
+        }
+        if export_taps {
+            match runtime::export_fixture_taps() {
+                Ok(names) => {
+                    self.console.fixture_status = format!("Exported: {}", names.join(", "))
+                }
+                Err(e) => self.console.fixture_status = format!("Export failed: {e}"),
+            }
+        }
+        if !self.console.fixture_status.is_empty() {
+            body(ui, &self.console.fixture_status);
         }
 
         section(ui, "Progress and review bundle");

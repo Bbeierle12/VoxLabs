@@ -307,31 +307,6 @@ pub fn yin_f0_from_diff(diff: &[f32], sample_rate: f32) -> Option<PitchEstimate>
     yin_pick(&cmnd, tau_min, tau_max, sample_rate)
 }
 
-/// YIN steps 2-4 using a GPU-computed **inclusive prefix sum** of `diff` as the
-/// CMND denominator. `cumsum[tau]` must equal `sum_{j=0..=tau} diff[j]`; since
-/// `diff[0] == 0` that equals `sum_{j=1..tau} diff[j]`, exactly the YIN
-/// denominator. This is the path where the cumulative sum runs as a parallel
-/// prefix-sum on the GPU rather than a serial loop on the CPU.
-pub fn yin_f0_from_diff_cumsum(
-    diff: &[f32],
-    cumsum: &[f32],
-    sample_rate: f32,
-) -> Option<PitchEstimate> {
-    let len = diff.len().min(cumsum.len());
-    let (tau_min, tau_max) = yin_bounds(len, sample_rate)?;
-
-    let mut cmnd = vec![1.0f32; tau_max + 1];
-    for tau in 1..=tau_max {
-        let denom = cumsum[tau];
-        cmnd[tau] = if denom > 0.0 {
-            diff[tau] * tau as f32 / denom
-        } else {
-            1.0
-        };
-    }
-    yin_pick(&cmnd, tau_min, tau_max, sample_rate)
-}
-
 /// YIN fundamental-frequency estimation (de Cheveigné & Kawahara, 2002),
 /// CPU reference path. Computes the difference function on the CPU then shares
 /// steps 2-4 with the GPU path via [`yin_f0_from_diff`]. Returns `None` only if

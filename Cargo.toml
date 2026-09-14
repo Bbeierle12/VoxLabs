@@ -103,13 +103,10 @@ hound = "3.5"
 # Android unchanged; the web target has no files to decode.
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "pcm", "isomp4", "aac", "vorbis", "ogg"] }
 
-# Desktop only: the wgpu GPU-compute analysis path + its blocking executor and
-# logger, plus winit's default backends (x11/wayland, matching eframe's stock
-# `winit/default`). Android takes the CPU DSP path instead, so it never compiles
-# wgpu — keeping wgpu-on-Vulkan-Android out of the build entirely (de-risked).
+# Desktop only: the logger and winit's default backends (x11/wayland,
+# matching eframe's stock `winit/default`). The wgpu compute path is gone
+# (D15, Phase 5c): wgpu enters only as eframe's desktop renderer.
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))'.dependencies]
-wgpu = "29.0.3"
-pollster = "0.4.0"
 env_logger = "0.11.10"
 winit = "0.30.13"
 

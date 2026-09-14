@@ -288,3 +288,16 @@ the console.
 - Not done: the shell, the tap renderers, the TypeScript worker's
   deletion and Coral's capture → cpal (all 5a, see DECISIONS.md).
 
+## Addendum — Phase 5 on branch `claude/epic-lamport-euju2k` (14 September 2026, night)
+
+- The shell decision: egui stays on the Pixel (DECISIONS.md, Phase 5).
+  The Room screen's PIPELINE card switches modes live (live_model,
+  fingerprint, calibrate, atlas, choir) and persists the choice; the
+  choir mode shows Coral's rehearsal cards, the atlas mode the airway
+  mesh. Console → "Record fixture taps" / "Export fixture taps" is the
+  phone side of the D5 tolerance bands.
+- D15: the desktop GPU engine is gone; the desktop runs the same runner
+  as the phone. `docs/phase5-gate.md`.
+- Still needed from the phone: the fixture-tap files, a screenshot of
+  each mode, the self-test lines, and the live-audio fault report.
+

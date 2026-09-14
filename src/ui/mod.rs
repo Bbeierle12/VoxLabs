@@ -37,6 +37,8 @@ mod room;
 mod room_probe;
 mod room_tv_path;
 mod sessions;
+#[cfg(not(target_arch = "wasm32"))]
+mod tap_views;
 mod theme;
 mod tract_card;
 mod viz;

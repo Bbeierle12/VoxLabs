@@ -4,10 +4,16 @@
 //! drives a tube view).
 
 use super::*;
+use crate::choir::cards::HarmonyResult;
+use crate::choir::harmony::HarmonyConfig;
+use crate::choir::pipeline::ChoirHarmony;
+use crate::config::PipelineParams;
 use crate::pipeline::runner::{RunnerState, ShellHandle};
 use crate::pipeline::tap::TapMsg;
 use crate::pipeline::types::{TractModelId, Wire};
+use crate::shell::engine;
 use std::sync::atomic::Ordering as AtomicOrdering;
+use std::time::Instant;
 
 /// What the app holds once a runner is attached.
 pub(super) struct PipelineShell {
@@ -16,34 +22,70 @@ pub(super) struct PipelineShell {
     pub(super) latest: Vec<Option<TapMsg>>,
     /// Taps received since the panel was last painted.
     pub(super) received: u64,
+    /// Coral's rehearsal harmony over the choir taps (a consumer, §5.2).
+    choir: ChoirHarmony,
+    choir_result: Option<HarmonyResult>,
+    choir_clock: Instant,
 }
 
 impl DashboardApp {
-    /// Hands the app the runner's taps and stats (Android only today; the
-    /// desktop keeps its GPU engine until Phase 5c).
+    /// Hands the app the runner's taps and stats (the phone and the desktop
+    /// both run the runner since Phase 5).
     pub fn attach_pipeline(&mut self, handle: ShellHandle) {
         let n = handle.stages.len();
+        let p = PipelineParams::DEFAULT;
         self.pipeline = Some(PipelineShell {
             handle,
             latest: vec![None; n],
             received: 0,
+            choir: ChoirHarmony::new(HarmonyConfig::default(), p.choir_harmony, p.choir_stft),
+            choir_result: None,
+            choir_clock: Instant::now(),
         });
     }
 
-    /// Per repaint: drain the taps, keep the newest per stage, and record
-    /// the render leg of the mic-to-render latency for the tube's tap.
+    /// Per repaint: pick up a switched runner, drain the taps, keep the
+    /// newest per stage, record the render leg of the mic-to-render latency
+    /// for the tube's tap, and feed the rehearsal harmony when a choir
+    /// frame completes.
     pub(super) fn poll_pipeline(&mut self) {
+        if let Some(handle) = engine::take_pending_handle() {
+            self.attach_pipeline(handle);
+        }
         let Some(shell) = self.pipeline.as_mut() else {
             return;
         };
+        let mut labels_hop = None;
         for msg in shell.handle.taps.drain() {
-            if matches!(msg.value, Wire::AreaFunction(_)) {
+            if matches!(msg.value, Wire::AreaFunction(_) | Wire::SectionLabels(_)) {
                 shell.handle.stats.note_render(msg.captured_at);
+            }
+            if matches!(msg.value, Wire::SectionLabels(_)) {
+                labels_hop = Some(msg.hop);
             }
             if let Some(slot) = shell.latest.get_mut(msg.stage) {
                 *slot = Some(msg);
             }
             shell.received += 1;
+        }
+        if let Some(hop) = labels_hop {
+            let find = |pred: &dyn Fn(&Wire) -> bool| {
+                shell
+                    .latest
+                    .iter()
+                    .flatten()
+                    .find(|m| m.hop == hop && pred(&m.value))
+                    .map(|m| &m.value)
+            };
+            if let (Some(Wire::Spectrum(s)), Some(Wire::NoteSet(n)), Some(Wire::SectionLabels(l))) = (
+                find(&|w| matches!(w, Wire::Spectrum(_))),
+                find(&|w| matches!(w, Wire::NoteSet(_))),
+                find(&|w| matches!(w, Wire::SectionLabels(_))),
+            ) {
+                let now_ms = shell.choir_clock.elapsed().as_secs_f32()
+                    * crate::config::consts::MILLIS_PER_SECOND;
+                shell.choir_result = Some(shell.choir.feed(s, n, l, now_ms));
+            }
         }
     }
 
@@ -71,8 +113,8 @@ impl DashboardApp {
                 ui.add_space(6.0);
                 ui.label(
                     RichText::new(
-                        "Runner not attached on this target: the desktop keeps its GPU engine \
-                         until Phase 5c. The Android build runs live_model.toml.",
+                        "Runner not attached: the pipeline failed to start (see the log) or no \
+                         input device was found.",
                     )
                     .size(11.5)
                     .color(ink(160)),
@@ -107,14 +149,39 @@ impl DashboardApp {
             });
             ui.label(
                 RichText::new(format!(
-                    "{} · hop {} @ {:.0} Hz · Phase 1 walking skeleton",
+                    "{} · hop {} @ {:.0} Hz · frame {}",
                     shell.handle.pipeline_name,
                     shell.handle.format.hop,
-                    shell.handle.format.sample_rate_hz
+                    shell.handle.format.sample_rate_hz,
+                    shell.handle.format.frame_samples
                 ))
                 .size(11.0)
                 .color(ink(160)),
             );
+            // ── Mode selector: the runner switches on the same audio stream ──
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("mode").font(FontId::monospace(9.5)).color(ink(115)));
+                let switching = engine::is_switching();
+                let current = engine::current_mode();
+                for name in engine::mode_names() {
+                    let selected = name == current;
+                    let button = egui::Button::new(
+                        RichText::new(name)
+                            .font(FontId::monospace(10.0))
+                            .color(if selected { white(230) } else { TEAL_DARK }),
+                    )
+                    .fill(if selected { TEAL_DARK } else { white(120) });
+                    if ui.add_enabled(!switching && !selected, button).clicked() {
+                        engine::request_mode(name);
+                    }
+                }
+                if switching {
+                    ui.label(RichText::new("switching…").size(10.0).color(AMBER_TEXT));
+                }
+            });
+            if let Some(e) = engine::last_error() {
+                ui.label(RichText::new(e).size(10.0).color(AMBER_TEXT));
+            }
             ui.add_space(8.0);
 
             // ── Taps: one row per stage ──
@@ -164,6 +231,24 @@ impl DashboardApp {
                     .font(FontId::monospace(9.5))
                     .color(ink(140)),
                 );
+                ui.add_space(6.0);
+            }
+
+            // ── Coral's rehearsal view from the choir taps ──
+            if let Some(r) = shell.choir_result.as_ref() {
+                super::tap_views::rehearsal_card(ui, r, &shell.choir.analyzer.cfg);
+                ui.add_space(6.0);
+            }
+            // ── The atlas mesh from the mesh tap ──
+            if let Some(Wire::TractGeometry(g)) = shell
+                .latest
+                .iter()
+                .flatten()
+                .rev()
+                .find(|m| matches!(m.value, Wire::TractGeometry(_)))
+                .map(|m| &m.value)
+            {
+                super::tap_views::mesh_card(ui, g);
                 ui.add_space(6.0);
             }
 

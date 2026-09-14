@@ -26,6 +26,10 @@ pub mod definition;
 pub mod framing;
 pub mod offline;
 pub mod provenance;
+// Recorded runs and the D5 fixture files: the fixture signals come from the
+// contract checks, which the web build does not carry.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod record;
 pub mod stage;
 pub mod stages;
 pub mod tap;

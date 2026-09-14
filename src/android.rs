@@ -8,11 +8,12 @@
 //!
 //! Two deliberate de-risking choices for this first on-device build:
 //!   1. **CPU DSP only.** Analysis runs through the pipeline runner
-//!      (`pipeline::runner`, Plan v3): every kernel is a stage of
-//!      `live_model.toml`, and the UI's profile, waterfall, scope, room
+//!      (`pipeline::runner`, Plan v3): every kernel is a stage of the
+//!      mode file the phone last chose (`shell::engine`, default
+//!      `live_model.toml`), and the UI's profile, waterfall, scope, room
 //!      calibration and capture export are tap consumers on the hop hook
-//!      (see [`WireConsumers`]). It never constructs the wgpu `GpuYin`
-//!      compute path, so a missing or limited Vulkan driver can't break
+//!      (`shell::consumers::WireConsumers`). No GPU compute path exists
+//!      any more (D15), so a missing or limited Vulkan driver can't break
 //!      launch.
 //!   2. **glow (GLES/EGL) renderer**, not wgpu/Vulkan — forced via
 //!      `NativeOptions.renderer`.
@@ -38,18 +39,15 @@
 
 use crate::audio::AudioEngine;
 use crate::concurrency::{AnalysisState, ConcurrencyBridges, MicPermission, MicRequest, Telemetry};
-use crate::pipeline::runner::{HopObserver, Runner, RunnerState};
-use crate::pipeline::{AudioFrame, PipelineDefinition, Wire};
+use crate::shell::consumers::WireConsumers;
+use crate::shell::engine::{self, LiveEngine};
 use crate::types::VocalProfile;
 use crate::ui::DashboardApp;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
-use triple_buffer::Input;
+use std::time::Duration;
 use winit::platform::android::activity::AndroidApp;
-
-use crate::frame::ANALYSIS_FRAME;
 
 /// Fallback microphone rate when the input device can't be queried yet (e.g.
 /// `RECORD_AUDIO` not granted at launch). 48 kHz is the near-universal Android
@@ -75,9 +73,10 @@ const PERMISSION_POLL: Duration = Duration::from_secs(1);
 /// One `android_main` invocation's background resources, parked where the
 /// *next* invocation can reach them.
 struct Generation {
-    /// Set to ask this generation's runner to return.
+    /// Set to ask this generation's threads to return.
     shutdown: Arc<AtomicBool>,
-    runner: Option<Runner>,
+    /// The live runner and the parked audio stream (mode switching).
+    engine: Arc<Mutex<LiveEngine>>,
     /// Dropping this closes the AAudio input/output streams — the reason the
     /// engine lives here instead of on the parked `android_main` stack frame,
     /// which the new generation cannot reach. Shared with the thread that
@@ -97,7 +96,7 @@ fn retire_previous_generation() {
         Ok(mut slot) => slot.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
-    let Some(mut previous) = previous else {
+    let Some(previous) = previous else {
         return;
     };
     log::info!("retiring the previous android_main generation");
@@ -119,23 +118,9 @@ fn retire_previous_generation() {
     // checks this flag every 0.1 s chunk and releases the recorder itself.
     crate::spatial::request_shutdown();
 
-    if let Some(mut runner) = previous.runner.take() {
-        let stats = runner.stats();
-        let deadline = Instant::now() + SHUTDOWN_GRACE;
-        let done = |s: RunnerState| matches!(s, RunnerState::Stopped | RunnerState::Failed);
-        while !done(stats.state()) && Instant::now() < deadline {
-            thread::sleep(SHUTDOWN_POLL);
-        }
-        if done(stats.state()) {
-            // Never join blind: a wedged worker would hang the relaunch.
-            runner.stop();
-        } else {
-            log::warn!(
-                "previous pipeline runner did not stop within {} ms; detaching it",
-                SHUTDOWN_GRACE.as_millis()
-            );
-            runner.detach();
-        }
+    match previous.engine.lock() {
+        Ok(mut e) => e.retire(SHUTDOWN_GRACE, SHUTDOWN_POLL),
+        Err(poisoned) => poisoned.into_inner().retire(SHUTDOWN_GRACE, SHUTDOWN_POLL),
     }
 }
 
@@ -182,71 +167,41 @@ fn android_main(app: AndroidApp) {
     let input_sample_rate = query_input_sample_rate().unwrap_or(FALLBACK_SAMPLE_RATE);
     log::info!("android input sample rate: {input_sample_rate} Hz");
 
-    // The analysis worker is the pipeline runner (Plan v3 Phase 1): the
-    // Live Model stages per hop, plus the legacy per-frame tail. The runner
-    // builds its pipeline on its own thread — the two inversion grids — so
-    // audio is opened only once it is ready (bounded by the mode file's
-    // init_timeout_ms), rather than letting the ring overflow meanwhile.
+    // The analysis worker is the pipeline runner (Plan v3): the stages of
+    // the mode the phone last chose (`mode.txt` in the files dir; default
+    // live_model), with the UI's consumers on the hop hook. The runner
+    // builds on its own thread — the inversion grids — so audio is opened
+    // only once it is ready (bounded by the mode file's init_timeout_ms).
     let shutdown = Arc::new(AtomicBool::new(false));
-    let telemetry_for_runner = bridges.telemetry.clone();
-    let (runner, shell) = match PipelineDefinition::live_model() {
-        Ok(def) => {
-            let format = def.format(Some(input_sample_rate));
-            if format.frame_samples != ANALYSIS_FRAME {
-                // The capture export and the calibration pass count
-                // ANALYSIS_FRAME-sample frames; a mode file that changes
-                // the frame changes the study's file layout, so refuse.
-                log::error!(
-                    "live_model.toml frame_samples {} != ANALYSIS_FRAME {}; refusing to start",
-                    format.frame_samples,
-                    ANALYSIS_FRAME
-                );
-                telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
-                (None, None)
-            } else {
-                let tail = WireConsumers {
-                    profile_tx,
-                    ui_profile_tx,
-                    spectrum_tx,
-                    scope_tx,
-                    telemetry: telemetry_for_runner.clone(),
-                    calibrator: crate::math::RoomCalibrator::new(),
-                    every: def.runner.legacy_frame_every_hops,
-                };
-                let init_timeout = Duration::from_millis(def.runner.init_timeout_ms);
-                let poll = Duration::from_millis(def.runner.poll_ms);
-                let (runner, shell) = Runner::spawn(
-                    def,
-                    format,
-                    audio_rx,
-                    Some(Box::new(tail)),
-                    shutdown.clone(),
-                );
-                match runner.wait_ready(init_timeout, poll) {
-                    RunnerState::Running => {
-                        telemetry_for_runner.set_analysis_state(AnalysisState::Running)
-                    }
-                    RunnerState::Building => {
-                        log::warn!(
-                            "pipeline still building after {} ms; opening audio anyway",
-                            init_timeout.as_millis()
-                        );
-                        telemetry_for_runner.set_analysis_state(AnalysisState::Running);
-                    }
-                    RunnerState::Failed | RunnerState::Stopped => {
-                        log::error!("pipeline failed to start; live analysis unavailable");
-                        telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
-                    }
-                }
-                (Some(runner), Some(shell))
-            }
-        }
+    let mode_dir = app.internal_data_path();
+    let mode = engine::saved_mode(mode_dir.as_deref());
+    let consumers = WireConsumers::new(
+        profile_tx,
+        ui_profile_tx,
+        spectrum_tx,
+        scope_tx,
+        bridges.telemetry.clone(),
+        1,
+        1,
+    );
+    let mut live = LiveEngine::new(
+        input_sample_rate,
+        audio_rx,
+        Some(Box::new(consumers)),
+        bridges.telemetry.clone(),
+    );
+    let shell = match live.start(&mode) {
+        Ok(handle) => Some(handle),
         Err(e) => {
-            log::error!("live_model.toml did not load: {e}");
-            telemetry_for_runner.set_analysis_state(AnalysisState::Unavailable);
-            (None, None)
+            log::error!("{e}; live analysis unavailable");
+            bridges
+                .telemetry
+                .set_analysis_state(AnalysisState::Unavailable);
+            None
         }
     };
+    let live = Arc::new(Mutex::new(live));
+    engine::spawn_watcher(live.clone(), shutdown.clone(), mode_dir);
 
     // cpal AAudio engine, opened as soon as RECORD_AUDIO is granted: now if
     // it already is, otherwise after the system dialog the app raises here.
@@ -265,7 +220,7 @@ fn android_main(app: AndroidApp) {
     // invocation may never get the chance to clean up after itself.
     let generation = Generation {
         shutdown,
-        runner,
+        engine: live,
         audio,
     };
     match ACTIVE_GENERATION.lock() {
@@ -472,85 +427,4 @@ fn query_input_sample_rate() -> Option<f32> {
     let dev = host.default_input_device()?;
     let config = dev.default_input_config().ok()?;
     Some(config.config().sample_rate as f32)
-}
-
-/// The tap consumers on the worker's hop hook: the profile the UI and the
-/// synthesis reads, assembled from the wires (`pipeline::consumers`); the
-/// waterfall from the `stft` tap; the oscilloscope from the frame; the
-/// room-calibration pass (fed the pre-gate periodicity, since a
-/// calibrating room with a voice in it must fail); the raw-capture
-/// export. Every stage now runs once per hop; the calibration pass and
-/// the capture mirror keep the frame cadence (`every` hops) so their
-/// frame counts and file layout are unchanged.
-struct WireConsumers {
-    profile_tx: Input<VocalProfile>,
-    ui_profile_tx: Input<VocalProfile>,
-    spectrum_tx: Input<Vec<f32>>,
-    scope_tx: Input<Vec<f32>>,
-    telemetry: Arc<Telemetry>,
-    calibrator: crate::math::RoomCalibrator,
-    every: u64,
-}
-
-impl HopObserver for WireConsumers {
-    fn on_hop(&mut self, frame: &AudioFrame, wires: &[Wire], hop: u64) {
-        use crate::pipeline::consumers::{first, latest, profile_from_wires};
-        use crate::pipeline::types::{F0Track, Spectrum};
-        let samples = &frame.samples;
-        let frame_cadence = hop.is_multiple_of(self.every);
-
-        if frame_cadence {
-            // Mirror the frame to the capture export (no-op unless a
-            // capture is armed), one whole frame per `every` hops.
-            crate::capture_log::push(samples);
-
-            let (calibrating, calib_done) = self.telemetry.take_calibration_frame();
-            if calibrating {
-                let rms = crate::math::frame_rms(samples);
-                // The estimator's own verdict, before the gates.
-                let raw: Option<&F0Track> = first(wires);
-                let yin_f0 = raw.filter(|t| t.voiced).map(|t| t.hz);
-                self.calibrator.push(rms, yin_f0);
-                if calib_done {
-                    match self.calibrator.finish() {
-                        Ok(cal) => {
-                            crate::room::set_calibration(cal.ambient_rms, cal.interferer);
-                            self.telemetry.set_calibration_result(Some((
-                                cal.ambient_rms,
-                                cal.interferer.map(|i| (i.f0_hz, i.rms)),
-                            )));
-                            crate::diagnostics::runtime::record_calibration(
-                                crate::diagnostics::room_calibration_report(
-                                    cal.ambient_rms,
-                                    cal.interferer.map(|i| i.f0_hz),
-                                ),
-                            );
-                            log::info!(
-                                "room calibrated: ambient rms {:.5}, interferer {:?}",
-                                cal.ambient_rms,
-                                cal.interferer
-                            );
-                        }
-                        Err(e) => {
-                            log::warn!("room calibration failed: {e:?}");
-                            self.telemetry.set_calibration_result(None);
-                        }
-                    }
-                    self.calibrator = crate::math::RoomCalibrator::new();
-                }
-            }
-        }
-
-        if let Some(profile) = profile_from_wires(wires) {
-            self.profile_tx.write(profile);
-            self.ui_profile_tx.write(profile);
-        }
-        if let Some(spectrum) = latest::<Spectrum>(wires) {
-            self.spectrum_tx.write(spectrum.magnitudes_db.clone());
-        }
-        self.scope_tx.write(samples.to_vec());
-
-        // Heartbeat for the UI's staleness watch.
-        self.telemetry.note_analysis_frame();
-    }
 }

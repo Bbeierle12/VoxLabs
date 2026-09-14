@@ -3883,7 +3883,6 @@ dependencies = [
  "jni",
  "log",
  "ndk-context",
- "pollster",
  "rtrb",
  "rustfft",
  "serde",
@@ -3894,7 +3893,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "wgpu",
  "winit",
 ]
 

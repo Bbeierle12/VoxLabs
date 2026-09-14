@@ -590,3 +590,67 @@ pub fn set_debug_overlay_enabled(enabled: bool) {
         ),
     );
 }
+
+/// Phase 5a (D5): records every compiled-in mode's fixture run into the
+/// diagnostics directory as `fixture-<mode>.taps.jsonl` +
+/// `.provenance.json`. Returns one line per mode.
+pub fn record_fixture_taps() -> Result<Vec<String>, String> {
+    let dir = with_state(|s| s.store.directory().to_path_buf())
+        .ok_or("Diagnostics are not initialized")?;
+    let mut lines = Vec::new();
+    for (mode, _) in crate::pipeline::PipelineDefinition::MODES {
+        let started = std::time::Instant::now();
+        let (taps, _, hops) = crate::pipeline::record::record_fixture_taps(mode, &dir)?;
+        let bytes = std::fs::metadata(&taps).map(|m| m.len()).unwrap_or(0);
+        let line = format!(
+            "{mode}: {hops} hops · {} KB · {} ms",
+            bytes / 1024,
+            started.elapsed().as_millis()
+        );
+        let mut evidence = std::collections::BTreeMap::new();
+        evidence.insert("mode".to_string(), mode.to_string());
+        evidence.insert("hops".to_string(), hops.to_string());
+        log(
+            "validation",
+            "fixture_taps_recorded",
+            &line,
+            evidence,
+            super::core::Severity::Info,
+        );
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// Copies the recorded fixture files to Downloads/VoxLabs (one export per
+/// file, through the same MediaStore path as the bundle).
+pub fn export_fixture_taps() -> Result<Vec<String>, String> {
+    let dir = with_state(|s| s.store.directory().to_path_buf())
+        .ok_or("Diagnostics are not initialized")?;
+    let mut names = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|e| e.to_string())?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("fixture-"))
+        })
+        .collect();
+    entries.sort();
+    if entries.is_empty() {
+        return Err("No fixture taps recorded yet".into());
+    }
+    for path in entries {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("fixture")
+            .to_string();
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        super::export::write_download(&name, &bytes)?;
+        names.push(name);
+    }
+    Ok(names)
+}
