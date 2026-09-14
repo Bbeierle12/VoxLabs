@@ -78,6 +78,20 @@ pub fn sha256_hex(data: &[u8]) -> String {
     sha256(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// CRC-32 (IEEE 802.3, the zlib/`java.util.zip.CRC32` polynomial) of
+/// `data`, for the Vocal Tract Lab lumen asset's payload checksum.
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (!(crc & 1)).wrapping_add(1);
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +115,12 @@ mod tests {
             sha256_hex(&[0x61u8; 56]),
             "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a"
         );
+    }
+
+    #[test]
+    fn crc32_matches_the_check_value() {
+        // The standard check value for CRC-32/ISO-HDLC.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
     }
 }

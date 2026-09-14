@@ -6,7 +6,7 @@
 use super::*;
 use crate::pipeline::runner::{RunnerState, ShellHandle};
 use crate::pipeline::tap::TapMsg;
-use crate::pipeline::types::Wire;
+use crate::pipeline::types::{TractModelId, Wire};
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 /// What the app holds once a runner is attached.
@@ -293,22 +293,46 @@ fn describe_tap(w: &Wire) -> String {
             t.measured_f0,
             if t.fresh { "fresh" } else { "held" }
         ),
-        Wire::TractParams(p) => format!(
-            "q1 {:+.2} · q2 {:+.2} · {} basis · VTL {} · {}",
-            p.q1,
-            p.q2,
-            p.basis.name(),
-            p.vtl_est_cm
-                .map(|l| format!("{l:.1} cm"))
-                .unwrap_or_else(|| "—".into()),
-            if p.valid { "VALID" } else { "held" }
-        ),
+        Wire::TractParams(p) => match p.model {
+            TractModelId::StoryTwoMode => format!(
+                "q1 {:+.2} · q2 {:+.2} · {} basis · VTL {} · {}",
+                p.q1,
+                p.q2,
+                p.basis.name(),
+                p.vtl_est_cm
+                    .map(|l| format!("{l:.1} cm"))
+                    .unwrap_or_else(|| "—".into()),
+                if p.valid { "VALID" } else { "held" }
+            ),
+            TractModelId::MriPca4 => format!(
+                "c {:+.2} {:+.2} {:+.2} {:+.2} SD · conf {:.2} · rel σ {:.2} · {}",
+                p.modes[0],
+                p.modes[1],
+                p.modes[2],
+                p.modes[3],
+                p.confidence.unwrap_or(0.0),
+                p.uncertainty.unwrap_or(0.0),
+                if p.abstained {
+                    format!("ABSTAINED ({})", p.reason.as_str())
+                } else {
+                    "audio evidence".into()
+                }
+            ),
+        },
         Wire::AreaFunction(a) => format!(
             "{} sections · {:.2} cm each · {} basis · {}",
             a.sections,
             a.section_len_cm,
             a.basis.name(),
             if a.live { "LIVE" } else { "HELD" }
+        ),
+        Wire::TractGeometry(g) => format!(
+            "{} vertices · {} triangles · rel σ {:.2} · {} · {}",
+            g.vertex_count,
+            g.triangles.len() / 3,
+            g.relative_area_std,
+            g.model_id,
+            if g.live { "LIVE" } else { "HELD" }
         ),
     }
 }

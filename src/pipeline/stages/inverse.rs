@@ -14,7 +14,9 @@ use crate::math::{self, FormantGrade};
 use crate::tract::{self, ADULT_FEMALE, ADULT_MALE, TractBasis, TractGrid};
 
 use super::super::stage::{Stage, StageError, StreamFormat};
-use super::super::types::{BasisId, F0Track, FormantTrack, TractParams};
+use super::super::types::{
+    AbstainReason, BasisId, F0Track, FormantTrack, TractModelId, TractParams,
+};
 use super::require_default;
 
 static GRID_MALE: OnceLock<TractGrid> = OnceLock::new();
@@ -81,6 +83,11 @@ impl Stage for GridInverseStage {
     ) -> Result<(), StageError> {
         out.valid = false;
         out.uncertainty = None;
+        out.model = TractModelId::StoryTwoMode;
+        out.n_modes = 2;
+        out.confidence = None;
+        out.abstained = false;
+        out.reason = AbstainReason::None;
         let grade = math::formant_grade(&ft.formants, ft.measured_f0);
         if !f0.voiced || grade == FormantGrade::Reject {
             out.vtl_est_cm = self.vtl_est_cm;
@@ -104,6 +111,7 @@ impl Stage for GridInverseStage {
         if let Some((q1, q2)) = grid.invert(f1, f2) {
             out.q1 = q1;
             out.q2 = q2;
+            out.modes = [q1, q2, 0.0, 0.0];
             out.valid = true;
         }
         Ok(())
@@ -139,6 +147,7 @@ mod tests {
             measured_f0,
             confidence: 1.0,
             fresh: true,
+            f4: None,
         }
     }
 

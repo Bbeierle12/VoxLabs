@@ -3904,6 +3904,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hound",
+ "serde",
+ "serde_json",
  "vox-core",
  "vox-validation",
 ]

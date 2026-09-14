@@ -227,3 +227,55 @@ fn fingerprint_mode_reproduces_the_analyzers_enrollment_features() {
     let similarity = math::voiceprint_similarity(&a, &b).expect("scorable");
     assert!(similarity >= 99.0, "match {similarity}");
 }
+
+/// Phase 3: the atlas mode (posterior inverse, MRI-reduced area function,
+/// lumen mesh) records and round-trips within the bands, geometry
+/// included, and the Evidence output carries the atlas's own statements.
+#[test]
+fn atlas_mode_round_trips_with_geometry_and_reports_the_atlas_statements() {
+    let dir = temp_dir("atlas");
+    let wav = dir.join("vowel_a_130.wav");
+    write_wav(&wav, &vowel(130.0, 2.0));
+    let mode = PipelineDefinition::by_name_or_path("atlas").unwrap();
+    let out = dir.join("results");
+    let (hops, provenance) = record_run(&mode, &wav, &out, SR as f32).unwrap();
+    assert!(hops > 60, "{hops} hops");
+    let report = validate_and_write(&provenance).unwrap();
+    assert!(
+        report.pass,
+        "round-trip outside bands: {:#?}",
+        report.compare.per_type
+    );
+    for t in ["TractParams", "AreaFunction", "TractGeometry"] {
+        assert!(report.compare.per_type.contains_key(t), "{t} compared");
+    }
+    let record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&provenance).unwrap()).unwrap();
+    let files = record["data_files"].as_array().unwrap();
+    assert_eq!(files[0]["model_id"], "vt3d-frozen-mri-pca-v0.7.0");
+    assert_eq!(files[0]["scientific_release_ready"], false);
+    let evidence: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("vowel_a_130.evidence.json")).unwrap(),
+    )
+    .unwrap();
+    let gates = evidence["gates"].as_array().unwrap();
+    let surface = gates
+        .iter()
+        .find(|g| g["name"] == "Atlas held-out surface error")
+        .unwrap();
+    assert_eq!(surface["met"], false);
+    assert!(surface["status"].as_str().unwrap().contains("4.781"));
+    // The posterior produced evidence frames somewhere in the vowel.
+    let taps = vox_validation::read_taps(&out.join("vowel_a_130.taps.jsonl")).unwrap();
+    let evidence_hops = taps
+        .iter()
+        .filter(|l| {
+            matches!(
+                l.taps.get("inverse"),
+                Some(vox_core::pipeline::types::Wire::TractParams(p)) if !p.abstained
+            )
+        })
+        .count();
+    assert!(evidence_hops > 0, "the posterior abstained on every hop");
+    let _ = std::fs::remove_dir_all(dir);
+}

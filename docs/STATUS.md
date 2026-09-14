@@ -253,3 +253,24 @@ console and the bundle. `docs/phase2-gate.md` has the table. Deferred:
 detecting voice before this work; the console build (46fd953) is the
 diagnosis tool and no screenshot has arrived yet. Every later APK carries
 the console.
+
+## Addendum — Phase 3 on branch `claude/epic-lamport-euju2k` (14 September 2026, later again)
+
+- The Vocal Tract Lab backends are in: `posterior_pca4`, `mri_pca4`,
+  `lumen_v2` (mesh), the `atlas` mode, the data files with provenance,
+  the articulator readout, `FormantTrack.f4`. `docs/phase3-gate.md` has
+  the numbers. Experiment 3: Story grid passes; the posterior misses the
+  accuracy band and the reason is written down (a local linear map that
+  needs F4 and VoxLabs' forward model); D10's parity clause is not met
+  because the phone comparison has not been run.
+- On the Pixel: Engineering Console → Run self-test now has eleven
+  `contract.*` lines, four of them Phase 3 (`atlas_data_files_verify`,
+  `posterior_matches_reference`, `lumen_mesh_morphs`,
+  `atlas_mode_runs_a_vowel`). The bundle's `shared_model` block and the
+  Evidence section carry the atlas's digests and its own
+  `scientific_release_ready: false`, zero acceptances, 4.781 mm vs 4 mm.
+- The live screen still runs `live_model` (Story). Phase 5a decides how
+  the phone selects the `atlas` mode.
+- Still needed from the phone: a screenshot or bundle for the live-audio
+  fault ("No voice signal captured"), and the self-test lines.
+

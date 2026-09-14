@@ -35,6 +35,11 @@ pub struct ProvenanceRecord {
     pub params_sha256: String,
     pub build: BuildProvenance,
     pub input: InputProvenance,
+    /// The compiled-in data files (the Vocal Tract Lab atlas) with their
+    /// digests and their own release-readiness statements, whatever mode
+    /// ran — provenance lists what the binary carries.
+    #[serde(default)]
+    pub data_files: Vec<crate::atlas::DataFileProvenance>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -193,6 +198,7 @@ impl ProvenanceRecord {
                 pipeline_toml_sha256: sha256_hex(PipelineParams::TOML.as_bytes()),
             },
             input,
+            data_files: crate::atlas::data_provenance(),
         }
     }
 

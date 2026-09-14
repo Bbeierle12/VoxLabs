@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Resonance + Anatomy · Vocal Tract Lab</title><link rel="stylesheet" href="bench.css">
+<script src="lab-view.js" defer></script><script src="reference.js" defer></script><script src="bench.js" defer></script>
+</head><body><main>
+<header><div class="eyebrow">VOCAL TRACT LAB <span>ONE SHARED MRI MODEL / 0.10.0</span></div><h1>Resonance + anatomy<span class="dot">.</span></h1><p>Explore vowels, harmonics, and the airway together.</p></header>
+<nav aria-label="Lab views"><button id="tab-bench" aria-current="page" data-tab="bench">Lab</button><button id="tab-reference" data-tab="reference">MRI labels</button><button id="tab-evidence" data-tab="evidence">Evidence</button></nav>
+<section id="bench" aria-labelledby="tab-bench">
+<article class="instrument">
+<div class="section-heading"><h2>Vowels & harmonics</h2><button id="play" aria-pressed="false">Play tone</button></div>
+<div id="vowels" class="vowels" aria-label="Vowel formant targets"></div>
+<div class="control"><label for="f0">Fundamental F0 <output id="f0-value" for="f0">165 Hz</output></label><input id="f0" type="range" min="55" max="800" value="165" step="1"></div>
+<div class="toolbar"><button id="f0-down" aria-label="Lower pitch by one hertz">−1 Hz</button><input id="f0-number" type="number" min="55" max="800" step="1" value="165" aria-label="Exact fundamental frequency in hertz"><button id="f0-up" aria-label="Raise pitch by one hertz">+1 Hz</button></div>
+<div class="control"><label for="master">Output level <output id="master-value" for="master">25%</output></label><input id="master" type="range" min="0" max="92" value="25" step="1"></div>
+<p id="audio-status" class="status" role="status">Loading MRI model. Start at low phone volume.</p><p id="work-status" class="muted" role="status">Loading…</p>
+</article>
+<article><div class="section-heading"><h2>Listen with the same model</h2><button id="listen" aria-pressed="false">Listen</button></div>
+<p class="muted">Microphone estimates update this airway. Sound cannot uniquely recover your anatomy; uncertain estimates are marked and return gradually toward the mean.</p>
+<div class="toolbar"><button id="demo">Replay model</button><button id="noise">Learn background</button><button id="calibrate">Start / cancel calibration</button></div>
+<p id="live-readout" class="readout" role="status">Microphone inactive.</p><p id="calibration-status" class="muted" role="status">Calibration saves derived summaries only.</p></article>
+<div class="notice"><span class="badge measured">MRI AIRWAY</span><p>Measured source geometry, reduced to a deformable airway surface. Five subjects, four shape coordinates. No whole-organ or muscle model.</p></div>
+<article class="viewer"><div class="viewer-title"><span>01 / SHARED AIRWAY</span><span id="view-label">Oblique cutaway</span></div>
+<canvas id="tract" aria-label="Rotatable MRI-derived 3D airway surface. Use view, rotation, and zoom buttons below." role="img"></canvas>
+<div class="canvas-help">Drag to rotate · grid spacing 10 mm</div>
+<div class="toolbar"><button id="cutaway" aria-pressed="true">Cutaway on</button><button id="wire" aria-pressed="false">Wireframe off</button><button id="sagittal">Side view</button><button id="oblique">Oblique view</button><button id="rotate-left" aria-label="Rotate model left">↶</button><button id="rotate-right" aria-label="Rotate model right">↷</button><button id="zoom-in" aria-label="Zoom in">Zoom +</button><button id="zoom-out" aria-label="Zoom out">Zoom −</button></div>
+<p id="model-state" class="readout viewer-note"></p><p id="debug-overlay" class="readout viewer-note" hidden></p></article>
+<div class="stats"><div><span>Tract path</span><strong id="length">—</strong><small>mm · fixed centerline</small></div><div><span>Minimum section</span><strong id="area">—</strong><small>cm² · model area</small></div><div><span>Predicted R1</span><strong id="r1">—</strong><small>Hz · tube resonance</small></div></div>
+<article><div class="section-heading"><h2>Formant tuning</h2><button id="reset">Reset lab</button></div>
+<p class="muted">Choose vowel targets or adjust F1–F3. The model fits supported shapes and shows achieved resonances. Some targets may not be reached by this bounded fit.</p>
+<div id="formant-controls"></div><p id="formant-comparison" class="readout" role="status"></p>
+<details open><summary>Shape the shared MRI airway</summary><p class="muted">These four coordinates combine variation between five subjects and their recorded vowels. They do not independently control tongue, jaw, or lips. Bounds are engineering limits in standard-deviation units.</p><div id="controls"></div></details></article>
+<article><div class="section-heading"><h2>Waveform & standing modes</h2><button id="wave-mode">Show standing modes</button></div>
+<canvas id="wave" class="chart" role="img" aria-label="Mathematical sum of the harmonic amplitudes sent to the synthesizer"></canvas><p id="wave-caption" class="muted">Ideal additive output, displayed in slow motion. Native audio smooths changes.</p>
+<canvas id="harmonics" class="chart" role="img" aria-label="Sixteen output harmonic amplitudes after the shared tract filter"></canvas>
+<details open><summary>16-partial source mixer</summary><div class="section-heading"><p class="muted">Independent source weights before the same tract filter. Output is normalized for headroom.</p><button id="retune">Reset source</button></div><div id="mixer" class="mixer"></div></details></article>
+<article><div class="section-heading"><h2>Geometry → acoustics</h2><span class="badge">1D MODEL</span></div>
+<p class="muted">The displayed mesh sections and their actual center-to-center distances feed this transfer-line solver and the synthesizer.</p>
+<h3>Area along the airway</h3><canvas id="area-chart" class="chart" role="img" aria-label="Airway area in square centimeters from glottal inlet to lips"></canvas>
+<h3>Predicted resonance response</h3><canvas id="response-chart" class="chart" role="img" aria-label="Normalized predicted transfer response from 40 to 5000 hertz"></canvas>
+<p id="resonances" class="readout"></p><p class="muted">Linear, lossy tube approximation. Response sampled every 10 Hz; peaks interpolated locally. No nasal branching, tissue mechanics, or source–filter coupling.</p></article>
+<details><summary>What anatomy is represented?</summary><p>The airway lumen comes from the frozen MRI atlas. Its 32 cross-sections change area around a fixed centerline using four bounded log-area modes. The glottis is an inlet boundary, not a vocal-fold simulation. Tongue, palate, lips, teeth, velum, hyoid, and individual muscles have no independently segmented 3D tissues in this model.</p><p>All interactive modes use this same airway and acoustic solver. F0 sets harmonic spacing; it cannot determine a unique tongue pose. The standing-mode display illustrates harmonics on a normalized interval; it is not a pressure field computed inside the irregular airway.</p></details>
+<details><summary>Numerical state / reproducibility</summary><p id="model-id"></p><p>One native state contains shape coordinates, pitch, mixer, geometry, and response. Settings save locally. Playback and microphone capture require an explicit tap after returning to the app.</p><textarea id="state" readonly aria-label="Current reproducible model state" spellcheck="false"></textarea></details>
+</section>
+<section id="reference" aria-labelledby="tab-reference" hidden>
+<div class="notice"><span class="badge measured">SOURCE LABELS</span><p>Independent 2D MRI reference data. These labels do not drive or supply tissues to the 3D model.</p></div>
+<article><div class="section-heading"><h2>Midsagittal label atlas</h2><span class="badge">392 FRAMES</span></div>
+<p class="muted">Five anonymous speakers counting in English while supine. Speech, not singing. Colors show segmentation classes, not MRI intensity.</p>
+<label class="select-label" for="subject">Speaker <select id="subject"></select></label><canvas id="mri" width="256" height="256" role="img" aria-label="Source MRI segmentation mask in its original pixel orientation"></canvas>
+<div class="control"><label for="frame">Source frame <output id="frame-label" for="frame"></output></label><input id="frame" type="range" min="1" max="105" value="1" step="1"></div>
+<div class="toolbar"><button id="prev-frame">Previous</button><button id="next-frame">Next</button></div><div id="mri-legend" class="mri-legend"></div>
+<p class="muted">Original 256 × 256 mask grid. Pixel coordinates only: the exported DICOM lacks a verified physical affine. Acquisition: 2.50 × 2.45 mm in-plane; zero-padding produced a 1.17 × 1.17 mm reconstructed grid, not extra measured resolution. Slice thickness: 10 mm.</p></article>
+<article><h2>Read the labels carefully</h2><p><b>Head</b> combines upper lip, hard palate, skull/brain, posterior pharyngeal wall and neck. <b>Jaw</b> combines lower lip and adjacent soft tissues, not isolated bone. <b>Tongue</b> includes epiglottis and hyoid. <b>Tooth space</b> is not teeth.</p><p class="muted">The source provides expert labels; our project has not independently accepted these as a 3D anatomical baseline.</p></article>
+<article><h2>Provenance & reuse</h2><p id="attribution"></p><p>Ruthven et al. · Zenodo 10046815 · CC BY 4.0<br><span class="url">https://zenodo.org/records/10046815</span><br><span class="url">https://creativecommons.org/licenses/by/4.0/</span></p><p class="muted">Lossless run-length encoding and display coloring. Raw MRI and personal DICOM fields are not bundled.</p><details><summary>Source archive SHA-256</summary><code id="source-hash"></code></details></article>
+</section>
+<section id="evidence" aria-labelledby="tab-evidence" hidden>
+<div class="notice"><span class="badge">NOT VALIDATED</span><p>Software consistency does not establish anatomical or clinical accuracy.</p></div>
+<article><h2>Baseline acceptance gates</h2><dl class="gates">
+<div><dt>Same model in manual, live, rendering, and audio</dt><dd>Implemented · engineering</dd></div>
+<div><dt>Frozen metric MRI airway</dt><dd>Five subjects · four coordinates</dd></div>
+<div><dt>Held-out surface error</dt><dd>Median 4.781 mm · target ≤4 mm · not met</dd></div>
+<div><dt>Metric, multi-structure 3D MRI</dt><dd>Required · not admitted</dd></div>
+<div><dt>Repeated speaker × articulation data</dt><dd>Required · unresolved</dd></div>
+<div><dt>Independent anatomical acceptance</dt><dd>Required · zero recorded</dd></div>
+<div><dt>Paired acoustic validation</dt><dd>Required · not established</dd></div>
+<div><dt>Scientific release readiness</dt><dd>False</dd></div></dl></article>
+<article><h2>How much data do we have?</h2><p>Enough for this constrained research prototype; insufficient for a validated singing anatomy model. The five 3D subjects each have different vowel conditions, so identity and articulation are confounded. The separate 392-frame MRI label viewer adds 2D reference evidence, not additional 3D subjects.</p><p class="muted">The next anatomical improvement needs licensed metric volumes with repeated vowels per person, matching tongue/lip/jaw/velum labels, paired acoustics, and independent expert review. Voice-part names and acoustic recordings alone cannot supply missing tissue geometry.</p></article>
+<article><h2>One model throughout</h2><p>Vowel targets fit the same bounded MRI model used by live analysis. The airway sections drive response, sound, and waveform. Targets and achieved resonances appear separately; a poor fit is never silently relabeled as the requested vowel.</p><p class="muted">The frozen atlas and its failed acceptance gates remain unchanged. No new subject or expert approval was added in this update.</p></article>
+</section><footer>Offline research prototype · No raw microphone recordings stored · No automatic audio restart.</footer>
+</main></body></html>

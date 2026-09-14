@@ -12,7 +12,8 @@ use crate::config::ToleranceConfig;
 use crate::types::VoiceMetrics;
 
 use super::types::{
-    AreaFunction, F0Track, FormantTrack, HarmonicSeries, Spectrum, TractParams, Wire, WireType,
+    AreaFunction, F0Track, FormantTrack, HarmonicSeries, Spectrum, TractGeometry, TractParams,
+    Wire, WireType,
 };
 
 /// The worst disagreement seen for one wire type, and whether it stayed
@@ -78,6 +79,7 @@ impl Comparer {
                 (Wire::FormantTrack(p), Wire::FormantTrack(q)) => self.formants(p, q, &mut worst),
                 (Wire::TractParams(p), Wire::TractParams(q)) => self.tract(p, q, &mut worst),
                 (Wire::AreaFunction(p), Wire::AreaFunction(q)) => self.area(p, q, &mut worst),
+                (Wire::TractGeometry(p), Wire::TractGeometry(q)) => self.geometry(p, q, &mut worst),
                 _ => {
                     self.report.mismatched_types += 1;
                     continue;
@@ -182,6 +184,18 @@ impl Comparer {
 
     fn formants(&self, p: &FormantTrack, q: &FormantTrack, w: &mut Excess) {
         w.flag("fresh", p.fresh != q.fresh);
+        w.opt(
+            "F4",
+            p.f4.map(|f| f.frequency),
+            q.f4.map(|f| f.frequency),
+            self.tol.formant_hz,
+        );
+        w.opt(
+            "B4",
+            p.f4.map(|f| f.bandwidth),
+            q.f4.map(|f| f.bandwidth),
+            self.tol.bandwidth_hz,
+        );
         w.abs("measured_f0", p.measured_f0, q.measured_f0, self.tol.f0_hz);
         for (i, (a, b)) in p.formants.iter().zip(&q.formants).enumerate() {
             w.abs(
@@ -202,14 +216,68 @@ impl Comparer {
     fn tract(&self, p: &TractParams, q: &TractParams, w: &mut Excess) {
         w.flag("valid", p.valid != q.valid);
         w.flag("basis", p.basis != q.basis);
+        w.flag("model", p.model != q.model);
+        w.flag("abstained", p.abstained != q.abstained);
+        w.flag("reason", p.reason != q.reason);
         w.abs("q1", p.q1, q.q1, self.tol.tract_q);
         w.abs("q2", p.q2, q.q2, self.tol.tract_q);
+        for (i, (a, b)) in p.modes.iter().zip(&q.modes).enumerate() {
+            w.abs(&format!("mode[{i}]"), *a, *b, self.tol.mode_sd);
+        }
+        w.opt(
+            "confidence",
+            p.confidence,
+            q.confidence,
+            self.tol.confidence,
+        );
+        w.opt(
+            "uncertainty",
+            p.uncertainty,
+            q.uncertainty,
+            self.tol.confidence,
+        );
         w.opt("vtl_est_cm", p.vtl_est_cm, q.vtl_est_cm, self.tol.vtl_cm);
+    }
+
+    fn geometry(&self, p: &TractGeometry, q: &TractGeometry, w: &mut Excess) {
+        w.flag("live", p.live != q.live);
+        w.flag("model_id", p.model_id != q.model_id);
+        w.flag("topology", p.triangles != q.triangles);
+        w.flag("vertex count", p.vertices_mm.len() != q.vertices_mm.len());
+        w.abs(
+            "relative_area_std",
+            p.relative_area_std,
+            q.relative_area_std,
+            self.tol.confidence,
+        );
+        for (i, (a, b)) in p.vertices_mm.iter().zip(&q.vertices_mm).enumerate() {
+            w.abs(
+                &format!("vertex[{}].{}", i / 3, i % 3),
+                *a,
+                *b,
+                self.tol.geometry_mm,
+            );
+        }
+        for (i, (a, b)) in p
+            .uncertainty_vertices_mm
+            .iter()
+            .zip(&q.uncertainty_vertices_mm)
+            .enumerate()
+        {
+            w.abs(
+                &format!("uncertainty_vertex[{}].{}", i / 3, i % 3),
+                *a,
+                *b,
+                self.tol.geometry_mm,
+            );
+        }
     }
 
     fn area(&self, p: &AreaFunction, q: &AreaFunction, w: &mut Excess) {
         w.flag("live", p.live != q.live);
         w.flag("basis", p.basis != q.basis);
+        w.flag("model", p.model != q.model);
+        w.flag("sections", p.sections != q.sections);
         w.abs("vtl_cm", p.vtl_cm, q.vtl_cm, self.tol.vtl_cm);
         for (i, (a, b)) in p.areas_cm2.iter().zip(&q.areas_cm2).enumerate() {
             w.abs(&format!("area[{i}]"), *a, *b, self.tol.area_cm2);

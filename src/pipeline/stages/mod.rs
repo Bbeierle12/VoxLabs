@@ -2,7 +2,9 @@
 //! function — YIN, the SNR/hum voicing gates, LPC/Levinson + root-solve,
 //! Goertzel harmonics, the voice-quality metrics, the f0 contour, the
 //! (q1, q2) grid inverse, the Story area function, the STFT — with that
-//! function's tests as its contract.
+//! function's tests as its contract. Phase 3 adds the Vocal Tract Lab
+//! ports (`posterior`, `mri_tract`, `mesh`) around `crate::atlas`, whose
+//! contracts are the decompiled app's formulas.
 //! Internals are untouched (§3: wrap, don't rewrite).
 //!
 //! One consequence, stated rather than hidden: the wrapped functions read
@@ -16,7 +18,10 @@ pub mod contour;
 pub mod harmonics;
 pub mod inverse;
 pub mod lpc;
+pub mod mesh;
 pub mod metrics;
+pub mod mri_tract;
+pub mod posterior;
 pub mod stft;
 pub mod tract;
 pub mod voicing;
@@ -35,6 +40,9 @@ pub fn registry() -> &'static [StageDescriptor] {
         describe::<contour::ContourStage>(),
         describe::<inverse::GridInverseStage>(),
         describe::<tract::StoryTractStage>(),
+        describe::<posterior::PosteriorInverseStage>(),
+        describe::<mri_tract::MriTractStage>(),
+        describe::<mesh::LumenMeshStage>(),
         describe::<stft::StftStage>(),
     ];
     REGISTRY

@@ -103,3 +103,49 @@ mirrored back to the plan.
   `calibrate`), and a provenance record per run feeds `vox-validation`,
   whose Evidence output follows the Vocal Tract Lab Evidence tab. The rows
   above keep the plan's wording; see `docs/phase2-gate.md`.
+- **Phase 3 status** (2026-09-14): D10's two backends exist —
+  `inverse/posterior_pca4`, `tract/mri_pca4` and the `mesh/lumen_v2`
+  stage producing `TractGeometry`, ported formula-for-formula from the
+  decompiled Vocal Tract Lab 0.10.0 APK with the app's formulas as their
+  contract tests (`docs/phase3-gate.md`). The data files ship in
+  `assets/vocal_tract_lab/` with digests checked at load and their own
+  release statements carried into provenance and the Evidence output.
+  D10's second clause — "Kotlin DSP retires after tolerance-band parity" —
+  is **not met**: parity is bundle-against-bundle on the Pixel and has not
+  been run. The Kotlin DSP is not marked retired.
+- **Experiment 3 verdict and fallback** (2026-09-14): `grid_story` meets
+  the bands (p95 1.9 % / 12 Hz, 3 µs); `posterior_pca4` meets latency
+  (0.2 µs) and misses accuracy (p95 42 % over ±2 SD, 9.6 % within
+  ±0.5 SD, after F4 was fed in) under VoxLabs' forward model, whose
+  Jacobian is within 19 % of the app's own. The map is the exact inverse
+  of the app's 4 × 4 Jacobian and is a local linearization by the
+  app's own description. Decision, per the plan's exit clause: the
+  posterior is kept as the **parity target** (it is the app's
+  algorithm) and is not offered as an accuracy-grade inverse;
+  `live_model` keeps the Story grid; the plan's fallback (a distilled
+  offline-trained model at the same latency bar, report C3) is the path
+  if an accuracy-grade atlas inverse is wanted, and is not started until
+  the phone parity comparison says whether the port matches the app.
+- **F4** (2026-09-14): `FormantTrack` gained `f4: Option<Formant>` (the
+  fourth in-band LPC pole, from the same candidate list F1–F3 come from)
+  because the app's map needs four formants (`docs/phase3-gate.md`, "Why
+  F4 matters"). `VocalProfile`, the synthesizer and every three-formant
+  path are unchanged.
+- **O4** (2026-09-14): resolved as far as the decompile allows. Ported:
+  `ReducedModelAsset`, `TemporalAtlasFilter`, the evidence score from
+  `FrameAnalyzer`, `TractLumenAsset`, `TractMeshCpu`,
+  `ArticulatorPosterior`. Still wanted from the source: the Kotlin
+  originals (comments, tests), the replay fixtures and per-frame outputs
+  for the fine-grained parity gate, `SharedTractModel.fit`/`TubeGrid`
+  semantics. The decompile is checked in under
+  `research/vocal-tract-lab-0.10.0/` and labelled as such.
+- **O1** (2026-09-14, from the files in hand — the `Vocal-Tract-Labs`
+  corpus registry was not available to read): `reduced_model.json`'s
+  atlas block says the model is the app's own frozen (0.6.3) metric-MRI
+  engineering mean over five subject means; the app's MRI reference
+  (`reference.js`) cites Ruthven, Peplinski and Miquel (2023), Zenodo
+  10046815, CC BY 4.0, 2-D real-time MRI labels. No VocalTractLab
+  (Birkholz, GPL) `.speaker` data is involved in Phase 3's files, so
+  O1's GPL question does not attach to them. O1 stays open for Phase 6
+  (the `vox-tract-vtl` backend), where it does attach.
+

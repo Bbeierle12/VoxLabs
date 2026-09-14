@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::core::SelfTestResult;
+use crate::config::ValidationConfig;
 
 pub const BANNER: &str = "NOT VALIDATED";
 pub const BANNER_TEXT: &str =
@@ -181,10 +182,62 @@ pub fn assemble(inputs: &EvidenceInputs<'_>) -> Evidence {
         "Not observed anatomy · a bounded model fit".into(),
         Some(false),
     ));
+
+    // The atlas's own words, from the compiled-in data files (Phase 3).
+    let files = crate::atlas::data_provenance();
+    let model = files.first();
+    let v = ValidationConfig::DEFAULT;
+    gates.push(match model {
+        Some(m) if m.model_id.is_empty() => gate(
+            "Atlas data files load with their recorded digests",
+            m.note.clone(),
+            Some(false),
+        ),
+        Some(m) => gate(
+            "Atlas data files load with their recorded digests",
+            format!(
+                "{} · {} · lumen {}",
+                m.model_id,
+                &m.sha256[..12],
+                files.get(1).map(|l| &l.sha256[..12]).unwrap_or("?")
+            ),
+            Some(true),
+        ),
+        None => gate(
+            "Atlas data files load with their recorded digests",
+            "None compiled in".into(),
+            Some(false),
+        ),
+    });
+    gates.push(gate(
+        "Atlas held-out surface error",
+        format!(
+            "median {:.3} mm reported · target ≤ {:.1} mm · {}",
+            v.surface_error_reported_mm,
+            v.surface_error_target_mm,
+            if v.surface_error_reported_mm <= v.surface_error_target_mm {
+                "met"
+            } else {
+                "not met"
+            }
+        ),
+        Some(v.surface_error_reported_mm <= v.surface_error_target_mm),
+    ));
+    gates.push(gate(
+        "Independent expert acceptances of the atlas",
+        format!(
+            "{}",
+            model.map(|m| m.independent_expert_acceptances).unwrap_or(0)
+        ),
+        Some(model.is_some_and(|m| m.independent_expert_acceptances > 0)),
+    ));
     gates.push(gate(
         "Scientific release readiness",
-        "False".into(),
-        Some(false),
+        format!(
+            "{} (the atlas's own statement)",
+            model.map(|m| m.scientific_release_ready).unwrap_or(false)
+        ),
+        Some(model.is_some_and(|m| m.scientific_release_ready)),
     ));
 
     Evidence {
@@ -232,10 +285,24 @@ mod tests {
         assert_eq!(e.gates[1].met, Some(false));
         assert_eq!(e.gates[2].met, Some(false));
         assert_eq!(e.gates[3].met, None);
+        let release = e
+            .gates
+            .iter()
+            .find(|g| g.name == "Scientific release readiness")
+            .unwrap();
+        assert_eq!(release.met, Some(false));
+        assert!(release.status.starts_with("false"));
+        let surface = e
+            .gates
+            .iter()
+            .find(|g| g.name == "Atlas held-out surface error")
+            .unwrap();
+        assert_eq!(surface.met, Some(false));
+        assert!(surface.status.contains("4.781") && surface.status.ends_with("not met"));
         assert!(
             e.gates
                 .iter()
-                .any(|g| g.name == "Scientific release readiness")
+                .any(|g| g.name.starts_with("Atlas data files") && g.met == Some(true))
         );
     }
 }

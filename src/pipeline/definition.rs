@@ -110,12 +110,16 @@ impl PipelineDefinition {
     pub const FINGERPRINT: &'static str = include_str!("../../pipelines/fingerprint.toml");
     /// The Calibrate mode (the room pass), compiled in.
     pub const CALIBRATE: &'static str = include_str!("../../pipelines/calibrate.toml");
+    /// Phase 3: the Vocal Tract Lab chain (posterior inverse, MRI-reduced
+    /// area function, lumen mesh).
+    pub const ATLAS: &'static str = include_str!("../../pipelines/atlas.toml");
 
     /// Every compiled-in mode, by name.
     pub const MODES: &'static [(&'static str, &'static str)] = &[
         ("live_model", Self::LIVE_MODEL),
         ("fingerprint", Self::FINGERPRINT),
         ("calibrate", Self::CALIBRATE),
+        ("atlas", Self::ATLAS),
     ];
 
     /// A compiled-in mode by name, or a `.toml` path.

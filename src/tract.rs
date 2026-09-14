@@ -81,8 +81,24 @@ pub fn area_function(basis: &TractBasis, q1: f32, q2: f32) -> [f32; N_SECTIONS] 
 /// far less than the measurement error of the formants being inverted.
 /// Returns `None` if fewer than three zeros lie in the sweep band.
 pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; N_RESONANCES]> {
-    if !(vtl_cm.is_finite() && vtl_cm > 0.0) {
-        return None;
+    let mut roots = [0.0f32; N_RESONANCES];
+    let found = resonances_up_to(areas, vtl_cm, RES_SWEEP_HI_HZ, &mut roots);
+    (found == N_RESONANCES).then_some(roots)
+}
+
+/// The same sweep with a caller-supplied ceiling and slot count: fills
+/// `out` with the resonances found in `[sweep_lo, hi_hz]` in ascending
+/// order and returns how many. `resonances` is this with the configured
+/// band and three slots; Experiment 3 asks for four up to
+/// `validation.forward_sweep_hi_hz` because the atlas map is built on F4.
+pub fn resonances_up_to(
+    areas: &[f32; N_SECTIONS],
+    vtl_cm: f32,
+    hi_hz: f32,
+    out: &mut [f32],
+) -> usize {
+    if !(vtl_cm.is_finite() && vtl_cm > 0.0) || out.is_empty() {
+        return 0;
     }
     let seg_len = vtl_cm / N_SECTIONS as f32;
 
@@ -108,12 +124,12 @@ pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; N_RESO
         d
     };
 
-    let mut roots = [0.0f32; N_RESONANCES];
+    let slots = out.len();
     let mut found = 0;
     let mut f_prev = RES_SWEEP_LO_HZ;
     let mut d_prev = d_term(f_prev);
     let mut f = f_prev + RES_SWEEP_STEP_HZ;
-    while f <= RES_SWEEP_HI_HZ && found < N_RESONANCES {
+    while f <= hi_hz && found < slots {
         let d_now = d_term(f);
         if d_prev == 0.0 || d_prev.signum() != d_now.signum() {
             // Bracketed: bisect.
@@ -129,14 +145,14 @@ pub fn resonances(areas: &[f32; N_SECTIONS], vtl_cm: f32) -> Option<[f32; N_RESO
                     d_lo = d_mid;
                 }
             }
-            roots[found] = HALF * (lo + hi);
+            out[found] = HALF * (lo + hi);
             found += 1;
         }
         f_prev = f;
         d_prev = d_now;
         f += RES_SWEEP_STEP_HZ;
     }
-    (found == N_RESONANCES).then_some(roots)
+    found
 }
 
 /// Precomputed forward map over the (q1, q2) plane: resonances (fR1, fR2) at

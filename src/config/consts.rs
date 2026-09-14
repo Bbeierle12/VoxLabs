@@ -10,6 +10,8 @@
 /// `(a + b) / 2`, the parabola vertex `(s0 − s2) / (2·(s0 − 2·s1 + s2))`, and
 /// `2^x` in octave arithmetic. Range: exactly 2.
 pub const TWO: f32 = 2.0;
+/// Millimetres per centimetre (the lumen mesh is stored in mm).
+pub const MM_PER_CM: f32 = 10.0;
 /// [`TWO`] for `f64` arithmetic. Range: exactly 2.
 pub const TWO_F64: f64 = 2.0;
 /// [`TWO`] as an index/length divisor (Nyquist bin, integer midpoint).

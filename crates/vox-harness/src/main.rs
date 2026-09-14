@@ -19,6 +19,9 @@
 //! the same audio — that is the point of the harness.
 
 #[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
+mod experiment3;
+
+#[cfg(all(not(target_arch = "wasm32"), not(target_os = "android")))]
 mod lab {
     use std::collections::HashMap;
     use std::fs::{self, File};
@@ -914,7 +917,7 @@ mod lab {
 
     pub fn main() -> anyhow::Result<()> {
         let args: Vec<String> = std::env::args().collect();
-        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>\n       voxlab run <mode|mode.toml> <audio|dir> [--out DIR] [--sr HZ]\n       voxlab validate <results_dir|x.provenance.json>";
+        let usage = "usage: voxlab analyze <dataset_dir> [--out DIR] [--sr HZ] [--vtl-f0-max HZ]\n       voxlab file <audio>\n       voxlab synth <out_dir>\n       voxlab run <mode|mode.toml> <audio|dir> [--out DIR] [--sr HZ]\n       voxlab validate <results_dir|x.provenance.json>\n       voxlab gen-inverse-fixtures <out_dir> [--n PAIRS] [--seed S]";
         match args.get(1).map(String::as_str) {
             Some("run") => {
                 let mode = args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?;
@@ -934,6 +937,20 @@ mod lab {
             Some("validate") => {
                 let target = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
                 validate(&target)
+            }
+            Some("gen-inverse-fixtures") => {
+                let out = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);
+                let v = vox_core::config::ValidationConfig::DEFAULT;
+                let n: usize = flag(&args, "--n")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(v.inverse_fixture_pairs);
+                let seed: u32 = flag(&args, "--seed")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(v.inverse_fixture_seed);
+                let report = super::experiment3::run(&out, n, seed)?;
+                super::experiment3::print(&report);
+                println!("→ {}", out.join("inverse_eval.json").display());
+                Ok(())
             }
             Some("analyze") => {
                 let root = PathBuf::from(args.get(2).ok_or_else(|| anyhow::anyhow!(usage))?);

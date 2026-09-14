@@ -5,6 +5,7 @@
 
 use crate::config::{FormantConfig, LpcConfig, PipelineParams};
 use crate::math;
+use crate::types::{Formant, N_FORMANTS};
 
 use super::super::stage::{Stage, StageError, StreamFormat};
 use super::super::types::{AudioFrame, F0Track, FormantTrack};
@@ -57,13 +58,21 @@ impl Stage for LpcStage {
             let (m, order, fs_dec) = self.plan(frame.sample_rate);
             let decimated = math::decimate(&frame.samples, m);
             let lpc = math::lpc_coefficients(&decimated, order, self.lpc.preemphasis);
-            let measured = math::formants_from_lpc(&lpc, fs_dec);
+            let candidates = math::formant_candidates(&lpc, fs_dec);
+            let mut measured = [Formant {
+                frequency: 0.0,
+                bandwidth: 0.0,
+            }; N_FORMANTS];
+            for (slot, f) in measured.iter_mut().zip(&candidates) {
+                *slot = *f;
+            }
             if measured[0].frequency > 0.0 {
                 self.held = FormantTrack {
                     formants: measured,
                     measured_f0: f0.hz,
                     confidence: 1.0,
                     fresh: true,
+                    f4: candidates.get(N_FORMANTS).copied(),
                 };
             }
         }

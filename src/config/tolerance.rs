@@ -34,6 +34,11 @@ stage_config! {
         cents: f32 = 1.0,
         /// Story mode coefficient agreement. Range: 1e-4..=0.5.
         tract_q: f32 = 1e-3,
+        /// Atlas mode coefficient agreement, standard deviations (the
+        /// posterior inverse's `modes`). Range: 1e-4..=0.5.
+        mode_sd: f32 = 1e-3,
+        /// Mesh vertex agreement, mm per coordinate. Range: 1e-3..=1.0.
+        geometry_mm: f32 = 0.01,
         /// Vocal-tract length agreement, cm. Range: 0.01..=1.0.
         vtl_cm: f32 = 0.05,
         /// Area-function agreement, cm² per section. Range: 1e-4..=0.5.

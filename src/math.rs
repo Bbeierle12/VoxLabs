@@ -115,9 +115,19 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; N_FORMANTS]
         frequency: 0.0,
         bandwidth: 0.0,
     }; N_FORMANTS];
+    for (slot, f) in result.iter_mut().zip(formant_candidates(lpc, sample_rate)) {
+        *slot = f;
+    }
+    result
+}
 
+/// Every in-band, sharp-enough pole of the LPC polynomial, ascending in
+/// frequency — the list `formants_from_lpc` takes its first three from.
+/// The fourth entry, when present, is the F4 the posterior inverse's
+/// four-formant map wants.
+pub fn formant_candidates(lpc: &[f32], sample_rate: f32) -> Vec<Formant> {
     if lpc.len() < FORMANT.min_coefficients {
-        return result;
+        return Vec::new();
     }
 
     // Reverse (root in z, not z^-1) and promote to f64 for conditioning.
@@ -161,11 +171,7 @@ pub fn formants_from_lpc(lpc: &[f32], sample_rate: f32) -> [Formant; N_FORMANTS]
             .partial_cmp(&b.frequency)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-
-    for (slot, f) in result.iter_mut().zip(formants) {
-        *slot = f;
-    }
-    result
+    formants
 }
 
 /// Computes a parabolic interpolation around the minimum lag `tau`.

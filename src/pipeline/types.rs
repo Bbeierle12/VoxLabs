@@ -2,6 +2,7 @@
 //! line in the plan's table. A stage declares exactly which of these it
 //! consumes and produces; the builder refuses to connect anything else.
 
+pub use crate::atlas::reduced_model::{AbstainReason, MAX_MODES};
 use crate::config::FormantConfig;
 use crate::tract::{self, ADULT_FEMALE, ADULT_MALE, N_SECTIONS, TractBasis};
 use crate::types::{Formant, MAX_PARTIALS, N_FORMANTS, VoiceMetrics};
@@ -168,6 +169,11 @@ pub struct FormantTrack {
     pub confidence: f32,
     /// True when this frame produced a new measurement.
     pub fresh: bool,
+    /// The fourth in-band LPC pole when the frame resolved one (the
+    /// posterior inverse's map is built on four formants); held with the
+    /// rest. `None` when the frame had only three.
+    #[serde(default)]
+    pub f4: Option<Formant>,
 }
 
 impl FormantTrack {
@@ -177,6 +183,7 @@ impl FormantTrack {
             measured_f0: 0.0,
             confidence: 0.0,
             fresh: false,
+            f4: None,
         }
     }
 }
@@ -186,13 +193,18 @@ impl FormantTrack {
 pub enum BasisId {
     AdultMale,
     AdultFemale,
+    /// The Vocal Tract Lab atlas: the frozen five-subject metric-MRI mean
+    /// (`assets/vocal_tract_lab/PROVENANCE.md`), not a Story basis.
+    MriAtlasMean,
 }
 
 impl BasisId {
-    pub fn basis(self) -> &'static TractBasis {
+    /// The Story basis table, for the two Story bases; the atlas has none.
+    pub fn basis(self) -> Option<&'static TractBasis> {
         match self {
-            BasisId::AdultMale => &ADULT_MALE,
-            BasisId::AdultFemale => &ADULT_FEMALE,
+            BasisId::AdultMale => Some(&ADULT_MALE),
+            BasisId::AdultFemale => Some(&ADULT_FEMALE),
+            BasisId::MriAtlasMean => None,
         }
     }
 
@@ -208,21 +220,58 @@ impl BasisId {
         match self {
             BasisId::AdultMale => "adult male",
             BasisId::AdultFemale => "adult female",
+            BasisId::MriAtlasMean => "MRI atlas mean",
         }
     }
 }
 
-/// Model-specific tract parameters: the Story two-mode coefficients.
-/// `valid` is false when the frame did not clear the inversion's gates —
-/// the coefficients then still hold the last valid pair, for a HELD view.
+/// Which tract model a parameter vector or area function belongs to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TractModelId {
+    /// Story (2018) two-mode area function on a published basis.
+    #[default]
+    StoryTwoMode,
+    /// The Vocal Tract Lab four-mode log-area PCA atlas
+    /// (`vt3d-frozen-mri-pca-v0.7.0`).
+    MriPca4,
+}
+
+impl TractModelId {
+    pub fn name(self) -> &'static str {
+        match self {
+            TractModelId::StoryTwoMode => "story_two_mode",
+            TractModelId::MriPca4 => "mri_pca4",
+        }
+    }
+}
+
+/// Model-specific tract parameters. `valid` is false when the frame did
+/// not clear the inversion's gates (or the posterior abstained) — the
+/// coefficients then still hold the backend's last state, for a HELD view.
+///
+/// Two backends write this: the Story grid inverse fills `q1`/`q2` (and
+/// mirrors them into `modes[..2]`); the posterior inverse fills `modes`
+/// (four atlas coefficients, in standard deviations) with its confidence
+/// and abstention, and leaves `q1`/`q2` at 0.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TractParams {
+    pub model: TractModelId,
     pub q1: f32,
     pub q2: f32,
-    /// Nearest-node distance in the grid's metric, when the backend reports
-    /// it. The Phase-1 grid backend does not (its `invert` returns only the
-    /// weighted coefficients), so this is `None` — never a made-up number.
+    /// The model's coefficient vector; `n_modes` of them are meaningful.
+    pub modes: [f32; MAX_MODES],
+    pub n_modes: usize,
+    /// The backend's own uncertainty measure, when it has one: the
+    /// posterior's relative area standard deviation. The grid backend has
+    /// none (`invert` returns only weighted coefficients) — `None`, never a
+    /// made-up number.
     pub uncertainty: Option<f32>,
+    /// The posterior's filtered confidence (0..1); `None` from a backend
+    /// that does not compute one.
+    pub confidence: Option<f32>,
+    /// The posterior abstained on this frame (decaying toward the mean).
+    pub abstained: bool,
+    pub reason: AbstainReason,
     pub valid: bool,
     pub basis: BasisId,
     /// Slow estimate of the singer's tract length, cm, once measured.
@@ -232,9 +281,15 @@ pub struct TractParams {
 impl Default for TractParams {
     fn default() -> Self {
         Self {
+            model: TractModelId::StoryTwoMode,
             q1: 0.0,
             q2: 0.0,
+            modes: [0.0; MAX_MODES],
+            n_modes: 2,
             uncertainty: None,
+            confidence: None,
+            abstained: false,
+            reason: AbstainReason::None,
             valid: false,
             basis: BasisId::AdultMale,
             vtl_est_cm: None,
@@ -242,11 +297,13 @@ impl Default for TractParams {
     }
 }
 
-/// The area function: `N_SECTIONS` equal-length sections from glottis to
-/// lips, as the diameters the display renders and the areas the resonance
-/// solver takes. `live` mirrors `TractParams::valid`.
+/// The area function: `sections` equal-length sections from glottis to
+/// lips (`N_SECTIONS` for the Story model, 32 for the atlas; the arrays
+/// beyond `sections` are 0), as the diameters the display renders and the
+/// areas the resonance solver takes. `live` mirrors `TractParams::valid`.
 #[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AreaFunction {
+    pub model: TractModelId,
     pub sections: usize,
     pub section_len_cm: f32,
     #[serde(with = "sections_array")]
@@ -265,9 +322,17 @@ impl AreaFunction {
         Self::from_coefficients(basis, 0.0, 0.0, false)
     }
 
+    /// A Story shape. The atlas basis has no Story table: a caller that
+    /// asks for one gets the neutral adult-male shape flagged not live,
+    /// and the stages refuse the mismatch before it gets here.
     pub fn from_coefficients(basis: BasisId, q1: f32, q2: f32, live: bool) -> Self {
-        let b = basis.basis();
+        let Some(b) = basis.basis() else {
+            let mut n = Self::from_coefficients(BasisId::AdultMale, 0.0, 0.0, false);
+            n.basis = basis;
+            return n;
+        };
         Self {
+            model: TractModelId::StoryTwoMode,
             sections: N_SECTIONS,
             section_len_cm: b.vtl_cm / N_SECTIONS as f32,
             diameters_cm: tract::diameters(b, q1, q2),
@@ -276,6 +341,61 @@ impl AreaFunction {
             basis,
             live,
         }
+    }
+}
+
+/// The lumen surface mesh for one frame: the atlas mesh morphed to the
+/// area function, its vertex normals, and the same mesh expanded by the
+/// uncertainty envelope. `frame` states the coordinate frame the vertices
+/// are in (`atlas::lumen::FRAME`: the renderer's mm frame; the transform
+/// to the VTL canonical frame is unknown and is said so).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TractGeometry {
+    pub model_id: String,
+    pub frame: String,
+    pub sections: usize,
+    pub angular: usize,
+    pub vertex_count: usize,
+    /// `vertex_count × 3`, mm.
+    pub vertices_mm: Vec<f32>,
+    /// `vertex_count × 3`, unit normals.
+    pub normals: Vec<f32>,
+    /// `vertex_count × 3`, mm: the uncertainty-expanded mesh.
+    pub uncertainty_vertices_mm: Vec<f32>,
+    /// `sections × 3`, mm.
+    pub centerline_mm: Vec<f32>,
+    /// Vertex indices, three per triangle.
+    pub triangles: Vec<u16>,
+    pub relative_area_std: f32,
+    pub live: bool,
+}
+
+impl TractGeometry {
+    /// The mesh at its stored (mean) shape, not live — the preallocated
+    /// wire, sized once from the compiled-in asset.
+    pub fn preallocated() -> Result<Self, StageError> {
+        let l = crate::atlas::lumen::shared().map_err(StageError::Init)?;
+        let n = l.vertex_count * 3;
+        let mut vertices_mm = vec![0.0; n];
+        l.morph_into(&l.reference_area_cm2, &mut vertices_mm)
+            .map_err(StageError::Init)?;
+        let mut normals = vec![0.0; n];
+        crate::atlas::lumen::vertex_normals_into(&vertices_mm, &l.triangle_indices, &mut normals)
+            .map_err(StageError::Init)?;
+        Ok(Self {
+            model_id: l.model_id.into(),
+            frame: crate::atlas::lumen::FRAME.into(),
+            sections: l.sections,
+            angular: l.angular,
+            vertex_count: l.vertex_count,
+            uncertainty_vertices_mm: vertices_mm.clone(),
+            vertices_mm,
+            normals,
+            centerline_mm: l.centerline_mm.clone(),
+            triangles: l.triangle_indices.clone(),
+            relative_area_std: 0.0,
+            live: false,
+        })
     }
 }
 
@@ -295,6 +415,7 @@ pub enum Wire {
     FormantTrack(FormantTrack),
     TractParams(TractParams),
     AreaFunction(AreaFunction),
+    TractGeometry(TractGeometry),
 }
 
 impl Wire {
@@ -308,6 +429,7 @@ impl Wire {
             Wire::FormantTrack(_) => WireType::FormantTrack,
             Wire::TractParams(_) => WireType::TractParams,
             Wire::AreaFunction(_) => WireType::AreaFunction,
+            Wire::TractGeometry(_) => WireType::TractGeometry,
         }
     }
 
@@ -334,6 +456,7 @@ impl Wire {
             WireType::FormantTrack => Wire::FormantTrack(FormantTrack::held_default(formants)),
             WireType::TractParams => Wire::TractParams(TractParams::default()),
             WireType::AreaFunction => Wire::AreaFunction(AreaFunction::neutral(BasisId::AdultMale)),
+            WireType::TractGeometry => Wire::TractGeometry(TractGeometry::preallocated()?),
             other => {
                 return Err(StageError::Init(format!(
                     "no payload for wire type {other}; no stage produces it yet"
@@ -377,6 +500,7 @@ wire_value!(VoiceMetrics);
 wire_value!(FormantTrack);
 wire_value!(TractParams);
 wire_value!(AreaFunction);
+wire_value!(TractGeometry);
 
 /// A stage's input: one wire value, or a tuple of them, borrowed from the
 /// runner's wire slots for the duration of `process`.

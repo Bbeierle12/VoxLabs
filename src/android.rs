@@ -148,7 +148,15 @@ fn android_main(app: AndroidApp) {
     // files dir; open it first so everything below can report into it.
     if let Some(files) = app.internal_data_path() {
         match crate::diagnostics::runtime::initialize(&files) {
-            Ok(()) => crate::diagnostics::install_panic_hook(),
+            Ok(()) => {
+                crate::diagnostics::install_panic_hook();
+                // The bundle's `shared_model` block: the compiled-in atlas
+                // files, their digests and their own release statements.
+                crate::diagnostics::runtime::set_shared_model_snapshot(
+                    serde_json::to_value(crate::atlas::data_provenance())
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
             Err(e) => log::error!("diagnostics store did not open: {e}"),
         }
     }

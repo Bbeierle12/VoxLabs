@@ -72,6 +72,7 @@ pub mod fach;
 #[cfg_attr(not(target_os = "android"), allow(dead_code))]
 mod device_probe;
 // SHA-256 for provenance digests (no dependency).
+pub mod atlas;
 pub mod hash;
 pub mod math;
 // The room as calibration learned it (floor seed, hum), shared between the

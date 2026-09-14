@@ -6,7 +6,7 @@
 use crate::config::{PipelineParams, TractConfig};
 
 use super::super::stage::{Stage, StageError, StreamFormat};
-use super::super::types::{AreaFunction, BasisId, TractParams};
+use super::super::types::{AreaFunction, BasisId, TractModelId, TractParams};
 use super::require_default;
 
 pub struct StoryTractStage {
@@ -29,6 +29,12 @@ impl Stage for StoryTractStage {
     }
 
     fn process(&mut self, p: &TractParams, out: &mut AreaFunction) -> Result<(), StageError> {
+        if p.model != TractModelId::StoryTwoMode {
+            return Err(StageError::Process(format!(
+                "story_two_mode cannot shape {} parameters (wire `inverse` to grid_story)",
+                p.model.name()
+            )));
+        }
         if p.valid {
             if !(p.q1.is_finite() && p.q2.is_finite()) {
                 return Err(StageError::Process(format!(
@@ -71,6 +77,7 @@ mod tests {
             valid: true,
             basis: BasisId::AdultMale,
             vtl_est_cm: None,
+            ..Default::default()
         };
         let mut out = AreaFunction::neutral(BasisId::AdultMale);
         s.process(&p, &mut out).unwrap();
@@ -96,6 +103,7 @@ mod tests {
             valid: true,
             basis: BasisId::AdultMale,
             vtl_est_cm: None,
+            ..Default::default()
         };
         let mut out = AreaFunction::neutral(BasisId::AdultMale);
         s.process(&i, &mut out).unwrap();

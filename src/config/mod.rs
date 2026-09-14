@@ -27,6 +27,7 @@ pub mod fach;
 pub mod formants;
 pub mod harmonics;
 pub mod pitch;
+pub mod posterior;
 pub mod spatial;
 pub mod spectrogram;
 pub mod stream;
@@ -44,6 +45,7 @@ pub use harmonics::{
     TuningConfig, VoiceClassConfig,
 };
 pub use pitch::{NoiseFloorConfig, RoomCalibrationConfig, VoicingConfig, YinConfig};
+pub use posterior::{ArticulatorConfig, PosteriorConfig, ValidationConfig};
 pub use spatial::SpatialConfig;
 pub use spectrogram::{ResampleConfig, SpectrogramConfig};
 pub use stream::StreamConfig;
@@ -82,6 +84,9 @@ pub struct PipelineParams {
     pub spatial: SpatialConfig,
     pub tract: TractConfig,
     pub inverse: InverseConfig,
+    pub posterior: PosteriorConfig,
+    pub articulators: ArticulatorConfig,
+    pub validation: ValidationConfig,
     pub diagnostics: DiagnosticsConfig,
     pub tolerance: ToleranceConfig,
 }
@@ -113,6 +118,9 @@ impl PipelineParams {
         spatial: SpatialConfig::DEFAULT,
         tract: TractConfig::DEFAULT,
         inverse: InverseConfig::DEFAULT,
+        posterior: PosteriorConfig::DEFAULT,
+        articulators: ArticulatorConfig::DEFAULT,
+        validation: ValidationConfig::DEFAULT,
         diagnostics: DiagnosticsConfig::DEFAULT,
         tolerance: ToleranceConfig::DEFAULT,
     };
@@ -283,6 +291,15 @@ pub fn all_sections() -> Vec<(&'static str, Vec<(&'static str, Value)>)> {
         (SpatialConfig::SECTION, SpatialConfig::DEFAULT.entries()),
         (TractConfig::SECTION, TractConfig::DEFAULT.entries()),
         (InverseConfig::SECTION, InverseConfig::DEFAULT.entries()),
+        (PosteriorConfig::SECTION, PosteriorConfig::DEFAULT.entries()),
+        (
+            ArticulatorConfig::SECTION,
+            ArticulatorConfig::DEFAULT.entries(),
+        ),
+        (
+            ValidationConfig::SECTION,
+            ValidationConfig::DEFAULT.entries(),
+        ),
         (
             DiagnosticsConfig::SECTION,
             DiagnosticsConfig::DEFAULT.entries(),
